@@ -1,0 +1,77 @@
+name: Manual Backport
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_url:
+        description: "PR URL or number (e.g. https://github.com/valkey-io/valkey/pull/1234 or just 1234)"
+        required: true
+        type: string
+      repo:
+        description: "Target repository (owner/repo) — only needed if pr_url is a plain number"
+        required: false
+        type: string
+        default: "valkey-io/valkey"
+      target_branch:
+        description: "Target branch to backport onto (e.g. 8.1, 8.0)"
+        required: true
+        type: string
+      push_repo:
+        description: "Override different-owner fork for the backport branch"
+        required: false
+        type: string
+        default: ""
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+permissions: {}
+
+jobs:
+  parse-inputs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      pr_number: ${{ steps.parse.outputs.pr_number }}
+      repo: ${{ steps.parse.outputs.repo }}
+    steps:
+      - name: Parse PR URL or number
+        id: parse
+        shell: bash
+        env:
+          PR_INPUT: ${{ inputs.pr_url }}
+          DEFAULT_REPO: ${{ inputs.repo }}
+        run: |
+          set -euo pipefail
+          INPUT="${PR_INPUT}"
+          # If it looks like a URL, extract owner/repo and PR number
+          if [[ "$INPUT" =~ github\.com/([^/]+/[^/]+)/pull/([0-9]+) ]]; then
+            echo "repo=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+            echo "pr_number=${BASH_REMATCH[2]}" >> "$GITHUB_OUTPUT"
+          elif [[ "$INPUT" =~ ^[0-9]+$ ]]; then
+            if [[ ! "${DEFAULT_REPO}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+              echo "::error::Invalid repo input: ${DEFAULT_REPO}"
+              exit 1
+            fi
+            echo "repo=${DEFAULT_REPO}" >> "$GITHUB_OUTPUT"
+            echo "pr_number=$INPUT" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Could not parse PR input: $INPUT. Use a URL or a number."
+            exit 1
+          fi
+
+  backport:
+    needs: parse-inputs
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/backport.yml
+    with:
+      source_pr_number: ${{ fromJSON(needs.parse-inputs.outputs.pr_number) }}
+      repo_full_name: ${{ needs.parse-inputs.outputs.repo }}
+      target_branch: ${{ inputs.target_branch }}
+      push_repo: ${{ inputs.push_repo }}
+    secrets:
+      AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+      VALKEYRIE_BOT_APP_ID: ${{ secrets.VALKEYRIE_BOT_APP_ID }}
+      VALKEYRIE_BOT_PRIVATE_KEY: ${{ secrets.VALKEYRIE_BOT_PRIVATE_KEY }}
