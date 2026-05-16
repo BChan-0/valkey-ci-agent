@@ -1,0 +1,149 @@
+name: Backport PR
+
+on:
+  workflow_call:
+    inputs:
+      source_pr_number:
+        description: "The merged PR number to backport"
+        required: true
+        type: number
+      repo_full_name:
+        description: "Full repository name (owner/repo) containing the source PR"
+        required: true
+        type: string
+      target_branch:
+        description: "Target release branch to cherry-pick onto (e.g. 8.1)"
+        required: true
+        type: string
+      aws_region:
+        description: "AWS region where Bedrock is available"
+        required: false
+        type: string
+        default: "us-east-1"
+      push_repo:
+        description: "Override different-owner fork for the backport branch"
+        required: false
+        type: string
+        default: ""
+    secrets:
+      AWS_ROLE_ARN:
+        required: true
+      VALKEYRIE_BOT_APP_ID:
+        required: true
+      VALKEYRIE_BOT_PRIVATE_KEY:
+        required: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  CLAUDE_CODE_USE_BEDROCK: "1"
+  CI_AGENT_EVIDENCE_DIR: agent-evidence
+
+jobs:
+  backport:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    concurrency:
+      group: backport-${{ inputs.repo_full_name }}-${{ inputs.source_pr_number }}-${{ inputs.target_branch }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Resolve called workflow ref
+        id: called-workflow
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const token = await core.getIDToken('valkey-ci-agent');
+            const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString('utf8'));
+            const workflowRef = payload.job_workflow_ref || '';
+            const marker = '/.github/workflows/';
+            const markerIndex = workflowRef.indexOf(marker);
+            const refIndex = workflowRef.lastIndexOf('@');
+            if (markerIndex <= 0 || refIndex <= markerIndex) {
+              core.setFailed(`Could not resolve called workflow repository/ref from job_workflow_ref: ${workflowRef}`);
+              return;
+            }
+            core.setOutput('repository', workflowRef.slice(0, markerIndex));
+            core.setOutput('ref', workflowRef.slice(refIndex + 1));
+
+      - name: Checkout agent repository
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ steps.called-workflow.outputs.repository }}
+          ref: ${{ steps.called-workflow.outputs.ref }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          npm install -g @anthropic-ai/claude-code
+
+      - name: Generate GitHub App token
+        id: generate-token
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
+        with:
+          app-id: ${{ secrets.VALKEYRIE_BOT_APP_ID }}
+          private-key: ${{ secrets.VALKEYRIE_BOT_PRIVATE_KEY }}
+          owner: valkey-io
+
+      - name: Configure AWS credentials from OIDC role
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: valkey-backport-agent-${{ github.run_id }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Run backport pipeline
+        env:
+          AWS_DEFAULT_REGION: ${{ inputs.aws_region }}
+          BACKPORT_GITHUB_TOKEN: ${{ steps.generate-token.outputs.token }}
+          REPO_FULL_NAME: ${{ inputs.repo_full_name }}
+          SOURCE_PR_NUMBER: ${{ inputs.source_pr_number }}
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+          PUSH_REPO: ${{ inputs.push_repo }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${REPO_FULL_NAME}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "Invalid repo_full_name: ${REPO_FULL_NAME}" >&2
+            exit 1
+          fi
+          if [[ ! "${SOURCE_PR_NUMBER}" =~ ^[0-9]+$ ]]; then
+            echo "Invalid source_pr_number: ${SOURCE_PR_NUMBER}" >&2
+            exit 1
+          fi
+          if [[ ! "${TARGET_BRANCH}" =~ ^[A-Za-z0-9._/-]+$ || "${TARGET_BRANCH}" == -* || "${TARGET_BRANCH}" == *..* ]]; then
+            echo "Invalid target_branch: ${TARGET_BRANCH}" >&2
+            exit 1
+          fi
+          args=(
+            -m scripts.backport.main
+            --registry repos.yml
+            --repo "${REPO_FULL_NAME}"
+            --pr-number "${SOURCE_PR_NUMBER}"
+            --target-branch "${TARGET_BRANCH}"
+          )
+          if [[ -n "${PUSH_REPO}" ]]; then
+            if [[ ! "${PUSH_REPO}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+              echo "Invalid push_repo: ${PUSH_REPO}" >&2
+              exit 1
+            fi
+            args+=(--push-repo "${PUSH_REPO}")
+          fi
+          python "${args[@]}"
+
+      - name: Upload agent evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backport-agent-evidence-${{ github.run_id }}
+          path: agent-evidence
+          if-no-files-found: ignore
+          retention-days: 30

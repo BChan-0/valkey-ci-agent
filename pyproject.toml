@@ -1,0 +1,61 @@
+[project]
+name = "valkey-ci-agent"
+version = "0.1.0"
+description = "CI automation agent for the Valkey project"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "PyGithub>=2.1.0",
+    "PyYAML>=6.0",
+]
+
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["scripts*"]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "hypothesis>=6.82.0",
+    "mypy>=1.5.0",
+    "pytest-mock>=3.11.0",
+    "pytest-cov>=4.1.0",
+    "ruff>=0.4.0",
+]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+show_error_codes = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "disable_publish_autouse: opt out of the autouse publish-guard fixture",
+]
+
+[tool.ruff]
+target-version = "py39"
+line-length = 120
+
+[tool.ruff.lint]
+# Start conservative: just catch obvious bugs (E, F, W) + import ordering (I).
+select = ["E", "F", "W", "I"]
+ignore = [
+    "E501",   # line-length handled by --line-length, not a hard error
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = [
+    "F401",  # test fixtures often reuse imports
+    "F811",  # test fixtures often rebind names
+    "E402",  # test files frequently set up sys.path before imports
+    "F841",  # test bindings sometimes kept for documentation
+    "E741",  # ambiguous names in tests
+]
+# Scripts with deliberate late imports (sys.path shim before scripts.*)
+"scripts/backport/main.py" = ["E402"]
+"scripts/backport/sweep.py" = ["E402"]
