@@ -462,6 +462,17 @@ def _push_backport_branch(
     *,
     force_with_lease: bool,
 ) -> None:
+    # Defense in depth: only ever push to branches under the agent's reserved
+    # namespace. This is checked at the lowest level so that no caller — and no
+    # future change to the sweep flow — can accidentally push to a release
+    # branch (e.g., 9.1, unstable). Combined with the always-create-fresh
+    # branch logic in _process_branch, this guarantees release branches and
+    # unstable are never written to by the agent.
+    if not branch.startswith(f"{_BRANCH_PREFIX}/"):
+        raise RuntimeError(
+            f"Refusing to push to non-namespaced branch: {branch!r}. "
+            f"Agent push targets must start with {_BRANCH_PREFIX}/."
+        )
     args = ["push", "push_target", branch]
     if force_with_lease:
         args.insert(1, "--force-with-lease")
