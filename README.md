@@ -11,7 +11,7 @@ scripts/
   ai/          AI layer: Claude Code subprocess orchestration
   backport/    Workflow 1: automated backports (active)
   common/      Shared infrastructure (git auth, GitHub client, safety guards)
-repos.yml      Central registry of repos, branches, project boards, validation
+repos.yml      Central registry of repos, branches, and project boards
 ```
 
 New workflows are added as sibling directories to `backport/`. Each workflow picks an agent profile (tools, timeout, effort) and writes its own prompt. The AI layer and shared infra stay unchanged.
@@ -24,7 +24,6 @@ New workflows are added as sibling directories to `backport/`. Each workflow pic
 | PR Reviewer | Planned | Two-stage code review with skeptic pass |
 | Fuzzer Monitor | Planned | Analyzes fuzzer runs, triages failures, files issues |
 | Daily CI Analysis | Planned | Detects flaky tests, generates fix PRs |
-| Health Dashboard | Planned | Publishes CI health metrics to GitHub Pages |
 
 ## Backport Workflow
 
@@ -35,9 +34,9 @@ The currently active workflow. Cherry-picks merged PRs onto release branches wit
 1. **Daily sweep** — every day at 09:00 UTC, the preflight job reads `repos.yml` and generates one matrix leg per `{repo, branch}` pair
 2. **Project discovery** — each leg queries the GitHub Project v2 board for PRs marked "To be backported"
 3. **Cherry-pick** — attempts `git cherry-pick` for each candidate onto the target release branch
-4. **AI conflict resolution** — when cherry-pick conflicts, Claude Code reads both sides, resolves the conflict, and receives the repo's matching validation commands as guidance
-5. **Validation** — registry-configured build commands always run, and path-matched validation rules add targeted tests for touched files; any failure blocks the push
-6. **PR creation** — pushes the branch and opens (or updates) a draft PR with a summary table
+4. **AI conflict resolution** — when cherry-pick conflicts, Claude Code reads both sides and resolves the conflict in place
+5. **Validation** — registry-configured build commands run before push; any failure blocks the push
+6. **PR creation** — pushes the branch and opens (or updates) a PR with a summary table
 
 Manual single-PR backports are also supported via `workflow_dispatch`.
 
@@ -53,11 +52,6 @@ repos:
     language: c                          # used in conflict resolver prompt
     build_commands:
       - "make -j$(nproc)"                # run before push; empty = skip
-    validation_rules:
-      - paths:
-          - "tests/unit/cluster/cli.tcl"
-        commands:
-          - "./runtest --clients 1 --single unit/cluster/cli"
     backport_label: backport
     llm_conflict_label: ai-resolved-conflicts
     max_conflicting_files: 100
@@ -69,8 +63,6 @@ repos:
 ```
 
 By default, agent branches are pushed directly to `repo` under the `agent/backport/...` namespace and PRs are opened in that same upstream repository. `push_repo` is optional and only exists as an escape hatch for a real different-owner fork; same-owner `push_repo` values are rejected so staging repositories do not become the normal model.
-
-`validation_rules` are optional. Each rule matches changed paths with shell-style globs and appends the listed commands after `build_commands`. Use them for high-signal tests that catch branch-specific adaptation mistakes without running a full CI matrix locally.
 
 See [`examples/repos.yml`](examples/repos.yml) for a multi-module example.
 
@@ -137,10 +129,10 @@ gh workflow run backport-sweep.yml \
 
 ## Safety
 
-- **Branch namespace** — the agent writes only `agent/backport/...` branches and opens draft PRs for maintainer review.
+- **Branch namespace** — the agent writes only `agent/backport/...` branches and opens PRs for maintainer review.
 - **Credential isolation** — all GitHub auth uses `GIT_ASKPASS`; tokens never appear in `.git/config` or URLs
 - **Claude Code env isolation** — `GITHUB_TOKEN`, `GH_TOKEN`, and `*_SECRET` are stripped from the subprocess environment. Claude cannot see credentials.
-- **Deterministic validation** — registry-configured build commands and matching path-based tests run before push. A validation failure blocks the push.
+- **Deterministic validation** — registry-configured build commands run before push. A validation failure blocks the push.
 - **Fork sync** — when a different-owner `push_repo` is configured, the agent fast-forwards that fork's release branch to match upstream before cherry-picking
 - **Stale branch pruning** — if a previous backport PR was closed without merging, the agent deletes the orphaned branch before starting fresh
 - **DCO** — all agent commits are signed off

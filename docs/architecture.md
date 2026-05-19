@@ -10,7 +10,7 @@ scripts/
   backport/    Backport workflow (active)
   ai/          Claude Code subprocess orchestration
   common/      Shared infrastructure
-repos.yml      Registry of repos, release branches, project boards, and validation
+repos.yml      Registry of repos, release branches, and project boards
 ```
 
 ## Backport Flow
@@ -22,7 +22,7 @@ sweep.py (daily cron or manual dispatch)
   -> for each registered release branch:
       cherry_pick.py -> git cherry-pick
       conflict_resolver.py -> Claude Code resolves conflicts
-      pr_creator.py -> opens/updates draft PR on the upstream repo
+      pr_creator.py -> opens/updates PR on the upstream repo
 ```
 
 ### Entry Points
@@ -45,13 +45,11 @@ conflict_resolver.py
 
 Claude gets the repo checkout with conflict markers, reads both sides, and edits
 only the conflicted files in place. The prompt is parameterized by the repo
-language and validation commands from `repos.yml`; validation is skipped when a
-repo has no commands configured.
+language from `repos.yml`.
 
-Validation is two-tiered. `build_commands` run for every generated branch, while
-optional `validation_rules` append targeted commands when changed paths match a
-rule. This lets Valkey core run focused Tcl cluster tests for cluster-related
-changes, and lets modules add their own smoke tests without changing agent code.
+Validation runs the registry's `build_commands` for every generated branch
+before push. A non-zero exit blocks the push. Repos with no `build_commands`
+configured rely on upstream CI for verification.
 
 ### Common Infrastructure
 
@@ -61,7 +59,7 @@ changes, and lets modules add their own smoke tests without changing agent code.
 ## Repository Model
 
 The standard model is direct upstream branches: the agent pushes
-`agent/backport/...` branches to `repo` and opens draft PRs in that same
+`agent/backport/...` branches to `repo` and opens PRs in that same
 repository. This keeps the registry small and matches the GitHub App
 permissions used by the workflows.
 
@@ -76,4 +74,3 @@ Future sibling modules to `backport/`:
 - **PR Reviewer** — two-stage code review with skeptic pass
 - **Fuzzer Monitor** — triage fuzzer failures, file issues
 - **Daily CI Analysis** — detect flaky tests, generate fix PRs
-- **Health Dashboard** — publish CI metrics to GitHub Pages
