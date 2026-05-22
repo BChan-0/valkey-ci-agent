@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 from scripts.backport.utils import (
-    braces_balanced,
     build_branch_name,
     build_pr_title,
     has_conflict_markers,
     is_whitespace_only_conflict,
-    validate_resolved_content,
 )
 
 
@@ -57,31 +55,6 @@ class TestHasConflictMarkers:
 
     def test_empty_string(self) -> None:
         assert has_conflict_markers("") is False
-
-
-
-
-class TestBracesBalanced:
-    def test_balanced(self) -> None:
-        assert braces_balanced("int main() { return 0; }") is True
-
-    def test_nested_balanced(self) -> None:
-        assert braces_balanced("void f() { if (x) { y(); } }") is True
-
-    def test_unbalanced_extra_open(self) -> None:
-        assert braces_balanced("void f() { if (x) {") is False
-
-    def test_unbalanced_extra_close(self) -> None:
-        assert braces_balanced("void f() }") is False
-
-    def test_empty_string(self) -> None:
-        assert braces_balanced("") is True
-
-    def test_no_braces(self) -> None:
-        assert braces_balanced("// just a comment") is True
-
-    def test_closing_before_opening(self) -> None:
-        assert braces_balanced("} {") is False
 
 
 
@@ -205,55 +178,6 @@ class TestHasConflictMarkersProperty:
         assert has_conflict_markers(content) is False
 
 
-class TestBracesBalancedProperty:
-
-
-    @given(data=st.data())
-    @settings(max_examples=100, deadline=None)
-    def test_balanced_braces_accepted(self, data: st.DataObject) -> None:
-        """Strings with balanced curly braces (depth never negative) pass validation."""
-        # Build a string with guaranteed balanced braces
-        depth = data.draw(st.integers(min_value=1, max_value=10))
-        filler = st.text(
-            alphabet=st.characters(blacklist_characters="{}"), max_size=20
-        )
-        parts: list[str] = []
-        for _ in range(depth):
-            parts.append(data.draw(filler))
-            parts.append("{")
-        for _ in range(depth):
-            parts.append(data.draw(filler))
-            parts.append("}")
-        parts.append(data.draw(filler))
-        content = "".join(parts)
-        assert braces_balanced(content) is True
-
-    @given(
-        content=st.text(
-            alphabet=st.characters(blacklist_characters="{}"), max_size=100
-        ),
-        extra_opens=st.integers(min_value=1, max_value=5),
-    )
-    @settings(max_examples=100, deadline=None)
-    def test_extra_open_braces_rejected(
-        self, content: str, extra_opens: int
-    ) -> None:
-        """Strings with more '{' than '}' are rejected."""
-        unbalanced = content + "{" * extra_opens
-        assert braces_balanced(unbalanced) is False
-
-    @given(
-        content=st.text(
-            alphabet=st.characters(blacklist_characters="{}"), max_size=100
-        ),
-    )
-    @settings(max_examples=100, deadline=None)
-    def test_closing_before_opening_rejected(self, content: str) -> None:
-        """A '}' appearing before any '{' is rejected."""
-        unbalanced = "}" + content + "{"
-        assert braces_balanced(unbalanced) is False
-
-
 class TestIsWhitespaceOnlyConflictProperty:
 
 
@@ -305,38 +229,4 @@ class TestIsWhitespaceOnlyConflictProperty:
         assert is_whitespace_only_conflict(base, modified) is False
 
 
-class TestValidateResolvedContent:
-    def test_valid_c_file(self):
-        assert validate_resolved_content("src/server.c", "int main() { return 0; }") is True
 
-    def test_invalid_c_file(self):
-        assert validate_resolved_content("src/server.c", "int main() {") is False
-
-    def test_valid_python_file(self):
-        assert validate_resolved_content("scripts/main.py", "x = 1\n") is True
-
-    def test_invalid_python_file(self):
-        assert validate_resolved_content("scripts/main.py", "def f(\n") is False
-
-    def test_valid_json_file(self):
-        assert validate_resolved_content("config.json", '{"key": "value"}') is True
-
-    def test_invalid_json_file(self):
-        assert validate_resolved_content("config.json", "{broken") is False
-
-    def test_valid_yaml_file(self):
-        assert validate_resolved_content("ci.yml", "name: CI\non: push\n") is True
-
-    def test_invalid_yaml_file(self):
-        assert validate_resolved_content("ci.yml", ":\n  - :\n  [invalid") is False
-
-    def test_unknown_extension_always_valid(self):
-        assert validate_resolved_content("README.md", "anything") is True
-
-    def test_header_file_uses_c_validation(self):
-        assert validate_resolved_content("src/server.h", "void f() { }") is True
-        assert validate_resolved_content("src/server.h", "void f() {") is False
-
-    def test_tcl_brace_validation(self):
-        assert validate_resolved_content("tests/unit/foo.tcl", "proc f {} { return ok }\n") is True
-        assert validate_resolved_content("tests/unit/foo.tcl", "proc f {} { return ok\n") is False

@@ -15,7 +15,6 @@ from scripts.backport.models import ConflictedFile, ResolutionResult
 from scripts.backport.utils import (
     has_conflict_markers,
     is_whitespace_only_conflict,
-    validate_resolved_content_detail,
 )
 
 if TYPE_CHECKING:
@@ -112,8 +111,7 @@ def _build_prompt(
         f"2. Understand the source PR's intent (preserve it — don't add new functionality).\n"
         f"3. Resolve each conflict by editing the files in place, keeping new "
         f"code inside the structural scope it belongs to.\n"
-        f"4. After editing, verify no conflict markers remain and the file is "
-        f"syntactically balanced (matching braces, valid syntax).\n\n"
+        f"4. After editing, verify no conflict markers remain.\n\n"
         f"CRITICAL constraints:\n"
         f"- ONLY edit the conflicted files listed above. Do NOT modify other files.\n"
         f"- Do NOT run `git add` or `git commit`.\n"
@@ -147,7 +145,9 @@ def _validate_file(
     - ``(failure_result, None)`` when the file is invalid for a reason that
       shouldn't trigger a retry (unchanged, unreadable).
     - ``(None, error_message)`` when the file is invalid for a reason that
-      should trigger a retry (markers remain, syntax invalid).
+      should trigger a retry (conflict markers remain).
+
+    Syntax/semantic correctness is the build's job, not this function's.
     """
     file_path = os.path.join(repo_dir, cf.path)
     try:
@@ -166,10 +166,6 @@ def _validate_file(
 
     if has_conflict_markers(content):
         return None, "conflict markers remain in the file"
-
-    valid, error = validate_resolved_content_detail(cf.path, content)
-    if not valid:
-        return None, error
 
     return ResolutionResult(
         path=cf.path, resolved_content=content,
@@ -195,16 +191,15 @@ def resolve_conflicts_with_claude(
     Pipeline:
     1. Whitespace-only conflicts are auto-resolved without an LLM call.
     2. The remaining files are sent to Claude Code in one call.
-    3. Each file's output is validated (no markers, valid syntax, file
-       actually changed).
-    4. If any file fails validation with a retryable error (markers remain
-       or syntax invalid), Claude is invoked once more with the specific
-       error as feedback. The retried files are re-validated.
+    3. Each file's output is checked for conflict markers and that Claude
+       actually edited it.
+    4. If any file still has conflict markers, Claude is invoked once
+       more with the specific error as feedback. The retried files are
+       re-checked.
 
     Build/test validation of the resulting branch is the sweep's job
-    (``_run_test_commands`` with registry validation rules), not the
-    resolver's. ``build_commands`` is accepted for backward compatibility
-    but unused here.
+    (``_run_test_commands``), not the resolver's. ``build_commands`` is
+    accepted for backward compatibility but unused here.
 
     Returns a ResolutionResult per conflicting file.
     """
@@ -305,8 +300,7 @@ def resolve_conflicts_with_claude(
         "Your previous resolution(s) failed validation:\n\n"
         f"{retry_files_list}\n\n"
         "Fix only the listed files. Do NOT edit any other files. "
-        "Do NOT run `git add` or `git commit`. "
-        "Verify the file is syntactically balanced after your edit."
+        "Do NOT run `git add` or `git commit`."
     )
     retry_result = run_agent("conflict_resolve_edit_only", retry_prompt, cwd=repo_dir)
     if retry_result.returncode != 0:
