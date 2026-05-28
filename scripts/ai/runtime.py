@@ -18,6 +18,7 @@ from scripts.ai.claude_code import (
 
 AgentProfileName = Literal[
     "conflict_resolve_edit_only",
+    "validation_repair_edit_only",
 ]
 
 
@@ -59,6 +60,15 @@ AGENT_PROFILES: dict[AgentProfileName, AgentProfile] = {
         timeout=3600,
         effort="max",
         max_turns=240,
+        writes_allowed=True,
+        output_schema="edited-files",
+    ),
+    "validation_repair_edit_only": AgentProfile(
+        name="validation_repair_edit_only",
+        allowed_tools="Read,Edit,MultiEdit,Grep,Glob",
+        timeout=1800,
+        effort="max",
+        max_turns=160,
         writes_allowed=True,
         output_schema="edited-files",
     ),

@@ -50,8 +50,12 @@ repos:
     project_owner: valkey-io
     project_owner_type: organization
     language: c                          # used in conflict resolver prompt
+    validation_setup_commands:
+      - "./ci/setup-backport-validation.sh" # optional; run once in clone
     build_commands:
       - "make -j$(nproc)"                # run before push; empty = skip
+    validate_each_candidate: false       # optional; validate after each pick
+    repair_validation_failures: false    # optional; one AI repair after failure
     backport_label: backport
     llm_conflict_label: ai-resolved-conflicts
     max_conflicting_files: 100
@@ -63,6 +67,8 @@ repos:
 ```
 
 By default, agent branches are pushed directly to `repo` under the `agent/backport/...` namespace and PRs are opened in that same upstream repository. `push_repo` is optional and only exists as an escape hatch for a real different-owner fork; same-owner `push_repo` values are rejected so staging repositories do not become the normal model.
+
+If validation fails after the sweep has reviewable commits, the agent pushes a draft PR with failure details instead of dropping the branch. Repos can opt into `validate_each_candidate`: a failure after an already-retained commit is reset so later candidates can continue, while a failure on the first retained candidate is preserved as a draft PR for review. Repos with expensive validation can instead keep one validation per sweep and opt into `repair_validation_failures`, which gives Claude Code one narrow edit-only attempt using the validation output and then re-runs validation once.
 
 See [`examples/repos.yml`](examples/repos.yml) for a multi-module example.
 
