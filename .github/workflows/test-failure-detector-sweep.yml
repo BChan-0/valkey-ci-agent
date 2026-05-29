@@ -3,7 +3,7 @@ name: Test Failure Detector
 on:
   schedule:
     # Run daily at 12:00 UTC — after the Daily CI (which runs at ~04:00 UTC)
-    - cron: "0 12 * * *"
+    - cron: "0 23 * * *"
   workflow_dispatch:
     inputs:
       repo:
@@ -50,6 +50,7 @@ jobs:
 
       - name: Generate GitHub App token
         id: generate-token
+        continue-on-error: true
         uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
         with:
           app-id: ${{ secrets.VALKEYRIE_BOT_APP_ID }}
@@ -58,10 +59,11 @@ jobs:
 
       - name: Run test failure detector
         env:
-          TARGET_TOKEN: ${{ steps.generate-token.outputs.token }}
-          TARGET_REPO: ${{ inputs.repo || 'valkey-io/valkey' }}
+          TARGET_TOKEN: ${{ steps.generate-token.outputs.token || secrets.TARGET_PAT }}
+          TARGET_REPO: ${{ inputs.repo || 'BChan-0/valkey' }}
           RUN_ID: ${{ inputs.run_id || '' }}
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run == true && 'true' || 'false' }}
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
         run: |
           set -euo pipefail
           args=(
