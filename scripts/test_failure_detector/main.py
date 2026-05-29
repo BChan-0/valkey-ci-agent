@@ -13,7 +13,6 @@ import argparse
 import json
 import logging
 import sys
-from pathlib import Path
 
 from github import Auth, Github
 
@@ -42,8 +41,8 @@ def _build_job_summary(
         f"**Source:** [{repo_full_name}](https://github.com/{repo_full_name}) "
         f"— [Run #{run_id}](https://github.com/{repo_full_name}/actions/runs/{run_id})",
         "",
-        f"| Metric | Count |",
-        f"|--------|-------|",
+        "| Metric | Count |",
+        "|--------|-------|",
         f"| Unique failures detected | {num_failures} |",
         f"| Issues created | {result.get('created', 0)} |",
         f"| Issues updated | {result.get('updated', 0)} |",
