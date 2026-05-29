@@ -27,7 +27,7 @@ permissions: {}
 jobs:
   detect-failures:
     name: "Detect test failures"
-    if: github.repository == 'valkey-io/valkey-ci-agent'
+    if: github.repository == 'BChan-0/valkey-ci-agent'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -50,6 +50,7 @@ jobs:
 
       - name: Generate GitHub App token
         id: generate-token
+        if: ${{ secrets.VALKEYRIE_BOT_APP_ID != '' }}
         uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
         with:
           app-id: ${{ secrets.VALKEYRIE_BOT_APP_ID }}
@@ -58,8 +59,8 @@ jobs:
 
       - name: Run test failure detector
         env:
-          TARGET_TOKEN: ${{ steps.generate-token.outputs.token }}
-          TARGET_REPO: ${{ inputs.repo || 'valkey-io/valkey' }}
+          TARGET_TOKEN: ${{ steps.generate-token.outputs.token || secrets.TARGET_PAT || github.token }}
+          TARGET_REPO: ${{ inputs.repo || 'BChan-0/valkey' }}
           RUN_ID: ${{ inputs.run_id || '' }}
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run == true && 'true' || 'false' }}
         run: |
