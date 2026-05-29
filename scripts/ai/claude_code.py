@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import subprocess
 import threading
 from typing import Any
@@ -51,6 +52,7 @@ def run_claude_code(
     effort: str | None = "max",
     max_turns: int = 200,
     allowed_tools: str = "Read,Edit,MultiEdit,Write,Bash,Glob,Grep",
+    disallowed_tools: str | None = None,
     env_allowlist: tuple[str, ...] | None = None,
 ) -> tuple[str, str, int]:
     """Run claude CLI and return (stdout, stderr, exit_code).
@@ -77,10 +79,17 @@ def run_claude_code(
     cmd = [
         "claude", "--print",
         "--max-turns", str(max_turns),
-        "--allowedTools", allowed_tools,
+        "--tools", allowed_tools,
         "--output-format", "stream-json",
         "--verbose",
     ]
+    denied = (
+        _default_disallowed_tools(allowed_tools)
+        if disallowed_tools is None
+        else disallowed_tools
+    )
+    if denied:
+        cmd.extend(["--disallowedTools", denied])
     if resolved_model:
         cmd.extend(["--model", resolved_model])
     if effort:
@@ -173,6 +182,16 @@ def _resolve_claude_model(model: str | None) -> str | None:
 def _resolve_bedrock_opus_model() -> str:
     """Resolve the Bedrock Opus model/inference profile used by Claude Code."""
     return os.environ.get(_BEDROCK_OPUS_MODEL_ENV, "").strip() or _DEFAULT_BEDROCK_OPUS_MODEL
+
+
+def _default_disallowed_tools(allowed_tools: str) -> str:
+    """Deny dangerous tools unless the profile explicitly allowed them."""
+    allowed = {
+        token.split("(", 1)[0]
+        for token in re.split(r"[\s,]+", allowed_tools.strip())
+        if token
+    }
+    return ",".join(tool for tool in ("Bash", "Write") if tool not in allowed)
 
 
 
