@@ -7,10 +7,10 @@ on:
   workflow_dispatch:
     inputs:
       repo:
-        description: "Repository to scan (default: valkey-io/valkey)"
+        description: "Repository to scan (default: BChan-0/valkey, change to valkey-io later)"
         required: false
         type: string
-        default: "valkey-io/valkey"
+        default: "BChan-0/valkey"
       run_id:
         description: "Specific workflow run ID to analyze (empty = latest Daily run)"
         required: false
