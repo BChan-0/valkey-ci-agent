@@ -5,6 +5,7 @@ repos:
     language: c
     build_commands:
       - "make -j$(nproc)"
+    repair_validation_failures: true
     backport_label: backport
     llm_conflict_label: ai-resolved-conflicts
     max_conflicting_files: 100
@@ -24,8 +25,13 @@ repos:
     project_owner: valkey-io
     project_owner_type: organization
     language: c++
+    # Use the upstream devcontainer image because release branches depend on
+    # its system packages; --privileged mirrors the repository's CI container.
+    validation_setup_commands:
+      - "docker build -t valkey-search-backport -f .devcontainer/Dockerfile ."
     build_commands:
-      - "./build.sh"
+      - "docker run --privileged --rm -v \"$(pwd):/workspace\" --user \"ubuntu:ubuntu\" valkey-search-backport sudo ci/build_ubuntu.sh"
+    repair_validation_failures: true
     backport_label: backport
     llm_conflict_label: ai-resolved-conflicts
     max_conflicting_files: 100
