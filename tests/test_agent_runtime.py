@@ -25,6 +25,7 @@ def test_run_agent_applies_profile_and_writes_hashed_evidence(tmp_path, monkeypa
 
     assert result.returncode == 0
     assert calls["allowed_tools"] == "Read,Edit,MultiEdit,Grep,Glob,Bash"
+    assert calls["disallowed_tools"] == "Write"
     assert "GITHUB_TOKEN" not in calls["env_allowlist"]
     assert calls["timeout"] == agent_runtime.AGENT_PROFILES["conflict_resolve_edit_only"].timeout
     assert calls["effort"] == "max"
@@ -52,3 +53,10 @@ def test_run_agent_writes_default_github_actions_evidence(tmp_path, monkeypatch)
 
     evidence_files = list((tmp_path / "agent-evidence").glob("*.json"))
     assert len(evidence_files) == 1
+
+
+def test_validation_repair_profile_denies_shell_and_write_tools() -> None:
+    profile = agent_runtime.AGENT_PROFILES["validation_repair_edit_only"]
+
+    assert profile.allowed_tools == "Read,Edit,MultiEdit,Grep,Glob"
+    assert profile.disallowed_tools == "Bash,Write"

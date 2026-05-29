@@ -34,6 +34,7 @@ class AgentProfile:
     writes_allowed: bool = False
     output_schema: str = "text"
     failure_policy: str = "fail-closed"
+    disallowed_tools: str = ""
     env_allowlist: tuple[str, ...] = DEFAULT_CLAUDE_ENV_ALLOWLIST
 
 
@@ -62,6 +63,7 @@ AGENT_PROFILES: dict[AgentProfileName, AgentProfile] = {
         max_turns=240,
         writes_allowed=True,
         output_schema="edited-files",
+        disallowed_tools="Write",
     ),
     "validation_repair_edit_only": AgentProfile(
         name="validation_repair_edit_only",
@@ -71,6 +73,7 @@ AGENT_PROFILES: dict[AgentProfileName, AgentProfile] = {
         max_turns=160,
         writes_allowed=True,
         output_schema="edited-files",
+        disallowed_tools="Bash,Write",
     ),
 }
 
@@ -106,6 +109,7 @@ def run_agent(
         effort=profile.effort,
         max_turns=profile.max_turns,
         allowed_tools=profile.allowed_tools,
+        disallowed_tools=profile.disallowed_tools,
         env_allowlist=profile.env_allowlist,
     )
     finished_at = datetime.now(timezone.utc).isoformat()

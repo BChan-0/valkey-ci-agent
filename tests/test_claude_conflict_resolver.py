@@ -72,6 +72,42 @@ def test_claude_resolves_conflict(tmp_path: Path) -> None:
     assert "untrusted data" in captured["prompt"]
 
 
+def test_claude_can_adapt_allowed_auto_merged_file(tmp_path: Path) -> None:
+    src = tmp_path / "src"
+    src.mkdir()
+    conflicted = src / "cluster.c"
+    auto_merged = src / "vector_base.h"
+    conflicted.write_text("<<<<<<< HEAD\nold\n=======\nnew\n>>>>>>> abc\n")
+    auto_merged.write_text("auto-merged source API\n")
+
+    cf = ConflictedFile(
+        path="src/cluster.c",
+        target_branch_content="old",
+        source_branch_content="new",
+    )
+    captured = {}
+
+    def mock_agent(_profile, prompt, **kw):
+        captured["prompt"] = prompt
+        conflicted.write_text("new\n")
+        auto_merged.write_text("adapted target-branch API\n")
+        return _agent_result('{"type":"result","result":"Resolved and adapted"}')
+
+    with patch("scripts.backport.conflict_resolver.run_agent", side_effect=mock_agent):
+        results = resolve_conflicts_with_claude(
+            str(tmp_path),
+            [cf],
+            _pr_context(),
+            allowed_paths=("src/cluster.c", "src/vector_base.h"),
+        )
+
+    assert {r.path for r in results} == {"src/cluster.c", "src/vector_base.h"}
+    adapted = next(r for r in results if r.path == "src/vector_base.h")
+    assert adapted.resolved_content == "adapted target-branch API\n"
+    assert "auto-merged changed files" in captured["prompt"]
+    assert "src/vector_base.h" in captured["prompt"]
+
+
 def test_unresolved_conflict_returns_none(tmp_path: Path) -> None:
     src = tmp_path / "src"
     src.mkdir()
@@ -196,19 +232,28 @@ def test_mixed_whitespace_and_real_conflicts(tmp_path: Path) -> None:
         target_branch_content="old",
         source_branch_content="new",
     )
+    captured = {}
 
     def mock_agent(_profile, prompt, **kw):
+        captured["prompt"] = prompt
         real_conflict.write_text("new\n")
         return _agent_result('{"type":"result","result":"Resolved"}')
 
     with patch("scripts.backport.conflict_resolver.run_agent", side_effect=mock_agent):
-        results = resolve_conflicts_with_claude(str(tmp_path), [ws_file, real_file], _pr_context())
+        results = resolve_conflicts_with_claude(
+            str(tmp_path),
+            [ws_file, real_file],
+            _pr_context(),
+            allowed_paths=("src/server.c", "src/cluster.c", "src/auto.c"),
+        )
 
     assert len(results) == 2
     ws_result = next(r for r in results if r.path == "src/server.c")
     real_result = next(r for r in results if r.path == "src/cluster.c")
     assert "whitespace" in ws_result.resolution_summary
     assert real_result.resolved_content == "new\n"
+    assert "src/auto.c" in captured["prompt"]
+    assert "src/server.c" not in captured["prompt"]
 
 
 def test_unchanged_file_without_markers_detected(tmp_path: Path) -> None:
@@ -269,5 +314,5 @@ def test_claude_editing_unlisted_file_is_rejected(tmp_path: Path) -> None:
 
     assert len(results) == 1
     assert results[0].resolved_content is None
-    assert "outside the conflict set" in results[0].resolution_summary
+    assert "outside the allowed cherry-pick file set" in results[0].resolution_summary
     assert "src/server.c" in results[0].resolution_summary

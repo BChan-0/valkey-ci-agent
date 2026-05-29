@@ -70,9 +70,11 @@ def test_run_claude_code_streams_json_and_uses_bedrock_env(monkeypatch, caplog):
     assert captured["cmd"][captured["cmd"].index("--effort") + 1] == "max"
     assert captured["cmd"][captured["cmd"].index("--output-format") + 1] == "stream-json"
     assert "--verbose" in captured["cmd"]
-    allowed_tools = captured["cmd"][captured["cmd"].index("--allowedTools") + 1]
-    assert "Edit" in allowed_tools
-    assert "MultiEdit" in allowed_tools
+    tools = captured["cmd"][captured["cmd"].index("--tools") + 1]
+    assert "Edit" in tools
+    assert "MultiEdit" in tools
+    assert "--allowedTools" not in captured["cmd"]
+    assert "--disallowedTools" not in captured["cmd"]
     assert captured["kwargs"]["cwd"] == "/tmp/checkout"
     assert captured["kwargs"]["env"]["CLAUDE_CODE_USE_BEDROCK"] == "1"
     assert captured["kwargs"]["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "us.anthropic.claude-opus-4-7"
@@ -121,6 +123,44 @@ def test_run_claude_code_does_not_inherit_github_tokens(monkeypatch):
     assert "GITHUB_TOKEN" not in captured["env"]
     assert "GH_TOKEN" not in captured["env"]
     assert "BACKPORT_GITHUB_TOKEN" not in captured["env"]
+
+
+def test_run_claude_code_denies_bash_and_write_when_not_allowed(monkeypatch):
+    captured = {}
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return _FakeProcess(cmd, stdout_text='{"type":"result","result":"ok"}\n', **kwargs)
+
+    monkeypatch.setattr(claude_code.subprocess, "Popen", fake_popen)
+
+    stdout, stderr, rc = claude_code.run_claude_code(
+        "prompt",
+        allowed_tools="Read,Edit,MultiEdit,Grep,Glob",
+    )
+
+    assert (stdout, stderr, rc) == ('{"type":"result","result":"ok"}\n', "", 0)
+    assert captured["cmd"][captured["cmd"].index("--tools") + 1] == "Read,Edit,MultiEdit,Grep,Glob"
+    assert captured["cmd"][captured["cmd"].index("--disallowedTools") + 1] == "Bash,Write"
+
+
+def test_run_claude_code_respects_explicit_empty_disallowed_tools(monkeypatch):
+    captured = {}
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return _FakeProcess(cmd, stdout_text='{"type":"result","result":"ok"}\n', **kwargs)
+
+    monkeypatch.setattr(claude_code.subprocess, "Popen", fake_popen)
+
+    stdout, stderr, rc = claude_code.run_claude_code(
+        "prompt",
+        allowed_tools="Read,Edit,MultiEdit,Grep,Glob",
+        disallowed_tools="",
+    )
+
+    assert (stdout, stderr, rc) == ('{"type":"result","result":"ok"}\n', "", 0)
+    assert "--disallowedTools" not in captured["cmd"]
 
 
 def test_run_claude_code_honors_model_env_overrides(monkeypatch):
