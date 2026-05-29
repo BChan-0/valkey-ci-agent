@@ -5,7 +5,6 @@ from __future__ import annotations
 import io
 import logging
 import zipfile
-from typing import Any
 
 from github import Github
 from github.WorkflowRun import WorkflowRun

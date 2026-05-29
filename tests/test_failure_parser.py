@@ -10,7 +10,6 @@ from scripts.test_failure_detector.parse_failures import (
     parse_and_deduplicate,
 )
 
-
 # --- Fixture data mimicking real all-test-failures.json ---
 
 SAMPLE_ALL_FAILURES = {
