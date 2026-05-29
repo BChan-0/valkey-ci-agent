@@ -405,7 +405,7 @@ def _process_branch(
                     cwd=tmpdir, capture_output=True, text=True,
                 )
                 if rebase_result.returncode != 0:
-                    subprocess.run(["git", "rebase", "--abort"], cwd=tmpdir, capture_output=True)
+                    _run_git(tmpdir, "rebase", "--abort")
                     raise RuntimeError(
                         f"Could not rebase existing backport branch "
                         f"{backport_branch} onto origin/{target_branch}. "
@@ -504,7 +504,7 @@ def _process_branch(
                         )
                         if not ok:
                             cr.outcome = "applied-validation-failed"
-                            cr.detail = output[:500]
+                            cr.detail = _validation_failure_detail(output)
                             if applied_count == 0:
                                 # Keep the first failing retained candidate on
                                 # the branch so maintainers can inspect the
@@ -587,7 +587,7 @@ def _process_branch(
                                 if item.outcome != "applied":
                                     continue
                                 item.outcome = "applied-validation-failed"
-                                item.detail = output[:500]
+                                item.detail = _validation_failure_detail(output)
                             logger.warning(
                                 "Validation failed for %s; pushing draft PR "
                                 "with failure details.\nOutput (last 4000 "
@@ -725,7 +725,7 @@ def _apply_candidate(
         if line.strip()
     ]
     if not conflicting_paths:
-        subprocess.run(["git", "cherry-pick", "--abort"], cwd=repo_dir, capture_output=True)
+        _abort_cherry_pick(repo_dir)
         stderr = result.stderr[:500]
         if "cherry-pick is now empty" in result.stderr or "nothing to commit" in result.stderr:
             return CandidateResult(
@@ -759,7 +759,7 @@ def _apply_candidate(
             source_branch_content=source_content,
         ))
     if target_missing_paths:
-        subprocess.run(["git", "cherry-pick", "--abort"], cwd=repo_dir, capture_output=True)
+        _abort_cherry_pick(repo_dir)
         paths = ", ".join(sorted(target_missing_paths))
         return CandidateResult(
             candidate.source_pr_number,
@@ -782,14 +782,17 @@ def _apply_candidate(
         validation_rules or [],
         conflicting_paths,
     )
+    allowed_resolution_paths = sorted(
+        set(conflicting_paths) | set(_changed_paths_in_index_or_worktree(repo_dir))
+    )
     resolutions = resolve_conflicts_with_claude(
         repo_dir, conflicting_files, pr_context,
         language=language, build_commands=resolver_validation_commands or None,
+        allowed_paths=allowed_resolution_paths,
     )
     unresolved = [r for r in resolutions if r.resolved_content is None]
     if unresolved:
-        # Abort cherry-pick
-        subprocess.run(["git", "cherry-pick", "--abort"], cwd=repo_dir, capture_output=True)
+        _abort_cherry_pick(repo_dir)
         # Surface why each file couldn't be resolved (truncated for readability).
         details = "; ".join(
             f"{r.path}: {(r.resolution_summary or 'unresolved')[:200]}"
@@ -812,7 +815,7 @@ def _apply_candidate(
             resolved_path.write_text(r.resolved_content, encoding="utf-8")
             _run_git(repo_dir, "add", r.path)
     if not _has_staged_changes(repo_dir):
-        subprocess.run(["git", "cherry-pick", "--abort"], cwd=repo_dir, capture_output=True)
+        _abort_cherry_pick(repo_dir)
         return CandidateResult(
             candidate.source_pr_number,
             candidate.source_pr_title,
@@ -836,13 +839,13 @@ def _apply_candidate(
         stderr_lower = (commit_result.stderr or "").lower()
         stdout_lower = (commit_result.stdout or "").lower()
         if "nothing to commit" in stderr_lower or "nothing to commit" in stdout_lower:
-            subprocess.run(["git", "cherry-pick", "--abort"], cwd=repo_dir, capture_output=True)
+            _abort_cherry_pick(repo_dir)
             return CandidateResult(
                 candidate.source_pr_number, candidate.source_pr_title,
                 "skipped-existing",
                 "resolution was already satisfied on target branch",
             )
-        subprocess.run(["git", "cherry-pick", "--abort"], cwd=repo_dir, capture_output=True)
+        _abort_cherry_pick(repo_dir)
         return CandidateResult(
             candidate.source_pr_number, candidate.source_pr_title,
             "skipped-conflict",
@@ -860,7 +863,7 @@ def _apply_candidate(
             "Reverting cherry-pick for #%d: %s",
             candidate.source_pr_number, issue,
         )
-        subprocess.run(["git", "reset", "--hard", "HEAD^"], cwd=repo_dir, capture_output=True)
+        _run_git(repo_dir, "reset", "--hard", "HEAD^")
         return CandidateResult(
             candidate.source_pr_number, candidate.source_pr_title,
             "skipped-conflict",
@@ -870,12 +873,50 @@ def _apply_candidate(
     return CandidateResult(candidate.source_pr_number, candidate.source_pr_title, "applied", "conflicts resolved by Claude Code")
 
 
+def _abort_cherry_pick(repo_dir: str) -> None:
+    """Abort an in-progress cherry-pick, failing closed if git cannot clean up."""
+    _run_git(repo_dir, "cherry-pick", "--abort")
+
+
 def _has_staged_changes(repo_dir: str) -> bool:
     result = subprocess.run(
         ["git", "diff", "--cached", "--quiet"],
         cwd=repo_dir, capture_output=True, text=True,
     )
     return result.returncode == 1
+
+
+def _changed_paths_in_index_or_worktree(repo_dir: str) -> tuple[str, ...]:
+    """Return staged, unstaged, and untracked paths with exact git path names."""
+    return _collect_git_paths_z(
+        repo_dir,
+        (
+            ("git", "diff", "--name-only", "-z"),
+            ("git", "diff", "--cached", "--name-only", "-z"),
+            ("git", "ls-files", "--others", "--exclude-standard", "-z"),
+        ),
+    )
+
+
+def _collect_git_paths_z(
+    repo_dir: str,
+    commands: tuple[tuple[str, ...], ...],
+) -> tuple[str, ...]:
+    paths: set[str] = set()
+    for command in commands:
+        result = subprocess.run(
+            list(command),
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"could not collect changed paths with {' '.join(command)}: "
+                + (result.stderr.strip()[:300] or "git command failed")
+            )
+        paths.update(path for path in result.stdout.split("\0") if path)
+    return tuple(sorted(paths))
 
 
 def _index_stage_exists(repo_dir: str, path: str, stage: int) -> bool:
@@ -1036,9 +1077,14 @@ def _repair_validation_failure_with_claude(
             prompt,
             cwd=repo_dir,
         )
+        diagnosis = _extract_agent_result_text(getattr(agent_result, "stdout", ""))
         if agent_result.returncode != 0:
             _run_git(repo_dir, "reset", "--hard", "HEAD")
-            detail = agent_result.stderr or "Claude Code validation repair failed"
+            detail = (
+                agent_result.stderr
+                or diagnosis
+                or "Claude Code validation repair failed"
+            )
             return False, detail[:500] or validation_output
 
         edited_paths = _worktree_changed_paths(repo_dir)
@@ -1052,11 +1098,17 @@ def _repair_validation_failure_with_claude(
                 "diff: " + ", ".join(unexpected_paths[:10]),
             )
         if not edited_paths:
-            return False, validation_output
+            return False, _validation_output_with_diagnosis(
+                validation_output,
+                diagnosis,
+            )
 
         _run_git(repo_dir, "add", *edited_paths)
         if not _has_staged_changes(repo_dir):
-            return False, validation_output
+            return False, _validation_output_with_diagnosis(
+                validation_output,
+                diagnosis,
+            )
         _run_git(repo_dir, "commit", "-m", "Repair backport validation failure")
 
         ok, output = _validate_backport_branch(
@@ -1074,10 +1126,44 @@ def _repair_validation_failure_with_claude(
             target_branch,
         )
         _run_git(repo_dir, "reset", "--hard", "HEAD^")
-        return False, output
+        return False, _validation_output_with_diagnosis(output, diagnosis)
     finally:
         if owns_log_path:
             _remove_validation_log_path(log_path)
+
+
+def _extract_agent_result_text(stdout: str) -> str:
+    result_text = ""
+    for line in stdout.strip().splitlines():
+        try:
+            event = json.loads(line)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") != "result" or "result" not in event:
+            continue
+        raw_result = event.get("result")
+        if isinstance(raw_result, str):
+            result_text = raw_result.strip()
+        elif raw_result is not None:
+            result_text = json.dumps(raw_result, sort_keys=True, default=str)
+    return result_text
+
+
+def _validation_output_with_diagnosis(
+    validation_output: str,
+    diagnosis: str,
+) -> str:
+    diagnosis = diagnosis.strip()
+    if not diagnosis:
+        return validation_output
+    return (
+        "Claude repair diagnosis:\n"
+        f"{diagnosis[:1200]}\n\n"
+        "Validation output:\n"
+        f"{validation_output}"
+    )
 
 
 def _create_validation_log_path() -> str:
@@ -1145,23 +1231,13 @@ def _build_validation_repair_prompt(
 
 
 def _worktree_changed_paths(repo_dir: str) -> tuple[str, ...]:
-    result = subprocess.run(
-        ["git", "status", "--porcelain"],
-        cwd=repo_dir,
-        capture_output=True,
-        text=True,
-        check=True,
+    return _collect_git_paths_z(
+        repo_dir,
+        (
+            ("git", "diff", "--name-only", "-z", "HEAD"),
+            ("git", "ls-files", "--others", "--exclude-standard", "-z"),
+        ),
     )
-    paths: list[str] = []
-    for line in result.stdout.splitlines():
-        if not line:
-            continue
-        path = line[3:].strip()
-        if " -> " in path:
-            path = path.split(" -> ", 1)[1].strip()
-        if path:
-            paths.append(path)
-    return tuple(paths)
 
 
 def _mark_repaired_results(results: list[CandidateResult]) -> None:
@@ -1372,8 +1448,7 @@ def _upsert_pr(gh: Any, base_repo: str, push_repo: str, target_branch: str, head
                draft: bool = False) -> str:
     repo = retry_github_call(lambda: gh.get_repo(base_repo), retries=2, description=f"get {base_repo}")
     body = _build_pr_body(result, validation_failed=draft)
-    title_prefix = "[backport][validation failed]" if draft else "[backport]"
-    title = f"{title_prefix} Backport sweep for {target_branch}"
+    title = f"[backport] Backport sweep for {target_branch}"
 
     if existing_pr:
         retry_github_call(lambda: existing_pr.edit(title=title, body=body), retries=2, description="update PR")
@@ -1476,6 +1551,36 @@ def _result_is_on_backport_branch(result: CandidateResult) -> bool:
     )
 
 
+def _repair_diagnosis_from_detail(detail: str) -> str:
+    prefix = "Claude repair diagnosis:\n"
+    if not detail.startswith(prefix):
+        return ""
+    body = detail[len(prefix):]
+    return body.split("\n\nValidation output:\n", 1)[0].strip()
+
+
+def _validation_failure_detail(output: str) -> str:
+    """Preserve AI diagnosis while keeping routine validation logs compact."""
+    diagnosis = _repair_diagnosis_from_detail(output)
+    if not diagnosis:
+        return _compact_validation_output(output)
+    marker = "\n\nValidation output:\n"
+    validation_tail = output.split(marker, 1)[1] if marker in output else ""
+    return (
+        "Claude repair diagnosis:\n"
+        f"{diagnosis[:1500]}\n\n"
+        "Validation output:\n"
+        f"{_compact_validation_output(validation_tail)}"
+    )
+
+
+def _compact_validation_output(output: str, *, limit: int = 500) -> str:
+    text = output.strip()
+    if len(text) <= limit:
+        return text
+    return text[-limit:]
+
+
 def _build_pr_body(
     result: BranchSweepResult,
     *,
@@ -1496,6 +1601,20 @@ def _build_pr_body(
             "of losing the work in scheduled-run logs.",
             "",
         ])
+        diagnoses = [
+            diagnosis
+            for r in result.results
+            if (diagnosis := _repair_diagnosis_from_detail(r.detail))
+        ]
+        if diagnoses:
+            lines.extend([
+                "### Claude repair diagnosis",
+                "",
+                "```text",
+                diagnoses[0][:1500],
+                "```",
+                "",
+            ])
     # The Applied table reflects the cumulative state of the backport
     # branch: PRs cherry-picked in this run AND PRs already on the branch
     # from prior sweeps. This way the PR description always matches the

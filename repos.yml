@@ -5,6 +5,7 @@ repos:
     language: c
     build_commands:
       - "make -j$(nproc)"
+    repair_validation_failures: true
     backport_label: backport
     llm_conflict_label: ai-resolved-conflicts
     max_conflicting_files: 100

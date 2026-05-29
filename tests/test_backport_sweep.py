@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
 from github.GithubException import GithubException
 
 from scripts.backport import sweep as backport_sweep
@@ -74,7 +75,7 @@ def test_apply_candidate_aborts_empty_cherry_pick(monkeypatch, tmp_path):
     assert result.outcome == "skipped-existing"
     assert result.detail == "already applied or empty cherry-pick"
     assert ("fetch", "origin", "abc123") in git_calls
-    assert ["git", "cherry-pick", "--abort"] in subprocess_calls
+    assert ("cherry-pick", "--abort") in git_calls
 
 
 def test_apply_candidate_retries_squash_merge_commit_without_mainline(
@@ -145,6 +146,12 @@ def test_apply_candidate_skips_noop_conflict_resolution(monkeypatch, tmp_path):
             return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="conflict")
         if cmd[:4] == ["git", "diff", "--name-only", "--diff-filter=U"]:
             return subprocess.CompletedProcess(cmd, 0, stdout="conflict.txt\n", stderr="")
+        if cmd in (
+            ["git", "diff", "--name-only", "-z"],
+            ["git", "diff", "--cached", "--name-only", "-z"],
+            ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+        ):
+            return subprocess.CompletedProcess(cmd, 0, stdout="conflict.txt\0", stderr="")
         if cmd[:2] == ["git", "show"]:
             return subprocess.CompletedProcess(cmd, 0, stdout="target content\n", stderr="")
         if cmd[:3] == ["git", "cat-file", "-e"]:
@@ -180,7 +187,7 @@ def test_apply_candidate_skips_noop_conflict_resolution(monkeypatch, tmp_path):
     assert result.detail == "resolution was already satisfied on target branch"
     assert ("add", "conflict.txt") in git_calls
     assert ["git", "commit", "--no-edit"] not in subprocess_calls
-    assert ["git", "cherry-pick", "--abort"] in subprocess_calls
+    assert ("cherry-pick", "--abort") in git_calls
 
 
 def test_apply_candidate_does_not_recreate_target_missing_file(monkeypatch, tmp_path):
@@ -236,7 +243,62 @@ def test_apply_candidate_does_not_recreate_target_missing_file(monkeypatch, tmp_
     assert ("add", "src/cluster_legacy.c") not in git_calls
     assert missing_on_target.exists()
     assert ["git", "commit", "--no-edit"] not in subprocess_calls
-    assert ["git", "cherry-pick", "--abort"] in subprocess_calls
+    assert ("cherry-pick", "--abort") in git_calls
+
+
+def test_apply_candidate_fails_closed_when_abort_fails(monkeypatch, tmp_path):
+    conflicted_file = tmp_path / "conflict.txt"
+    conflicted_file.write_text("<<<<<<< HEAD\ntarget\n=======\nsource\n>>>>>>> source\n", encoding="utf-8")
+    candidate = ProjectBackportCandidate(
+        source_pr_number=631,
+        source_pr_title="Fix ordering",
+        source_pr_url="https://github.com/valkey-io/valkey-search/pull/631",
+        target_branch="1.1",
+        merge_commit_sha="abc123",
+    )
+
+    def fake_run_git(_repo_dir, *args, **_kwargs):
+        if args == ("cherry-pick", "--abort"):
+            raise subprocess.CalledProcessError(1, ["git", *args])
+
+    def fake_subprocess_run(cmd, **_kwargs):
+        if cmd[:2] == ["git", "cherry-pick"]:
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="conflict")
+        if cmd[:4] == ["git", "diff", "--name-only", "--diff-filter=U"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="conflict.txt\n", stderr="")
+        if cmd in (
+            ["git", "diff", "--name-only", "-z"],
+            ["git", "diff", "--cached", "--name-only", "-z"],
+            ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+        ):
+            return subprocess.CompletedProcess(cmd, 0, stdout="conflict.txt\0", stderr="")
+        if cmd[:2] == ["git", "show"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="target\n", stderr="")
+        if cmd[:3] == ["git", "cat-file", "-e"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    monkeypatch.setattr(backport_sweep, "_run_git", fake_run_git)
+    monkeypatch.setattr(backport_sweep.subprocess, "run", fake_subprocess_run)
+    monkeypatch.setattr(
+        backport_sweep,
+        "resolve_conflicts_with_claude",
+        lambda *_args, **_kwargs: [
+            ResolutionResult(
+                path="conflict.txt",
+                resolved_content=None,
+                resolution_summary="unresolved",
+            )
+        ],
+    )
+
+    with pytest.raises(subprocess.CalledProcessError):
+        backport_sweep._apply_candidate(
+            repo_dir=str(tmp_path),
+            candidate=candidate,
+            repo_full_name="valkey-io/valkey-search",
+            git_env={},
+        )
 
 
 def test_run_test_commands_returns_failure_output(tmp_path):
@@ -446,7 +508,7 @@ def test_upsert_pr_creates_draft_when_validation_failed():
 
     _, kwargs = mock_repo.create_pull.call_args
     assert kwargs["draft"] is True
-    assert kwargs["title"] == "[backport][validation failed] Backport sweep for 8.1"
+    assert kwargs["title"] == "[backport] Backport sweep for 8.1"
     assert "## Validation failed" in kwargs["body"]
     assert "## Applied (validation failed)" in kwargs["body"]
     assert "## Needs attention" not in kwargs["body"]
@@ -1698,6 +1760,74 @@ def test_repair_validation_failure_invokes_edit_only_agent(monkeypatch):
     # after Claude edits.
     assert validation_calls == [["make"]]
     assert log_paths == [None]
+
+
+def test_worktree_changed_paths_handles_spaces(tmp_path):
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True)
+    src = tmp_path / "src"
+    src.mkdir()
+    tracked = src / "file with space.c"
+    untracked = src / "new file with space.c"
+    tracked.write_text("old\n", encoding="utf-8")
+    subprocess.run(["git", "add", "src/file with space.c"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "base"], cwd=tmp_path, check=True)
+
+    tracked.write_text("new\n", encoding="utf-8")
+    untracked.write_text("created\n", encoding="utf-8")
+
+    assert backport_sweep._worktree_changed_paths(str(tmp_path)) == (
+        "src/file with space.c",
+        "src/new file with space.c",
+    )
+    assert backport_sweep._changed_paths_in_index_or_worktree(str(tmp_path)) == (
+        "src/file with space.c",
+        "src/new file with space.c",
+    )
+
+
+def test_build_pr_body_surfaces_claude_repair_diagnosis():
+    result = BranchSweepResult(
+        target_branch="8.1",
+        candidates_found=1,
+        results=[
+            CandidateResult(
+                10,
+                "Broken compile",
+                "applied-validation-failed",
+                "Claude repair diagnosis:\nmissing include in tag.cc\n\n"
+                "Validation output:\nwarning tail",
+            ),
+        ],
+    )
+
+    body = backport_sweep._build_pr_body(result, validation_failed=True)
+
+    assert "### Claude repair diagnosis" in body
+    assert "missing include in tag.cc" in body
+
+
+def test_validation_failure_detail_uses_tail_without_repair_diagnosis():
+    detail = backport_sweep._validation_failure_detail(
+        "configure output\n" + ("compiler noise\n" * 80) + "undefined reference to objectGetVal\n"
+    )
+
+    assert "configure output" not in detail
+    assert "undefined reference to objectGetVal" in detail
+
+
+def test_validation_failure_detail_uses_tail_with_repair_diagnosis():
+    detail = backport_sweep._validation_failure_detail(
+        "Claude repair diagnosis:\n"
+        "clean cherry-pick used a newer API\n\n"
+        "Validation output:\n"
+        + ("compiler noise\n" * 80)
+        + "undefined reference to objectGetVal\n"
+    )
+
+    assert "clean cherry-pick used a newer API" in detail
+    assert "undefined reference to objectGetVal" in detail
 
 
 # ---------------------------------------------------------------------------
