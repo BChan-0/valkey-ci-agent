@@ -56,7 +56,6 @@ class TestLoadRegistry:
         assert entry.build_commands == ()
         assert entry.validation_setup_commands == ()
         assert entry.validation_rules == ()
-        assert entry.validate_each_candidate is False
         assert entry.repair_validation_failures is False
         assert entry.backport_label == "backport"
         assert entry.llm_conflict_label == "ai-resolved-conflicts"
@@ -73,7 +72,6 @@ class TestLoadRegistry:
                     "commands": ["./runtest --single unit/cluster/slot-migration"],
                 }
             ],
-            validate_each_candidate=True,
             repair_validation_failures=True,
             backport_label="bp",
             llm_conflict_label="ai",
@@ -96,7 +94,6 @@ class TestLoadRegistry:
                 commands=("./runtest --single unit/cluster/slot-migration",),
             ),
         )
-        assert entry.validate_each_candidate is True
         assert entry.repair_validation_failures is True
         assert entry.backport_label == "bp"
         assert entry.llm_conflict_label == "ai"
@@ -243,12 +240,6 @@ class TestValidation:
             ValueError,
             match=r"validation_setup_commands\[1\] must be a non-empty string",
         ):
-            load_registry(path)
-
-    def test_validate_each_candidate_must_be_boolean(self, tmp_path):
-        data = _minimal_registry(repos=[_minimal_repo(validate_each_candidate="yes")])
-        path = _write_registry(tmp_path, data)
-        with pytest.raises(ValueError, match="validate_each_candidate must be a boolean"):
             load_registry(path)
 
     def test_repair_validation_failures_must_be_boolean(self, tmp_path):
