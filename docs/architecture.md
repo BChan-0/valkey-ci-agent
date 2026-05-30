@@ -31,6 +31,9 @@ sweep.py (daily cron or manual dispatch)
 - `scripts/backport/main.py` — single-PR backport (manual dispatch)
 - `scripts/backport/matrix.py` — GitHub Actions matrix generation from `repos.yml`
 - `scripts/backport/registry.py` — typed registry loader and validation
+- `scripts/backport/sweep_*.py` — focused sweep support modules:
+  typed sweep results, Git workspace operations, GitHub PR operations,
+  GraphQL access, validation command execution, and Markdown reporting
 
 ### AI Layer
 
@@ -48,16 +51,15 @@ only the conflicted files in place. The prompt is parameterized by the repo
 language from `repos.yml`.
 
 Validation first runs the registry's optional `validation_setup_commands`,
-then runs `build_commands` before push. Repos can opt into
-`validate_each_candidate` to validate after each cherry-pick. After one
-candidate has been retained, later validation failures are reset so the sweep
-can keep moving; when the first retained candidate fails, the broken branch is
-preserved as a draft PR for review. For expensive validation, repos can instead
-use `repair_validation_failures`: the sweep runs one batch validation, gives
-Claude Code one edit-only repair attempt scoped to the backport diff when that
-validation fails, and re-runs validation once before deciding whether to push a
-draft PR. Repos with no `build_commands` configured rely on upstream CI for
-verification.
+then validates the branch after each cherry-pick. The sweep branch is kept
+green: a cherry-pick is only kept if the whole branch still validates, and a
+failure is reset off the branch so it can never block later candidates. The
+run keeps a single validated cherry-pick (`--max-candidates 1`) and records
+skipped or failed candidates in the PR's "Needs attention" section without
+committing them. When `repair_validation_failures` is enabled, Claude Code
+gets one edit-only repair attempt scoped to the backport diff before a failing
+cherry-pick is dropped. Repos with no `build_commands` configured rely on
+upstream CI for verification.
 
 ### Common Infrastructure
 

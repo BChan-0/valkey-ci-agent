@@ -51,7 +51,6 @@ def build_matrix(
                 "validation_setup_commands_json": json.dumps(
                     list(repo_entry.validation_setup_commands)
                 ),
-                "validate_each_candidate": repo_entry.validate_each_candidate,
                 "repair_validation_failures": repo_entry.repair_validation_failures,
             })
 

@@ -213,9 +213,10 @@ class BackportPRCreator:
                     label, self._base_repo, exc,
                 )
                 return
-        except Exception as exc:  # pragma: no cover - defensive
+        except Exception as exc:
+            # Best-effort: a transport/parse failure must not abort PR creation.
             logger.warning(
-                "Unexpected error checking label %r on %s: %s",
+                "Could not verify label %r on %s: %s",
                 label, self._base_repo, exc,
             )
             return
@@ -240,6 +241,12 @@ class BackportPRCreator:
                 "Failed to create label %r on %s: %s",
                 label, self._base_repo, exc,
             )
+        except Exception as exc:
+            # Best-effort: a transport/parse failure must not abort PR creation.
+            logger.error(
+                "Failed to create label %r on %s: %s",
+                label, self._base_repo, exc,
+            )
 
     @staticmethod
     def build_pr_body(
@@ -249,16 +256,7 @@ class BackportPRCreator:
         *,
         applied_commits: list[str] | None = None,
     ) -> str:
-        """Build the PR body with links, commit list, conflict info.
-
-        Includes:
-        * Link to the source PR
-        * List of cherry-picked commit SHAs
-        * Whether conflicts were encountered
-        * Per-file LLM resolution summaries (when applicable)
-        * Human review disclaimer (when any file was LLM-resolved)
-
-        """
+        """Build the PR body with links, commit list, conflict info."""
         sections: list[str] = []
         results = resolution_results or []
         resolved_count = sum(result.resolved_content is not None for result in results)
