@@ -73,7 +73,7 @@ def test_run_claude_code_streams_json_and_uses_bedrock_env(monkeypatch, caplog):
     tools = captured["cmd"][captured["cmd"].index("--tools") + 1]
     assert "Edit" in tools
     assert "MultiEdit" in tools
-    assert "--allowedTools" not in captured["cmd"]
+    assert "--dangerously-skip-permissions" in captured["cmd"]
     assert "--disallowedTools" not in captured["cmd"]
     assert captured["kwargs"]["cwd"] == "/tmp/checkout"
     assert captured["kwargs"]["env"]["CLAUDE_CODE_USE_BEDROCK"] == "1"
@@ -141,6 +141,7 @@ def test_run_claude_code_denies_bash_and_write_when_not_allowed(monkeypatch):
 
     assert (stdout, stderr, rc) == ('{"type":"result","result":"ok"}\n', "", 0)
     assert captured["cmd"][captured["cmd"].index("--tools") + 1] == "Read,Edit,MultiEdit,Grep,Glob"
+    assert "--dangerously-skip-permissions" in captured["cmd"]
     assert captured["cmd"][captured["cmd"].index("--disallowedTools") + 1] == "Bash,Write"
 
 

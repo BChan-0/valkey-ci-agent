@@ -54,8 +54,7 @@ repos:
       - "./ci/setup-backport-validation.sh" # optional; run once in clone
     build_commands:
       - "make -j$(nproc)"                # run before push; empty = skip
-    validate_each_candidate: false       # optional; validate after each pick
-    repair_validation_failures: false    # optional; one AI repair after failure
+    repair_validation_failures: false    # optional; one AI repair attempt on failure
     backport_label: backport
     llm_conflict_label: ai-resolved-conflicts
     max_conflicting_files: 100
@@ -68,7 +67,7 @@ repos:
 
 By default, agent branches are pushed directly to `repo` under the `agent/backport/...` namespace and PRs are opened in that same upstream repository. `push_repo` is optional and only exists as an escape hatch for a real different-owner fork; same-owner `push_repo` values are rejected so staging repositories do not become the normal model.
 
-If validation fails after the sweep has reviewable commits, the agent pushes a draft PR with failure details instead of dropping the branch. Repos can opt into `validate_each_candidate`: a failure after an already-retained commit is reset so later candidates can continue, while a failure on the first retained candidate is preserved as a draft PR for review. Repos with expensive validation can instead keep one validation per sweep and opt into `repair_validation_failures`, which gives Claude Code one narrow edit-only attempt using the validation output and then re-runs validation once.
+The sweep branch is always kept green: a candidate is only kept if the whole branch still validates after the cherry-pick, so one bad commit can never block later candidates. Each scheduled run keeps a single validated cherry-pick (`--max-candidates 1`) and reports candidates that were skipped or failed validation in the PR's "Needs attention" section without committing them. When `repair_validation_failures` is enabled, Claude Code gets one narrow edit-only attempt to fix a failing cherry-pick before it is dropped.
 
 See [`examples/repos.yml`](examples/repos.yml) for a multi-module example.
 
