@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import io
 import logging
+import re
+import urllib.request
 import zipfile
 
 from github import Github
@@ -12,6 +14,34 @@ from github.WorkflowRun import WorkflowRun
 from scripts.common.github_client import retry_github_call
 
 logger = logging.getLogger(__name__)
+
+
+class _NoAuthRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Strip Authorization header when following redirects.
+
+    GitHub's artifact download endpoint returns a 302 to a temporary blob
+    storage URL. That URL uses its own auth baked into the query string;
+    forwarding the GitHub Authorization header causes a 401.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return urllib.request.Request(newurl, headers={
+            "Accept": "application/octet-stream",
+        })
+
+
+def _download_artifact(url: str, github_token: str) -> bytes:
+    """Download a GitHub artifact zip, handling the auth-stripping redirect."""
+    opener = urllib.request.build_opener(_NoAuthRedirectHandler)
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {github_token}",
+            "Accept": "application/vnd.github+json",
+        },
+    )
+    with opener.open(req, timeout=120) as resp:
+        return resp.read()
 
 
 def get_latest_daily_run(
@@ -53,7 +83,7 @@ def get_latest_daily_run(
     )
 
     for run in runs:
-        if run.conclusion == "cancelled":
+        if run.conclusion in ("cancelled", "skipped"):
             continue
         if run.status == "completed":
             logger.info(
@@ -100,36 +130,9 @@ def download_all_test_failures(
 
     logger.info("Downloading artifact: %s (id=%d)", target_artifact.name, target_artifact.id)
 
-    # Use urllib to download the artifact zip. The GitHub API returns a 302
-    # redirect to a temporary blob storage URL. We must NOT forward the
-    # Authorization header to the redirect target (it causes a 401).
-    import urllib.request
-
     url = target_artifact.archive_download_url
-
-    class _NoAuthRedirectHandler(urllib.request.HTTPRedirectHandler):
-        """Strip Authorization header when following redirects."""
-
-        def redirect_request(self, req, fp, code, msg, headers, newurl):
-            new_req = urllib.request.Request(newurl, headers={
-                "Accept": "application/octet-stream",
-            })
-            return new_req
-
-    def _download() -> bytes:
-        opener = urllib.request.build_opener(_NoAuthRedirectHandler)
-        req = urllib.request.Request(
-            url,
-            headers={
-                "Authorization": f"Bearer {github_token}",
-                "Accept": "application/vnd.github+json",
-            },
-        )
-        with opener.open(req, timeout=120) as resp:
-            return resp.read()
-
     zip_bytes = retry_github_call(
-        _download,
+        lambda: _download_artifact(url, github_token),
         retries=3,
         description="download artifact zip",
     )
@@ -155,7 +158,6 @@ def get_job_urls(
     Also includes normalized variants (parentheses replaced with dashes,
     spaces replaced with dashes) for fuzzy matching.
     """
-    import re
 
     repo = retry_github_call(
         lambda: gh.get_repo(repo_full_name),

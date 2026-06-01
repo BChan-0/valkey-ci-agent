@@ -2,15 +2,15 @@ name: Test Failure Detector
 
 on:
   schedule:
-    # Run daily at 12:00 UTC — after the Daily CI (which runs at ~04:00 UTC)
+    # Run daily at 23:00 UTC — after the Daily CI (begins at 00:00 UTC and usually does not go over 8 hours), may adjust this timing later
     - cron: "0 23 * * *"
   workflow_dispatch:
     inputs:
       repo:
-        description: "Repository to scan (default: BChan-0/valkey, change to valkey-io later)"
+        description: "Repository to scan (default: BChan-0/valkey, change to valkey-io later)" # EDIT BEFORE PR
         required: false
         type: string
-        default: "BChan-0/valkey"
+        default: "BChan-0/valkey" # EDIT BEFORE PR
       run_id:
         description: "Specific workflow run ID to analyze (empty = latest Daily run)"
         required: false
@@ -22,18 +22,21 @@ on:
         default: false
         type: boolean
 
-permissions: {}
+permissions: 
+  contents: read
+  issues: write
 
 jobs:
   detect-failures:
     name: "Detect test failures"
-    if: github.repository == 'BChan-0/valkey-ci-agent'
+    if: >-  # EDIT BEFORE PR
+      (github.event_name == 'workflow_dispatch' || 
+      github.repository == 'BChan-0/valkey-ci-agent')
     runs-on: ubuntu-latest
-    timeout-minutes: 10
     permissions:
       contents: read
     steps:
-      - name: Check out agent repository
+      - name: Check out agent repository # ???
         uses: actions/checkout@v6
         with:
           persist-credentials: false
@@ -50,7 +53,7 @@ jobs:
 
       - name: Generate GitHub App token
         id: generate-token
-        continue-on-error: true
+        continue-on-error: true # EDIT BEFORE PR: once migrated, token will always be on valkey-io so no need for fallback
         uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
         with:
           app-id: ${{ secrets.VALKEYRIE_BOT_APP_ID }}
@@ -59,11 +62,11 @@ jobs:
 
       - name: Run test failure detector
         env:
-          TARGET_TOKEN: ${{ steps.generate-token.outputs.token || secrets.TARGET_PAT }}
-          TARGET_REPO: ${{ inputs.repo || 'BChan-0/valkey' }}
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true # Added to suppress JS20 warning , can remove later
+          TARGET_TOKEN: ${{ steps.generate-token.outputs.token || secrets.TARGET_PAT }}  # EDIT BEFORE PR: once migrated, no need for PAT fallback
+          TARGET_REPO: ${{ inputs.repo || 'BChan-0/valkey' }} # EDIT BEFORE PR
           RUN_ID: ${{ inputs.run_id || '' }}
-          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run == true && 'true' || 'false' }}
-          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run == true && 'true' || 'false' }} 
         run: |
           set -euo pipefail
           args=(
