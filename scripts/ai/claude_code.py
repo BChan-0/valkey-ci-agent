@@ -80,6 +80,13 @@ def run_claude_code(
         "claude", "--print",
         "--max-turns", str(max_turns),
         "--tools", allowed_tools,
+        # Three layers, each doing distinct work: --tools is the set of tools
+        # that exist, --disallowedTools (below) hard-denies specific ones, and
+        # --dangerously-skip-permissions drops the interactive approval prompt
+        # that otherwise blocks every write in headless --print mode. The env
+        # is already hardened (GitHub tokens stripped, AWS-only) and runs in
+        # throwaway checkouts.
+        "--dangerously-skip-permissions",
         "--output-format", "stream-json",
         "--verbose",
     ]
@@ -126,24 +133,16 @@ def run_claude_code(
         returncode = process.wait(timeout=timeout)
         reader.join(timeout=5)
         stdout = "".join(stdout_parts)
-        logger.info(
-            "Claude exited %d (%d chars stdout, %d chars stderr).",
-            returncode, len(stdout), 0,
-        )
+        logger.info("Claude exited %d (%d chars stdout).", returncode, len(stdout))
         return stdout, "", returncode
     except subprocess.TimeoutExpired:
         if process is not None:
             try:
                 process.kill()
-            except Exception:
+            except ProcessLookupError:
                 pass
-        # Wait briefly for the reader thread to flush any remaining buffered
-        # output before we read stdout_parts. Without this the returned
-        # stdout may be truncated mid-line or miss the final error.
-        try:
-            reader.join(timeout=5)
-        except Exception:
-            pass
+        # Let the reader thread flush buffered output before we read it.
+        reader.join(timeout=5)
         stdout = "".join(stdout_parts)
         logger.error("Claude timed out after %ds.", timeout)
         return stdout, f"timeout after {timeout}s", 1
@@ -192,8 +191,6 @@ def _default_disallowed_tools(allowed_tools: str) -> str:
         if token
     }
     return ",".join(tool for tool in ("Bash", "Write") if tool not in allowed)
-
-
 
 
 def _log_stream_event(raw_line: str) -> None:
