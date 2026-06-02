@@ -92,4 +92,3 @@ def parse_and_deduplicate(
     unique_failures = list(grouped.values())
     logger.info("Total unique failures: %d", len(unique_failures))
     return unique_failures
-    
