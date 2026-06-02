@@ -12,7 +12,7 @@ on:
         type: string
         default: "BChan-0/valkey" # EDIT BEFORE PR
       run_id:
-        description: "Specific workflow run ID to analyze (empty = latest Daily run)"
+        description: "Specific workflow run ID to analyze (empty = latest completed Daily run)"
         required: false
         type: string
         default: ""

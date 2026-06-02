@@ -8,7 +8,6 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-
 @dataclass
 class JobReference:
     """A reference to a specific CI job where a test failed."""
@@ -16,7 +15,6 @@ class JobReference:
     job: str
     suite: str
     url: str = ""
-
 
 @dataclass
 class UniqueFailure:
@@ -33,8 +31,7 @@ class UniqueFailure:
 
 def parse_and_deduplicate(
     all_failures: dict[str, Any],
-
-
+    job_urls: dict[str, str],
 ) -> list[UniqueFailure]:
     """Parse the all-test-failures JSON and deduplicate by test name + file.
 
