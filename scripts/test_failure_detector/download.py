@@ -74,20 +74,22 @@ def get_latest_daily_run(
         return None
 
     runs = retry_github_call(
-        lambda: daily_workflow.get_runs(branch=branch),
+        lambda: daily_workflow.get_runs(branch=branch, status="completed"),
         retries=3,
         description=f"list runs for {workflow_name}",
     )
 
     for run in runs:
-        if run.conclusion in ("cancelled", "skipped"):
-            continue
-        if run.status == "completed":
-            logger.info(
-                "Found daily run #%d (id=%d, conclusion=%s, created=%s)",
-                run.run_number, run.id, run.conclusion, run.created_at,
+        if run.conclusion in ("cancelled", "skipped", None):
+            logger.debug(
+                "Skipping run #%d (conclusion=%s)", run.run_number, run.conclusion,
             )
-            return run
+            continue
+        logger.info(
+            "Found daily run #%d (id=%d, conclusion=%s, created=%s)",
+            run.run_number, run.id, run.conclusion, run.created_at,
+        )
+        return run
 
     logger.warning("No completed non-cancelled run found for %s/%s", workflow_name, branch)
     return None
