@@ -278,3 +278,4 @@ class TestGetJobUrls:
 
         result = get_job_urls(mock_gh, "owner/repo", 123)
         assert result == {}
+        
