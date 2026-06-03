@@ -17,17 +17,23 @@ from scripts.backport.sweep import (
     CandidateResult,
     ProjectBackportCandidate,
 )
-from scripts.backport.sweep_apply import apply_candidate, check_applied_commit_size
+from scripts.backport.sweep_apply import apply_candidate
 from scripts.backport.sweep_git import (
     changed_paths_in_index_or_worktree,
     clone_target_branch,
+    list_applied_prs_on_branch,
     push_backport_branch,
     safe_tmp_component,
     sync_target_branch_to_source,
     worktree_changed_paths,
 )
 from scripts.backport.sweep_prs import upsert_pr
-from scripts.backport.sweep_reporting import build_pr_body, build_summary
+from scripts.backport.sweep_reporting import (
+    build_pr_body,
+    build_summary,
+    parse_previous_applied,
+    parse_previous_failed,
+)
 from scripts.backport.sweep_validation import (
     build_validation_repair_prompt,
     repair_validation_failure_with_claude,
@@ -35,6 +41,8 @@ from scripts.backport.sweep_validation import (
     validate_backport_branch,
 )
 from scripts.common.git_auth import GitAuth
+
+DETAIL = backport_sweep.DETAIL_ALREADY_ON_SWEEP_BRANCH
 
 
 def test_git_auth_keeps_askpass_outside_clone_destination(tmp_path):
@@ -496,6 +504,64 @@ def test_upsert_pr_skips_ready_promotion_when_already_open():
     mock_gql.execute.assert_not_called()
 
 
+def test_upsert_pr_preserves_existing_applied_detail_on_update():
+    """Already-on-branch candidates keep richer detail from the prior body."""
+    mock_gh = MagicMock()
+    mock_repo = MagicMock()
+    mock_gh.get_repo.return_value = mock_repo
+
+    existing_pr = MagicMock()
+    existing_pr.number = 1001
+    existing_pr.html_url = "https://github.com/valkey-io/valkey/pull/1001"
+    existing_pr.draft = False
+    existing_pr.body = "\n".join(
+        [
+            "# Backport sweep for 8.0",
+            "",
+            "## Applied",
+            "",
+            "| Source PR | Title | Detail |",
+            "|---|---|---|",
+            "| #2915 | Fix CLUSTER SLOTS crash | conflicts resolved by Claude Code |",
+        ]
+    )
+
+    result = BranchSweepResult(
+        target_branch="8.0",
+        candidates_found=1,
+        results=[
+            CandidateResult(
+                2915,
+                "Fix CLUSTER SLOTS crash",
+                "skipped-existing",
+                backport_sweep.DETAIL_ALREADY_ON_SWEEP_BRANCH,
+            )
+        ],
+    )
+
+    upsert_pr(
+        mock_gh,
+        "valkey-io/valkey",
+        "valkey-io/valkey",
+        "8.0",
+        "agent/backport/sweep/8.0",
+        result,
+        existing_pr=existing_pr,
+        branch_applied=[
+            CandidateResult(
+                2915,
+                "Fix CLUSTER SLOTS crash",
+                "skipped-existing",
+                backport_sweep.DETAIL_ALREADY_ON_SWEEP_BRANCH,
+            )
+        ],
+    )
+
+    _, kwargs = existing_pr.edit.call_args
+    assert "conflicts resolved by Claude Code" in kwargs["body"]
+    assert "already on backport branch" not in kwargs["body"]
+
+
 def test_clone_target_branch_invokes_git_clone_without_destination_cwd(
     monkeypatch,
     tmp_path,
@@ -601,6 +667,7 @@ def test_process_branch_applied_cap_ignores_skipped_candidates(monkeypatch):
     monkeypatch.setattr(backport_sweep, "find_existing_pr", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(backport_sweep, "delete_stale_backport_branch", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(backport_sweep, "list_already_applied", lambda *_args, **_kwargs: {"2"})
+    monkeypatch.setattr(backport_sweep, "list_applied_prs_on_branch", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(sweep_validation, "changed_paths_since_base", lambda *_args, **_kwargs: [], raising=False)
     monkeypatch.setattr(backport_sweep, "run_test_commands", lambda *_args, **_kwargs: (True, ""))
     monkeypatch.setattr(
@@ -608,7 +675,6 @@ def test_process_branch_applied_cap_ignores_skipped_candidates(monkeypatch):
         "validate_branch_with_optional_repair",
         lambda *_args, **_kwargs: (True, ""),
     )
-    monkeypatch.setattr(backport_sweep, "head_changes_workflow_files", lambda *_args: False)
     monkeypatch.setattr(backport_sweep, "branch_has_changes", lambda *_args, **_kwargs: True)
 
     pushed: list[str] = []
@@ -660,51 +726,39 @@ def test_process_branch_applied_cap_ignores_skipped_candidates(monkeypatch):
     assert result.pr_url == "https://github.com/valkey-io/valkey/pull/100"
 
 
-def test_process_branch_skips_workflow_candidates_before_push(monkeypatch):
+def test_process_branch_push_failure_reconciles_applied(monkeypatch):
     candidate = ProjectBackportCandidate(
-        source_pr_number=3317,
-        source_pr_title="Fix macOS workflow",
-        source_pr_url="https://github.com/valkey-io/valkey/pull/3317",
+        source_pr_number=1,
+        source_pr_title="PR 1",
+        source_pr_url="https://github.com/valkey-io/valkey/pull/1",
         target_branch="8.1",
-        merge_commit_sha="sha3317",
+        merge_commit_sha="sha1",
     )
 
     monkeypatch.setattr(backport_sweep, "clone_target_branch", lambda *_args, **_kwargs: None)
-    git_calls: list[tuple[str, ...]] = []
-    monkeypatch.setattr(
-        backport_sweep,
-        "_run_git",
-        lambda _repo_dir, *args, **_kwargs: git_calls.append(args),
-    )
+    monkeypatch.setattr(backport_sweep, "_run_git", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(backport_sweep, "find_existing_pr", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(backport_sweep, "delete_stale_backport_branch", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(backport_sweep, "list_already_applied", lambda *_args, **_kwargs: set())
-    monkeypatch.setattr(backport_sweep, "head_changes_workflow_files", lambda *_args: True)
+    monkeypatch.setattr(backport_sweep, "run_test_commands", lambda *_args, **_kwargs: (True, ""))
+    monkeypatch.setattr(
+        backport_sweep,
+        "validate_branch_with_optional_repair",
+        lambda *_args, **_kwargs: (True, ""),
+    )
     monkeypatch.setattr(backport_sweep, "branch_has_changes", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(
         backport_sweep,
         "apply_candidate",
         lambda _repo_dir, c, *_args, **_kwargs: CandidateResult(
-            c.source_pr_number,
-            c.source_pr_title,
-            "applied",
+            c.source_pr_number, c.source_pr_title, "applied"
         ),
     )
-    run_calls: list[list[str]] = []
-
-    def fake_run_test_commands(_repo_dir, commands, **_kwargs):
-        run_calls.append(list(commands))
-        return True, ""
 
     def fail_push(*_args, **_kwargs):
-        raise AssertionError("workflow candidates must not be pushed")
+        raise RuntimeError("push rejected")
 
-    def fail_upsert(*_args, **_kwargs):
-        raise AssertionError("workflow-only skipped runs must not upsert PRs")
-
-    monkeypatch.setattr(backport_sweep, "run_test_commands", fake_run_test_commands)
     monkeypatch.setattr(backport_sweep, "push_backport_branch", fail_push)
-    monkeypatch.setattr(backport_sweep, "upsert_pr", fail_upsert)
 
     result = backport_sweep._process_branch(
         gh=MagicMock(),
@@ -713,15 +767,13 @@ def test_process_branch_skips_workflow_candidates_before_push(monkeypatch):
         target_branch="8.1",
         candidates=[candidate],
         push_repo="valkey-io/valkey",
-        test_commands=["make"],
+        test_commands=[],
     )
 
-    assert result.error == ""
-    assert result.pr_url == ""
-    assert result.results[0].outcome == "skipped-conflict"
-    assert "workflow" in result.results[0].detail
-    assert ("reset", "--hard", "HEAD^") in git_calls
-    assert run_calls == [[]]
+    assert result.error
+    assert result.results[0].outcome == "error"
+    assert "push failed" in result.results[0].detail
+    assert sum(1 for r in result.results if r.outcome == "applied") == 0
 
 
 def _green_only_process_branch(monkeypatch, *, candidates, apply_fn, validate_fn,
@@ -740,7 +792,7 @@ def _green_only_process_branch(monkeypatch, *, candidates, apply_fn, validate_fn
         "list_already_applied",
         lambda *_a, **_k: set(already_applied or set()),
     )
-    monkeypatch.setattr(backport_sweep, "head_changes_workflow_files", lambda *_a: False)
+    monkeypatch.setattr(backport_sweep, "list_applied_prs_on_branch", lambda *_a, **_k: [])
     monkeypatch.setattr(backport_sweep, "branch_has_changes", lambda *_a, **_k: True)
     monkeypatch.setattr(backport_sweep, "run_test_commands", lambda *_a, **_k: (True, ""))
     monkeypatch.setattr(backport_sweep, "apply_candidate", apply_fn)
@@ -961,11 +1013,6 @@ def test_apply_candidate_preserves_source_author_on_conflict_path(monkeypatch, t
                 resolution_summary="resolved",
             )
         ]
-    # Skip over-application check (requires `git fetch origin` which fails in
-    # the tmpdir repo).
-    monkeypatch.setattr(
-        sweep_apply, "check_applied_commit_size", lambda *_a, **_k: None,
-    )
     # Drive just the post-resolution phase: write files, stage, continue.
     # This mirrors what _apply_candidate does after Claude returns.
     resolution = ResolutionResult(
@@ -998,73 +1045,6 @@ def test_apply_candidate_preserves_source_author_on_conflict_path(monkeypatch, t
     # Don't rely on the unused `candidate` local.
     assert candidate.source_pr_number == 42
 
-
-
-def _make_size_check_candidate() -> ProjectBackportCandidate:
-    return ProjectBackportCandidate(
-        source_pr_number=99,
-        source_pr_title="Test",
-        source_pr_url="https://example.invalid/pr/99",
-        target_branch="8.1",
-        merge_commit_sha="deadbeef",
-    )
-
-
-def _stub_size_check_subprocess(monkeypatch, upstream_add: int, applied_add: int):
-    """Stub subprocess.run so _check_applied_commit_size sees the given additions."""
-
-    def fake(cmd, **_kwargs):
-        if cmd[:3] == ["git", "fetch", "origin"]:
-            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
-        if cmd[:2] == ["git", "show"] and "HEAD" in cmd:
-            return subprocess.CompletedProcess(
-                cmd, 0,
-                stdout=f" 1 file changed, {applied_add} insertions(+)\n",
-                stderr="",
-            )
-        if cmd[:3] == ["git", "diff", "--stat"]:
-            return subprocess.CompletedProcess(
-                cmd, 0,
-                stdout=f" 1 file changed, {upstream_add} insertions(+)\n",
-                stderr="",
-            )
-        raise AssertionError(f"unexpected command: {cmd}")
-
-    return fake
-
-
-def test_check_applied_commit_size_passes_small_pr_adaptation(monkeypatch):
-    """A 1-line upstream PR that becomes 5 lines after branch adaptation
-    must not be rejected (under old 3x rule, 3+ lines would trip)."""
-    fake = _stub_size_check_subprocess(monkeypatch, upstream_add=1, applied_add=5)
-    assert check_applied_commit_size("/fake", _make_size_check_candidate(), run_process=fake) is None
-
-
-def test_check_applied_commit_size_passes_medium_pr_slight_growth(monkeypatch):
-    """Upstream 50 lines, applied 120 lines (70 extra) is fine under the new rule."""
-    fake = _stub_size_check_subprocess(monkeypatch, upstream_add=50, applied_add=120)
-    assert check_applied_commit_size("/fake", _make_size_check_candidate(), run_process=fake) is None
-
-
-def test_check_applied_commit_size_rejects_ratio_and_floor(monkeypatch):
-    """Upstream 100 lines, applied 400 (300 extra, 4x) trips both guards."""
-    fake = _stub_size_check_subprocess(monkeypatch, upstream_add=100, applied_add=400)
-    issue = check_applied_commit_size("/fake", _make_size_check_candidate(), run_process=fake)
-    assert issue is not None
-    assert "+400" in issue and "+100" in issue
-
-
-def test_check_applied_commit_size_rejects_absolute_floor_only(monkeypatch):
-    """Upstream 200 lines, applied 600 (400 extra, 3x): absolute-floor branch."""
-    fake = _stub_size_check_subprocess(monkeypatch, upstream_add=200, applied_add=600)
-    issue = check_applied_commit_size("/fake", _make_size_check_candidate(), run_process=fake)
-    assert issue is not None
-
-
-def test_check_applied_commit_size_accepts_mild_ratio_under_floor(monkeypatch):
-    """Upstream 5 lines, applied 50 (10x ratio but only 45 extra): accept."""
-    fake = _stub_size_check_subprocess(monkeypatch, upstream_add=5, applied_add=50)
-    assert check_applied_commit_size("/fake", _make_size_check_candidate(), run_process=fake) is None
 
 
 def test_sync_target_branch_creates_missing_fork_branch():
@@ -1189,6 +1169,35 @@ def test_safe_tmp_component_removes_branch_separators():
     assert safe_tmp_component("///") == "branch"
 
 
+def test_list_applied_prs_on_branch_reads_backport_commit_subjects(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "8.0")
+    _git(repo, "config", "user.name", "Test User")
+    _git(repo, "config", "user.email", "test@example.com")
+    (repo / "file.txt").write_text("base\n", encoding="utf-8")
+    _git(repo, "add", "file.txt")
+    _git(repo, "commit", "-q", "-m", "base")
+    _git(repo, "update-ref", "refs/remotes/origin/8.0", "HEAD")
+    _git(repo, "checkout", "-q", "-b", "agent/backport/sweep/8.0")
+
+    (repo / "file.txt").write_text("base\none\n", encoding="utf-8")
+    _git(repo, "commit", "-q", "-am", "Preserve original fd blocking state (#1298)")
+    (repo / "file.txt").write_text("base\none\ntwo\n", encoding="utf-8")
+    _git(repo, "commit", "-q", "-am", "Fix CLUSTER SLOTS crash (#2915)")
+
+    applied = list_applied_prs_on_branch(
+        str(repo),
+        "8.0",
+        "agent/backport/sweep/8.0",
+    )
+
+    assert [(r.source_pr_number, r.source_pr_title) for r in applied] == [
+        (1298, "Preserve original fd blocking state"),
+        (2915, "Fix CLUSTER SLOTS crash"),
+    ]
+
+
 def test_build_pr_body_lists_already_on_branch_under_applied():
     """Applied table reflects cumulative state of the backport branch.
 
@@ -1259,6 +1268,136 @@ def test_build_pr_body_lists_already_on_branch_under_applied():
     # Applied would misrepresent the PR's commit set.
     assert "#4001" not in body
     assert "#4002" not in body
+
+
+def test_build_pr_body_uses_branch_commits_and_preserves_prior_detail():
+    result = BranchSweepResult(
+        target_branch="8.0",
+        candidates_found=2,
+        results=[
+            CandidateResult(
+                source_pr_number=2915,
+                source_pr_title="Fix CLUSTER SLOTS crash",
+                outcome="skipped-existing",
+                detail=backport_sweep.DETAIL_ALREADY_ON_SWEEP_BRANCH,
+            ),
+            CandidateResult(
+                source_pr_number=1826,
+                source_pr_title="Fix Lua VM crash",
+                outcome="skipped-conflict",
+                detail="target branch lacks conflicted file(s): src/lua/engine_lua.c",
+            ),
+        ],
+    )
+    previous_body = "\n".join(
+        [
+            "# Backport sweep for 8.0",
+            "",
+            "## Applied",
+            "",
+            "| Source PR | Title | Detail |",
+            "|---|---|---|",
+            "| #2915 | Fix CLUSTER SLOTS crash | conflicts resolved by Claude Code |",
+        ]
+    )
+
+    body = build_pr_body(
+        result,
+        branch_applied=[
+            CandidateResult(
+                1298,
+                "Preserve original fd blocking state",
+                "skipped-existing",
+                backport_sweep.DETAIL_ALREADY_ON_SWEEP_BRANCH,
+            ),
+            CandidateResult(
+                2915,
+                "Fix CLUSTER SLOTS crash",
+                "skipped-existing",
+                backport_sweep.DETAIL_ALREADY_ON_SWEEP_BRANCH,
+            ),
+        ],
+        previous_body=previous_body,
+    )
+
+    assert "#1298" in body
+    assert "#2915" in body
+    assert "#1826" in body
+    assert "conflicts resolved by Claude Code" in body
+    assert body.index("#1298") < body.index("#2915")
+
+
+def test_build_pr_body_round_trips_applied_and_failed_detail():
+    first = build_pr_body(
+        BranchSweepResult("8.0", 2, results=[
+            CandidateResult(2915, "Fix | crash", "applied", "conflicts resolved by Claude Code"),
+            CandidateResult(1826, "Fix Lua VM crash", "skipped-conflict", "lacks src/lua/engine_lua.c"),
+        ]),
+        branch_applied=[CandidateResult(2915, "Fix | crash", "applied", "conflicts resolved by Claude Code")],
+    )
+
+    # A later run that processes nothing must keep every entry from the prior body.
+    second = build_pr_body(
+        BranchSweepResult("8.0", 0),
+        branch_applied=[CandidateResult(2915, "Fix | crash", "skipped-existing", DETAIL)],
+        previous_body=first,
+    )
+
+    assert parse_previous_applied(second) == [
+        CandidateResult(2915, "Fix | crash", "applied", "conflicts resolved by Claude Code"),
+    ]
+    assert [(r.source_pr_number, r.detail) for r in parse_previous_failed(second)] == [
+        (1826, "lacks src/lua/engine_lua.c"),
+    ]
+
+
+def test_build_pr_body_drops_failed_entry_once_applied():
+    previous_body = "\n".join([
+        "## Needs attention", "",
+        "| Source PR | Title | Outcome | Reason |", "|---|---|---|---|",
+        "| #4100 | Now fixed | skipped-conflict | was conflicting |",
+    ])
+
+    body = build_pr_body(
+        BranchSweepResult("8.0", 0),
+        branch_applied=[CandidateResult(4100, "Now fixed", "skipped-existing", DETAIL)],
+        previous_body=previous_body,
+    )
+
+    assert "## Needs attention" not in body
+    assert "#4100" in body
+
+
+def test_build_pr_body_clears_stale_failure_when_current_skips_existing():
+    previous_body = "\n".join([
+        "## Needs attention", "",
+        "| Source PR | Title | Outcome | Reason |", "|---|---|---|---|",
+        "| #4001 | Already merged | skipped-conflict | was conflicting |",
+    ])
+
+    # Current run reports it as already on the release branch (not on the
+    # sweep branch, so not in Applied) -> it no longer needs attention.
+    body = build_pr_body(
+        BranchSweepResult("8.0", 1, results=[
+            CandidateResult(4001, "Already merged", "skipped-existing", "already applied or empty cherry-pick"),
+        ]),
+        branch_applied=[],
+        previous_body=previous_body,
+    )
+
+    assert "## Needs attention" not in body
+    assert "#4001" not in body
+
+
+def test_build_pr_body_uses_friendly_detail_for_bare_branch_commit():
+    body = build_pr_body(
+        BranchSweepResult("8.0", 0),
+        branch_applied=[CandidateResult(4200, "Preserved feature", "skipped-existing", DETAIL)],
+    )
+
+    assert "#4200" in body
+    assert DETAIL not in body
+    assert "cherry-picked in a prior sweep" in body
 
 
 def test_build_summary_counts_applied_candidates():
