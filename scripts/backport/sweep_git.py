@@ -172,24 +172,6 @@ def collect_git_paths_z(
     return tuple(sorted(paths))
 
 
-def head_changes_workflow_files(repo_dir: str) -> bool:
-    result = subprocess.run(
-        ["git", "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"],
-        cwd=repo_dir,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(
-            "could not inspect HEAD for workflow changes: "
-            + (result.stderr.strip()[:300] or "git diff-tree failed")
-        )
-    return any(
-        path.strip().startswith(".github/workflows/")
-        for path in result.stdout.splitlines()
-    )
-
-
 def branch_has_changes(repo_dir: str, target_branch: str) -> bool:
     result = subprocess.run(
         ["git", "diff", "--quiet", f"origin/{target_branch}...HEAD"],

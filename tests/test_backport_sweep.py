@@ -17,7 +17,7 @@ from scripts.backport.sweep import (
     CandidateResult,
     ProjectBackportCandidate,
 )
-from scripts.backport.sweep_apply import apply_candidate, check_applied_commit_size
+from scripts.backport.sweep_apply import apply_candidate
 from scripts.backport.sweep_git import (
     changed_paths_in_index_or_worktree,
     clone_target_branch,
@@ -675,7 +675,6 @@ def test_process_branch_applied_cap_ignores_skipped_candidates(monkeypatch):
         "validate_branch_with_optional_repair",
         lambda *_args, **_kwargs: (True, ""),
     )
-    monkeypatch.setattr(backport_sweep, "head_changes_workflow_files", lambda *_args: False)
     monkeypatch.setattr(backport_sweep, "branch_has_changes", lambda *_args, **_kwargs: True)
 
     pushed: list[str] = []
@@ -727,51 +726,39 @@ def test_process_branch_applied_cap_ignores_skipped_candidates(monkeypatch):
     assert result.pr_url == "https://github.com/valkey-io/valkey/pull/100"
 
 
-def test_process_branch_skips_workflow_candidates_before_push(monkeypatch):
+def test_process_branch_push_failure_reconciles_applied(monkeypatch):
     candidate = ProjectBackportCandidate(
-        source_pr_number=3317,
-        source_pr_title="Fix macOS workflow",
-        source_pr_url="https://github.com/valkey-io/valkey/pull/3317",
+        source_pr_number=1,
+        source_pr_title="PR 1",
+        source_pr_url="https://github.com/valkey-io/valkey/pull/1",
         target_branch="8.1",
-        merge_commit_sha="sha3317",
+        merge_commit_sha="sha1",
     )
 
     monkeypatch.setattr(backport_sweep, "clone_target_branch", lambda *_args, **_kwargs: None)
-    git_calls: list[tuple[str, ...]] = []
-    monkeypatch.setattr(
-        backport_sweep,
-        "_run_git",
-        lambda _repo_dir, *args, **_kwargs: git_calls.append(args),
-    )
+    monkeypatch.setattr(backport_sweep, "_run_git", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(backport_sweep, "find_existing_pr", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(backport_sweep, "delete_stale_backport_branch", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(backport_sweep, "list_already_applied", lambda *_args, **_kwargs: set())
-    monkeypatch.setattr(backport_sweep, "head_changes_workflow_files", lambda *_args: True)
+    monkeypatch.setattr(backport_sweep, "run_test_commands", lambda *_args, **_kwargs: (True, ""))
+    monkeypatch.setattr(
+        backport_sweep,
+        "validate_branch_with_optional_repair",
+        lambda *_args, **_kwargs: (True, ""),
+    )
     monkeypatch.setattr(backport_sweep, "branch_has_changes", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(
         backport_sweep,
         "apply_candidate",
         lambda _repo_dir, c, *_args, **_kwargs: CandidateResult(
-            c.source_pr_number,
-            c.source_pr_title,
-            "applied",
+            c.source_pr_number, c.source_pr_title, "applied"
         ),
     )
-    run_calls: list[list[str]] = []
-
-    def fake_run_test_commands(_repo_dir, commands, **_kwargs):
-        run_calls.append(list(commands))
-        return True, ""
 
     def fail_push(*_args, **_kwargs):
-        raise AssertionError("workflow candidates must not be pushed")
+        raise RuntimeError("push rejected")
 
-    def fail_upsert(*_args, **_kwargs):
-        raise AssertionError("workflow-only skipped runs must not upsert PRs")
-
-    monkeypatch.setattr(backport_sweep, "run_test_commands", fake_run_test_commands)
     monkeypatch.setattr(backport_sweep, "push_backport_branch", fail_push)
-    monkeypatch.setattr(backport_sweep, "upsert_pr", fail_upsert)
 
     result = backport_sweep._process_branch(
         gh=MagicMock(),
@@ -780,15 +767,13 @@ def test_process_branch_skips_workflow_candidates_before_push(monkeypatch):
         target_branch="8.1",
         candidates=[candidate],
         push_repo="valkey-io/valkey",
-        test_commands=["make"],
+        test_commands=[],
     )
 
-    assert result.error == ""
-    assert result.pr_url == ""
-    assert result.results[0].outcome == "skipped-conflict"
-    assert "workflow" in result.results[0].detail
-    assert ("reset", "--hard", "HEAD^") in git_calls
-    assert run_calls == [[]]
+    assert result.error
+    assert result.results[0].outcome == "error"
+    assert "push failed" in result.results[0].detail
+    assert sum(1 for r in result.results if r.outcome == "applied") == 0
 
 
 def _green_only_process_branch(monkeypatch, *, candidates, apply_fn, validate_fn,
@@ -808,7 +793,6 @@ def _green_only_process_branch(monkeypatch, *, candidates, apply_fn, validate_fn
         lambda *_a, **_k: set(already_applied or set()),
     )
     monkeypatch.setattr(backport_sweep, "list_applied_prs_on_branch", lambda *_a, **_k: [])
-    monkeypatch.setattr(backport_sweep, "head_changes_workflow_files", lambda *_a: False)
     monkeypatch.setattr(backport_sweep, "branch_has_changes", lambda *_a, **_k: True)
     monkeypatch.setattr(backport_sweep, "run_test_commands", lambda *_a, **_k: (True, ""))
     monkeypatch.setattr(backport_sweep, "apply_candidate", apply_fn)
@@ -1029,11 +1013,6 @@ def test_apply_candidate_preserves_source_author_on_conflict_path(monkeypatch, t
                 resolution_summary="resolved",
             )
         ]
-    # Skip over-application check (requires `git fetch origin` which fails in
-    # the tmpdir repo).
-    monkeypatch.setattr(
-        sweep_apply, "check_applied_commit_size", lambda *_a, **_k: None,
-    )
     # Drive just the post-resolution phase: write files, stage, continue.
     # This mirrors what _apply_candidate does after Claude returns.
     resolution = ResolutionResult(
@@ -1066,73 +1045,6 @@ def test_apply_candidate_preserves_source_author_on_conflict_path(monkeypatch, t
     # Don't rely on the unused `candidate` local.
     assert candidate.source_pr_number == 42
 
-
-
-def _make_size_check_candidate() -> ProjectBackportCandidate:
-    return ProjectBackportCandidate(
-        source_pr_number=99,
-        source_pr_title="Test",
-        source_pr_url="https://example.invalid/pr/99",
-        target_branch="8.1",
-        merge_commit_sha="deadbeef",
-    )
-
-
-def _stub_size_check_subprocess(monkeypatch, upstream_add: int, applied_add: int):
-    """Stub subprocess.run so _check_applied_commit_size sees the given additions."""
-
-    def fake(cmd, **_kwargs):
-        if cmd[:3] == ["git", "fetch", "origin"]:
-            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
-        if cmd[:2] == ["git", "show"] and "HEAD" in cmd:
-            return subprocess.CompletedProcess(
-                cmd, 0,
-                stdout=f" 1 file changed, {applied_add} insertions(+)\n",
-                stderr="",
-            )
-        if cmd[:3] == ["git", "diff", "--stat"]:
-            return subprocess.CompletedProcess(
-                cmd, 0,
-                stdout=f" 1 file changed, {upstream_add} insertions(+)\n",
-                stderr="",
-            )
-        raise AssertionError(f"unexpected command: {cmd}")
-
-    return fake
-
-
-def test_check_applied_commit_size_passes_small_pr_adaptation(monkeypatch):
-    """A 1-line upstream PR that becomes 5 lines after branch adaptation
-    must not be rejected (under old 3x rule, 3+ lines would trip)."""
-    fake = _stub_size_check_subprocess(monkeypatch, upstream_add=1, applied_add=5)
-    assert check_applied_commit_size("/fake", _make_size_check_candidate(), run_process=fake) is None
-
-
-def test_check_applied_commit_size_passes_medium_pr_slight_growth(monkeypatch):
-    """Upstream 50 lines, applied 120 lines (70 extra) is fine under the new rule."""
-    fake = _stub_size_check_subprocess(monkeypatch, upstream_add=50, applied_add=120)
-    assert check_applied_commit_size("/fake", _make_size_check_candidate(), run_process=fake) is None
-
-
-def test_check_applied_commit_size_rejects_ratio_and_floor(monkeypatch):
-    """Upstream 100 lines, applied 400 (300 extra, 4x) trips both guards."""
-    fake = _stub_size_check_subprocess(monkeypatch, upstream_add=100, applied_add=400)
-    issue = check_applied_commit_size("/fake", _make_size_check_candidate(), run_process=fake)
-    assert issue is not None
-    assert "+400" in issue and "+100" in issue
-
-
-def test_check_applied_commit_size_rejects_absolute_floor_only(monkeypatch):
-    """Upstream 200 lines, applied 600 (400 extra, 3x): absolute-floor branch."""
-    fake = _stub_size_check_subprocess(monkeypatch, upstream_add=200, applied_add=600)
-    issue = check_applied_commit_size("/fake", _make_size_check_candidate(), run_process=fake)
-    assert issue is not None
-
-
-def test_check_applied_commit_size_accepts_mild_ratio_under_floor(monkeypatch):
-    """Upstream 5 lines, applied 50 (10x ratio but only 45 extra): accept."""
-    fake = _stub_size_check_subprocess(monkeypatch, upstream_add=5, applied_add=50)
-    assert check_applied_commit_size("/fake", _make_size_check_candidate(), run_process=fake) is None
 
 
 def test_sync_target_branch_creates_missing_fork_branch():

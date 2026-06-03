@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import re
 import subprocess
 from pathlib import Path
 from typing import Any, Callable
@@ -206,19 +205,6 @@ def apply_candidate(
             f"commit failed: {(commit_result.stderr or commit_result.stdout).strip()[:200]}",
         )
 
-    issue = check_applied_commit_size(repo_dir, candidate, run_process=run_process)
-    if issue:
-        logger.warning(
-            "Reverting cherry-pick for #%d: %s",
-            candidate.source_pr_number, issue,
-        )
-        run_git(repo_dir, "reset", "--hard", "HEAD^")
-        return CandidateResult(
-            candidate.source_pr_number, candidate.source_pr_title,
-            "skipped-conflict",
-            f"rejected after over-application: {issue}",
-        )
-
     return CandidateResult(
         candidate.source_pr_number,
         candidate.source_pr_title,
@@ -254,52 +240,6 @@ def index_stage_exists(
         cwd=repo_dir, capture_output=True, text=True,
     )
     return result.returncode == 0
-
-
-def check_applied_commit_size(
-    repo_dir: str,
-    candidate: ProjectBackportCandidate,
-    *,
-    run_process: RunProcess = subprocess.run,
-) -> str | None:
-    source_sha = candidate.merge_commit_sha or (candidate.commit_shas[0] if candidate.commit_shas else None)
-    if not source_sha:
-        return None
-
-    run_process(
-        ["git", "fetch", "origin", source_sha],
-        cwd=repo_dir, capture_output=True, text=True, check=False,
-    )
-    # Diff against the first parent rather than `git show --stat`, which emits
-    # no diffstat for merge commits and would silently disable this guard.
-    upstream_stats = run_process(
-        ["git", "diff", "--stat", f"{source_sha}^1", source_sha],
-        cwd=repo_dir, capture_output=True, text=True, check=False,
-    )
-    upstream_additions = parse_additions_from_stat(upstream_stats.stdout)
-    if upstream_additions <= 0:
-        return None
-
-    applied_stats = run_process(
-        ["git", "show", "--stat", "--format=", "HEAD"],
-        cwd=repo_dir, capture_output=True, text=True, check=False,
-    )
-    applied_additions = parse_additions_from_stat(applied_stats.stdout)
-
-    extra = applied_additions - upstream_additions
-    ratio = applied_additions / upstream_additions
-    over_applied = (applied_additions >= upstream_additions * 3 and extra > 100) or extra > 300
-    if not over_applied:
-        return None
-    return (
-        f"applied +{applied_additions} vs upstream +{upstream_additions} "
-        f"(+{extra} extra lines, {ratio:.1f}x)"
-    )
-
-
-def parse_additions_from_stat(stat_output: str) -> int:
-    match = re.search(r"(\d+) insertion", stat_output)
-    return int(match.group(1)) if match else 0
 
 
 def read_index_stage(
