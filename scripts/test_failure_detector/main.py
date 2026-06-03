@@ -20,7 +20,7 @@ from scripts.test_failure_detector.parse_failures import parse_and_deduplicate
 
 logger = logging.getLogger(__name__)
 
-# EDIT BEFORE PR: Build a markdown summary for the GitHub Actions job summary.
+# New: Build a markdown summary for the GitHub Actions job summary.
 def _build_job_summary(
     run_id: int,
     repo_full_name: str,
