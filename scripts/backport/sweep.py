@@ -25,7 +25,6 @@ from scripts.backport.sweep_apply import (
 from scripts.backport.sweep_git import (
     branch_has_changes,
     clone_target_branch,
-    head_changes_workflow_files,
     list_already_applied,
     list_applied_prs_on_branch,
     push_backport_branch,
@@ -415,21 +414,6 @@ def _process_branch(
                 if candidate_result.outcome != "applied":
                     continue
 
-                if head_changes_workflow_files(tmpdir):
-                    candidate_result.outcome = "skipped-conflict"
-                    candidate_result.detail = (
-                        "changes GitHub Actions workflow files; "
-                        "the backport App token cannot push workflow updates"
-                    )
-                    _run_git(tmpdir, "reset", "--hard", "HEAD^")
-                    logger.warning(
-                        "Candidate #%d on %s changes workflow files; removed candidate because "
-                        "the App token cannot push workflow updates.",
-                        candidate.source_pr_number,
-                        target_branch,
-                    )
-                    continue
-
                 # The sweep branch must stay green: only keep a cherry-pick if
                 # the whole branch still validates. A red commit left on the
                 # branch would block every later candidate, so we always reset
@@ -460,12 +444,19 @@ def _process_branch(
                 if result_is_on_backport_branch(item)
             ]
             if committed and branch_has_changes(tmpdir, target_branch):
-                push_backport_branch(
-                    tmpdir,
-                    backport_branch,
-                    git_env,
-                    force_with_lease=existing_pr is not None,
-                )
+                try:
+                    push_backport_branch(
+                        tmpdir,
+                        backport_branch,
+                        git_env,
+                        force_with_lease=existing_pr is not None,
+                    )
+                except Exception as exc:
+                    for item in result.results:
+                        if item.outcome == "applied":
+                            item.outcome = "error"
+                            item.detail = f"push failed: {exc}"
+                    raise
                 logger.info(
                     "Pushed %d commit(s) to %s/%s",
                     len(committed),
@@ -699,3 +690,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
