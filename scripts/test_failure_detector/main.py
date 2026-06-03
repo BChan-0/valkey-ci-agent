@@ -62,9 +62,6 @@ def run(
         branch: Branch to filter workflow runs (default: "unstable").
         dry_run: If True, parse and report but don't create/update issues.
         verbose: Enable debug logging.
-
-    Returns:
-        0 on success, 1 on failure.
     """
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(level=level, format="%(levelname)s %(name)s: %(message)s")

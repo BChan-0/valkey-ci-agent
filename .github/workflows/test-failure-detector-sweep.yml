@@ -56,7 +56,7 @@ jobs:
         continue-on-error: true # EDIT BEFORE PR: once migrated, token will always be on valkey-io so no need for fallback
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          app-id: ${{ secrets.VALKEYRIE_BOT_APP_ID }}
+          client-id: ${{ secrets.VALKEYRIE_BOT_CLIENT_ID }}
           private-key: ${{ secrets.VALKEYRIE_BOT_PRIVATE_KEY }}
           owner: valkey-io
 
