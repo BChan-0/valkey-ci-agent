@@ -47,10 +47,7 @@ def get_latest_daily_run(
     workflow_name: str = "Daily",
     branch: str = "unstable",
 ) -> WorkflowRun | None:
-    """Find the most recent completed (non-cancelled) Daily workflow run.
-
-    Returns None if no qualifying run is found.
-    """
+    """Find the most recent completed (non-cancelled) Daily workflow run."""
     repo = retry_github_call(
         lambda: gh.get_repo(repo_full_name),
         retries=3,
