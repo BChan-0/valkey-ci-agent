@@ -151,7 +151,7 @@ def process_failures(
                     description=f"update issue #{existing.number} body",
                 )
 
-            # Always add a comment noting the recurrence
+            # Add a comment noting the recurrence
             comment_body = _build_comment_body(failure)
             retry_github_call(
                 lambda: existing.create_comment(comment_body),
