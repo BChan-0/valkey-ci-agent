@@ -7,10 +7,11 @@ defined in the central `repos.yml` registry.
 
 ```text
 scripts/
-  backport/    Backport workflow (active)
-  ai/          Claude Code subprocess orchestration
-  common/      Shared infrastructure
-repos.yml      Registry of repos, release branches, and project boards
+  backport/              Backport workflow (active)
+  test_failure_detector/ Test Failure Detector workflow (active)
+  ai/                    Claude Code subprocess orchestration
+  common/                Shared infrastructure
+repos.yml                Registry of repos, release branches, and project boards
 ```
 
 ## Backport Flow
@@ -77,10 +78,28 @@ permissions used by the workflows.
 Same-owner `push_repo` values are rejected so staging repositories do not become
 the normal deployment model.
 
+## Test Failure Detector Flow
+
+```text
+main.py (daily cron or manual dispatch)
+  -> get_latest_daily_run() or use provided run_id
+  -> download_all_test_failures() from the run's artifacts
+  -> get_job_urls() for CI links
+  -> parse_and_deduplicate() groups by {test_name, test_file}
+  -> process_failures() creates/updates GitHub issues
+```
+
+### Entry Points
+
+- `scripts/test_failure_detector/main.py` — CLI entry point and pipeline orchestration
+- `scripts/test_failure_detector/download.py` — workflow run discovery and artifact download
+- `scripts/test_failure_detector/parse_failures.py` — JSON parsing and deduplication
+- `scripts/test_failure_detector/manage_issues.py` — issue creation, update, and label management
+
 ## Planned Workflows
 
-Future sibling modules to `backport/`:
+Future sibling modules:
 
 - **PR Reviewer** — two-stage code review with skeptic pass
 - **Fuzzer Monitor** — triage fuzzer failures, file issues
-- **Daily CI Analysis** — detect flaky tests, generate fix PRs
+- **Additional Daily CI Analysis**	- flaky tests detector, fix PRs

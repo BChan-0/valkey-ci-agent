@@ -21,9 +21,10 @@ New workflows are added as sibling directories to `backport/`. Each workflow pic
 | Workflow | Status | Description |
 |----------|--------|-------------|
 | Backport | Active | Cherry-picks merged PRs onto release branches with AI conflict resolution |
+| Test Failure Detector | Active | Detects test failures from Daily CI, files/updates GitHub issues |
 | PR Reviewer | Planned | Two-stage code review with skeptic pass |
 | Fuzzer Monitor | Planned | Analyzes fuzzer runs, triages failures, files issues |
-| Daily CI Analysis | Planned | Detects flaky tests, generates fix PRs |
+| Additional Daily CI Analysis	| Planned	| Detects flaky tests, generates fix PRs |
 
 ## Backport Workflow
 
@@ -131,6 +132,46 @@ gh workflow run backport-sweep.yml \
   --field repo=valkey-io/valkey \
   --field project_number=14
 ```
+
+## Test Failure Detector
+
+Monitors the Daily CI workflow on `valkey-io/valkey`, detects test failures, and automatically creates or updates GitHub issues to track them.
+
+### How it works
+
+1. **Find the run** — locates the most recent completed (non-cancelled) Daily workflow run on the `unstable` branch, or uses a manually input run ID
+2. **Download artifact** — fetches the `all-test-failures` artifact from the run (a JSON file consolidated by the CI workflow). Uses a custom HTTP handler to strip the Authorization header on the redirect to Azure blob storage
+3. **Get job URLs** — fetches job metadata from the run to build CI links for each failure, with normalized name variants for fuzzy matching against artifact names
+4. **Parse and deduplicate** — iterates the nested JSON (`{job → suite → [failures]}`) and groups by `{test_name, test_file}` such that a test failing across multiple  jobs becomes one unique failure with multiple job references
+5. **Create or update issues** — for each unique failure:
+   - If an open issue with matching title (`[TEST-FAILURE] {test_name} in {test_file}`) already exists: updates the environments list and adds a recurrence comment with the date
+   - Otherwise: creates a new issue with the `test-failure` label, error stack trace, CI links, and environment list
+
+A GitHub Actions job summary is emitted at every exit path with a table of metrics (failures detected, issues created/updated).
+
+#### Prerequisites: Cross-repo Authentication
+
+The workflow generates a GitHub App installation token scoped to the `valkey-io` org using the same App secrets as the backport workflow (`VALKEYRIE_BOT_APP_ID` + `VALKEYRIE_BOT_PRIVATE_KEY`). This token provides `actions:read` (to download artifacts) and `issues:write` (to create/update issues) on `valkey-io/valkey`.
+
+### Usage
+
+#### Scheduled (automatic)
+
+Runs daily at 23:00 UTC via cron. The workflow runs on `valkey-io/valkey-ci-agent` and uses a GitHub App token to read artifacts from and write issues to `valkey-io/valkey`. Valkey Daily CI runs daily at 00:00 UTC, with runs typically completing within 4-7 hours, with slight exception, such that Test Failure Detector should always capture the current day's workflow. 
+
+#### Manual dispatch
+
+```bash
+gh workflow run test-failure-detector-sweep.yml \
+  --repo valkey-io/valkey-ci-agent \
+  --field repo=valkey-io/valkey \
+  --field run_id=12345678 \
+  --field dry_run=true
+```
+
+- `repo` — target repository to scan (default: `valkey-io/valkey`)
+- `run_id` — specific workflow run ID to analyze (empty = latest Daily run)
+- `dry_run` — parse and report only, don't create/update issues
 
 ## Safety
 
