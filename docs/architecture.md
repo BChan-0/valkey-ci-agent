@@ -54,7 +54,7 @@ Validation first runs the registry's optional `validation_setup_commands`,
 then validates the branch after each cherry-pick. The sweep branch is kept
 green: a cherry-pick is only kept if the whole branch still validates, and a
 failure is reset off the branch so it can never block later candidates. The
-run keeps a single validated cherry-pick (`--max-candidates 1`) and records
+run keeps up to two validated cherry-picks (`--max-candidates 2`) and records
 skipped or failed candidates in the PR's "Needs attention" section without
 committing them. When `repair_validation_failures` is enabled, Claude Code
 gets one edit-only repair attempt scoped to the backport diff before a failing

@@ -67,7 +67,7 @@ repos:
 
 By default, agent branches are pushed directly to `repo` under the `agent/backport/...` namespace and PRs are opened in that same upstream repository. `push_repo` is optional and only exists as an escape hatch for a real different-owner fork; same-owner `push_repo` values are rejected so staging repositories do not become the normal model.
 
-The sweep branch is always kept green: a candidate is only kept if the whole branch still validates after the cherry-pick, so one bad commit can never block later candidates. Each scheduled run keeps a single validated cherry-pick (`--max-candidates 1`) and reports candidates that were skipped or failed validation in the PR's "Needs attention" section without committing them. When `repair_validation_failures` is enabled, Claude Code gets one narrow edit-only attempt to fix a failing cherry-pick before it is dropped.
+The sweep branch is always kept green: a candidate is only kept if the whole branch still validates after the cherry-pick, so one bad commit can never block later candidates. Each scheduled run keeps up to two validated cherry-picks (`--max-candidates 2`) and reports candidates that were skipped or failed validation in the PR's "Needs attention" section without committing them. When `repair_validation_failures` is enabled, Claude Code gets one narrow edit-only attempt to fix a failing cherry-pick before it is dropped.
 
 See [`examples/repos.yml`](examples/repos.yml) for a multi-module example.
 
@@ -80,7 +80,7 @@ See [`examples/repos.yml`](examples/repos.yml) for a multi-module example.
   - `pull-requests:write` on each repo (for opening PRs)
   - `issues:write` on each repo (for backport status comments)
   - `organization_projects:read` on the org (for querying project boards)
-- An AWS account with Bedrock access to `us.anthropic.claude-opus-4-7`
+- An AWS account with Bedrock access to `us.anthropic.claude-opus-4-8`
 - An OIDC trust between GitHub Actions and your AWS account
 
 #### Step 1: Configure secrets and variables
