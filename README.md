@@ -171,14 +171,17 @@ Monitors the Daily CI workflow on `valkey-io/valkey`, detects test failures, and
 
 ### How it works
 
-1. **Daily sweep** - every day at 23:00 UTC, the preflight job reads from `valkey-io/valkey`
-2. **Find the run** — locates the most recent completed (non-cancelled) Daily workflow run on the `unstable` branch, or uses a manually input run ID
-3. **Download artifact** — fetches the `all-test-failures` artifact from the CI workflow. Uses an HTTP handler to strip the Authorization header on the redirect to Azure blob storage
+The detector is a thin pipeline (`scripts/test_failure_detector/`) layered on shared building blocks in `scripts/common/` — `ArtifactClient` for artifact download and `IssueDedupPublisher` for issue dedup/publishing — so the same primitives back the Fuzzer Monitor.
+
+1. **Daily sweep** — every day at 23:00 UTC the workflow runs on `valkey-io/valkey-ci-agent` and reads from `valkey-io/valkey`
+2. **Find the run** — locates the most recent completed, non-cancelled/skipped Daily workflow run on the target branch (`unstable` by default), or uses a manually supplied run ID
+3. **Download artifact** — `ArtifactClient` fetches the `all-test-failures` artifact, handling the auth-header-stripping redirect to Azure blob storage, transient-failure retries, and expired-artifact (404) cases
 4. **Get job URLs** — fetches job metadata from the run to build CI links for each failure, with normalized name variants for fuzzy matching against artifact names
-5. **Parse and deduplicate** — iterates the nested JSON (`{job → suite → [failures]}`) and groups by `{test_name, test_file}` such that a test failing across multiple  jobs becomes one unique failure with multiple job references
-6. **Create or update issues** — for each unique failure:
-   - If an open issue with matching title (`[TEST-FAILURE] {test_name} in {test_file}`) already exists: updates the environments list and adds a recurrence comment with the date
-   - Otherwise: creates a new issue with the `test-failure` label, error stack trace, CI links, and environment list
+5. **Parse and deduplicate** — iterates the nested JSON (`{job → suite → [failures]}`) and groups by a `{test_name}::{test_file}` fingerprint, so a test failing across multiple jobs becomes one `UniqueFailure` with multiple job references
+6. **Create or update issues** — `IssueDedupPublisher` upserts one issue per fingerprint, matching on a hidden body marker (`<!-- valkey-ci-agent:test-failure:{test_name}::{test_file} -->`) rather than the title. Per-failure rendering (title, body, recurrence comment, `test-failure` label) lives in `issue_renderer.py`. Each failure resolves to one of three outcomes:
+   - **created** — no matching issue exists: opens one titled `[TEST-FAILURE] {test_name} in {test_file}` with the `test-failure` label, error trace, CI links, and environment list
+   - **updated** — a matching issue exists: merges any new failing environments into the body and bumps the occurrence counter / adds a recurrence comment
+   - **skipped** — the run ID matches the `last-key` marker already recorded on the issue, so a re-triggered sweep over the same CI run does not inflate the occurrence count or post a duplicate comment
 
 A GitHub Actions job summary is emitted at every exit path with a table of metrics (failures detected, issues created/updated).
 
