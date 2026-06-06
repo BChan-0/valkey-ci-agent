@@ -24,7 +24,6 @@ New workflows are added as sibling directories to `backport/`. Each workflow pic
 | Fuzzer Monitor | Active | Analyzes scheduled fuzzer runs and files issues for anomalous failures |
 | Test Failure Detector | Active | Detects test failures from Daily CI, files/updates GitHub issues |
 | PR Reviewer | Planned | Two-stage code review with skeptic pass |
-| Fuzzer Monitor | Planned | Analyzes fuzzer runs, triages failures, files issues |
 | Additional Daily CI Analysis	| Planned	| Detects flaky tests, generates fix PRs |
 
 ## Backport Workflow
