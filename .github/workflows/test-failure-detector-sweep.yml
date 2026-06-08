@@ -49,9 +49,9 @@ jobs:
 
       - name: Generate GitHub App token
         id: generate-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
         with:
-          client-id: ${{ secrets.VALKEYRIE_BOT_APP_ID }}
+          app-id: ${{ secrets.VALKEYRIE_BOT_APP_ID }}
           private-key: ${{ secrets.VALKEYRIE_BOT_PRIVATE_KEY }}
           owner: valkey-io
 
