@@ -1,0 +1,166 @@
+name: Backport Poll
+
+# Runs the backport poller on a short cron. For each registered {repo, branch}
+# the poller runs a sweep only when no sweep PR is currently open for that
+# branch, so a merged sweep PR is topped back up within one poll interval
+# instead of waiting for the daily Backport Sweep cron.
+
+on:
+  schedule:
+    - cron: "0 * * * *"
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: "Filter to this repository (empty = all repos in registry)"
+        required: false
+        type: string
+        default: ""
+      project_number:
+        description: "Filter to this project number (empty = all)"
+        required: false
+        type: string
+        default: ""
+      max_candidates:
+        description: "Cap successfully applied cherry-picks per branch (0 = unlimited)"
+        required: false
+        type: string
+        default: "2"
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+permissions: {}
+
+jobs:
+  preflight:
+    name: "Generate matrix"
+    if: github.repository == 'valkey-io/valkey-ci-agent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      has_entries: ${{ steps.matrix.outputs.has_entries }}
+    steps:
+      - name: Check out agent repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install pyyaml
+
+      - name: Generate matrix from registry
+        id: matrix
+        shell: bash
+        env:
+          REPO_FILTER: ${{ inputs.repo || '' }}
+          PROJECT_FILTER: ${{ inputs.project_number || '' }}
+        run: |
+          set -euo pipefail
+          args=(--registry repos.yml)
+          if [[ -n "${REPO_FILTER}" ]]; then
+            args+=(--repo "${REPO_FILTER}")
+          fi
+          if [[ -n "${PROJECT_FILTER}" ]]; then
+            args+=(--project-number "${PROJECT_FILTER}")
+          fi
+          python -m scripts.backport.matrix "${args[@]}" --output-file "$GITHUB_OUTPUT"
+
+  poll:
+    name: "poll/${{ matrix.repo }}/${{ matrix.branch }}"
+    needs: preflight
+    if: needs.preflight.outputs.has_entries == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.preflight.outputs.matrix) }}
+    concurrency:
+      # Shared with Backport Sweep so the poller never races the daily cron
+      # for the same branch.
+      group: backport-sweep-${{ matrix.repo }}-${{ matrix.branch }}
+      cancel-in-progress: false
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      CLAUDE_CODE_USE_BEDROCK: "1"
+      CI_AGENT_EVIDENCE_DIR: agent-evidence
+      MAX_CANDIDATES: ${{ inputs.max_candidates || '2' }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out agent repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          npm install -g @anthropic-ai/claude-code@2.1.175
+
+      - name: Generate GitHub App token
+        id: generate-token
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
+        with:
+          app-id: ${{ secrets.VALKEYRIE_BOT_APP_ID }}
+          private-key: ${{ secrets.VALKEYRIE_BOT_PRIVATE_KEY }}
+          owner: valkey-io
+          repositories: ${{ split(matrix.repo, '/')[1] }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: backport-poll-${{ github.run_id }}-${{ matrix.branch }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Run backport poll
+        shell: bash
+        env:
+          TARGET_TOKEN: ${{ steps.generate-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          # Pass --max-candidates unconditionally, including 0, which the
+          # poller treats as unlimited. Dropping it at 0 would fall back to the
+          # Python default instead of unlimited.
+          python -m scripts.backport.poller \
+            --registry repos.yml \
+            --repo "${{ matrix.repo }}" \
+            --branch "${{ matrix.branch }}" \
+            --target-token "${TARGET_TOKEN}" \
+            --max-candidates "${MAX_CANDIDATES}" \
+            --verbose | tee backport-poll-result.json
+
+      - name: Upload result
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: backport-poll-result-${{ github.run_id }}-${{ matrix.repo_slug }}-${{ matrix.branch }}
+          path: backport-poll-result.json
+          retention-days: 30
+
+      - name: Upload agent evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: backport-poll-agent-evidence-${{ github.run_id }}-${{ matrix.repo_slug }}-${{ matrix.branch }}
+          path: agent-evidence
+          if-no-files-found: ignore
+          retention-days: 30
