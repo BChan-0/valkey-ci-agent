@@ -37,6 +37,7 @@ The currently active workflow. Cherry-picks merged PRs onto release branches wit
 4. **AI conflict resolution** — when cherry-pick conflicts, Claude Code reads both sides and resolves the conflict in place
 5. **Validation** — registry-configured build commands run before push; any failure blocks the push
 6. **PR creation** — pushes the branch and opens (or updates) a PR with a summary table
+7. **Status sync** — after a backport PR is merged into the release branch, the source PR's Project v2 status can be moved from "To be backported" to "Done"
 
 Manual single-PR backports are also supported via `workflow_dispatch`.
 
@@ -79,7 +80,7 @@ See [`examples/repos.yml`](examples/repos.yml) for a multi-module example.
   - `contents:write` on each repo in the registry (for pushing branches)
   - `pull-requests:write` on each repo (for opening PRs)
   - `issues:write` on each repo (for backport status comments)
-  - `organization_projects:read` on the org (for querying project boards)
+  - `organization_projects:write` on the org (for querying and updating project boards)
 - An AWS account with Bedrock access to `us.anthropic.claude-opus-4-8`
 - An OIDC trust between GitHub Actions and your AWS account
 
@@ -120,6 +121,32 @@ gh workflow run manual-backport.yml \
 ```
 
 Creates one PR named `[Backport 9.0] <original title>`.
+
+#### Mark merged backports done
+
+A scheduled poller reconciles each project board against branch reality and
+flips items from `To be backported` to `Done` once the backport actually lands.
+It runs hourly via `backport-mark-done-poll.yml` and reconciles every repo and
+branch in `repos.yml`. Because it reconciles the whole board on every run, it is
+self-healing: it picks up backports applied by the sweep, by an earlier run, or
+by a manual cherry-pick, without depending on a merge event.
+
+An item is marked `Done` only when the source PR's commit is genuinely on the
+target branch — verified by the cherry-pick's trailing `(#N)` subject, or by the
+PR appearing in a sweep commit's `## Applied` table. A backport PR body that
+merely claims a PR was applied can never mark it `Done` on its own.
+
+Run it manually for a single repo (omit `--target-branch` to reconcile every
+configured branch), and add `--dry-run` to report what would change without
+mutating the board:
+
+```bash
+python -m scripts.backport.mark_done \
+  --repo valkey-io/valkey \
+  --target-branch 9.1 \
+  --target-token "$TOKEN" \
+  --dry-run
+```
 
 #### Filtering the sweep
 
