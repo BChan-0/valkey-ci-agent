@@ -21,8 +21,7 @@ on:
         default: false
         type: boolean
 
-permissions:
-  contents: read
+permissions: {}
 
 jobs:
   detect-failures:
@@ -54,6 +53,10 @@ jobs:
           app-id: ${{ secrets.VALKEYRIE_BOT_APP_ID }}
           private-key: ${{ secrets.VALKEYRIE_BOT_PRIVATE_KEY }}
           owner: valkey-io
+          repositories: valkey
+          permission-actions: read
+          permission-issues: write
+          permission-metadata: read
 
       - name: Run test failure detector
         env:
