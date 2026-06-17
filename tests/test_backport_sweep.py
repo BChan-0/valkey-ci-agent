@@ -10,7 +10,7 @@ import pytest
 from github.GithubException import GithubException
 
 from scripts.backport import sweep as backport_sweep
-from scripts.backport import sweep_apply, sweep_graphql, sweep_validation
+from scripts.backport import sweep_apply, sweep_git, sweep_graphql, sweep_validation
 from scripts.backport.models import ResolutionResult
 from scripts.backport.sweep import (
     BranchSweepResult,
@@ -57,6 +57,18 @@ def test_git_auth_keeps_askpass_outside_clone_destination(tmp_path):
         assert env["GIT_TERMINAL_PROMPT"] == "0"
         assert env["GIT_PASSWORD"] == "token"
     assert not askpass.exists()
+
+
+def test_git_auth_default_env_strips_ambient_tokens(monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "ambient")
+    monkeypatch.setenv("GH_TOKEN", "ambient")
+    with GitAuth("token", prefix="test-git-auth-") as git_auth:
+        env = git_auth.env()
+    assert env["GIT_PASSWORD"] == "token"
+    assert env["GIT_CONFIG_NOSYSTEM"] == "1"
+    assert env["GIT_CONFIG_GLOBAL"] == os.devnull
+    assert "GITHUB_TOKEN" not in env
+    assert "GH_TOKEN" not in env
 
 
 def test_apply_candidate_aborts_empty_cherry_pick(monkeypatch, tmp_path):
@@ -572,7 +584,11 @@ def test_clone_target_branch_invokes_git_clone_without_destination_cwd(
         calls.append((cmd, kwargs))
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
-    monkeypatch.setattr(backport_sweep.subprocess, "run", fake_run)
+    monkeypatch.setattr(sweep_git.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        sweep_git, "run_git_default",
+        lambda repo_dir, *args, **_kwargs: calls.append((["git", *args], {})),
+    )
 
     dest = tmp_path / "checkout"
     clone_target_branch(
@@ -582,25 +598,27 @@ def test_clone_target_branch_invokes_git_clone_without_destination_cwd(
         {"GIT_ASKPASS": "/tmp/askpass"},
     )
 
-    assert calls == [
-        (
-            [
-                "git",
-                "clone",
-                "--branch",
-                "1.0",
-                "https://github.com/owner/repo.git",
-                str(dest),
-            ],
-            {
-                "check": True,
-                "capture_output": True,
-                "text": True,
-                "env": {"GIT_ASKPASS": "/tmp/askpass"},
-            },
-        )
-    ]
+    assert calls[0] == (
+        [
+            "git",
+            "clone",
+            "--branch",
+            "1.0",
+            "https://github.com/owner/repo.git",
+            str(dest),
+        ],
+        {
+            "check": True,
+            "capture_output": True,
+            "text": True,
+            "env": {"GIT_ASKPASS": "/tmp/askpass"},
+        },
+    )
     assert "cwd" not in calls[0][1]
+    assert [cmd for cmd, _ in calls[1:]] == [
+        ["git", "config", "user.name", sweep_git.BOT_NAME],
+        ["git", "config", "user.email", sweep_git.BOT_EMAIL],
+    ]
 
 
 def test_push_backport_branch_uses_plain_push_for_new_branch(monkeypatch):
@@ -889,7 +907,7 @@ def test_process_branch_keeps_trying_until_green(monkeypatch):
     assert resets == 2  # two red cherry-picks reset off the branch
     assert pushed == [("agent/backport/sweep/8.1", False)]
     assert len(upserts) == 1
-    # The pushed PR is never a draft — the branch is green.
+    # The pushed PR is never a draft - the branch is green.
     assert upserts[0].get("draft", False) is False
 
 
@@ -981,7 +999,7 @@ def test_apply_candidate_preserves_source_author_on_conflict_path(monkeypatch, t
     _git(repo, "commit", "-q", "-m", "main conflicting change")
     _git(repo, "checkout", "-q", "-b", "backport")
 
-    # Attempt cherry-pick — will conflict
+    # Attempt cherry-pick - will conflict
     result = subprocess.run(
         ["git", "cherry-pick", source_sha],
         cwd=str(repo), capture_output=True, text=True,
@@ -1102,7 +1120,7 @@ def test_graphql_client_retry_exhaustion_raises_clear_error(monkeypatch):
         client.execute("query {}", {})
     except urllib.error.URLError:
         # On the 4th attempt, the client re-raises the URLError directly,
-        # which is also fine — the test's purpose is to verify we never
+        # which is also fine - the test's purpose is to verify we never
         # hit an UnboundLocalError from the `body` variable.
         pass
     except RuntimeError:
@@ -1529,7 +1547,7 @@ def test_validation_failure_detail_uses_tail_with_repair_diagnosis():
 
 
 # ---------------------------------------------------------------------------
-# ProjectBackportDiscovery — cross-repo filter
+# ProjectBackportDiscovery - cross-repo filter
 # ---------------------------------------------------------------------------
 
 
@@ -1569,7 +1587,7 @@ def _make_discovery(items: list[dict], *, source_repo: str = "valkey-io/valkey")
         source_repo=source_repo,
         implicit_target_branch="9.1",
     )
-    # Bypass the GraphQL fetch — return our fake items directly.
+    # Bypass the GraphQL fetch - return our fake items directly.
     discovery._iter_items = lambda: items  # type: ignore[method-assign]
     return discovery
 
@@ -1611,7 +1629,7 @@ def test_discovery_drops_pr_with_wrong_status_regardless_of_repo():
 
 def test_discovery_keeps_pr_when_repository_field_missing():
     """If the GraphQL payload lacks repository (older cached response, schema
-    quirk, etc.), don't refuse to sweep — the field is the new filter, not a
+    quirk, etc.), don't refuse to sweep - the field is the new filter, not a
     hard requirement.
     """
     item = _project_item(number=3654, repo="valkey-io/valkey")

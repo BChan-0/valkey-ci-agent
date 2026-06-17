@@ -39,3 +39,8 @@ class BranchSweepResult:
     results: list[CandidateResult] = field(default_factory=list)
     pr_url: str = ""
     error: str = ""
+
+    @property
+    def applied_count(self) -> int:
+        """Number of candidates that were cherry-picked onto the branch."""
+        return sum(1 for item in self.results if item.outcome == "applied")

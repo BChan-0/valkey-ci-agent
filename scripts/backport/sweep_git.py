@@ -10,11 +10,13 @@ from typing import Any, Callable
 
 from github.GithubException import GithubException
 
+from scripts.backport.main import BOT_EMAIL, BOT_NAME
 from scripts.backport.main import _run_git as run_git_default
 from scripts.backport.sweep_models import (
     DETAIL_ALREADY_ON_SWEEP_BRANCH,
     CandidateResult,
 )
+from scripts.backport.utils import pr_numbers_from_commit_subjects
 from scripts.common.git_auth import github_https_url
 from scripts.common.github_client import retry_github_call
 
@@ -44,6 +46,8 @@ def clone_target_branch(
         text=True,
         env=git_env,
     )
+    run_git_default(dest_dir, "config", "user.name", BOT_NAME)
+    run_git_default(dest_dir, "config", "user.email", BOT_EMAIL)
 
 
 def push_backport_branch(
@@ -91,10 +95,10 @@ def list_applied_prs_on_branch(
     applied: list[CandidateResult] = []
     seen: set[int] = set()
     for line in result.stdout.strip().splitlines():
-        m = re.search(r"\(#(\d+)\)", line)
-        if not m:
+        matched = pr_numbers_from_commit_subjects([line])
+        if not matched:
             continue
-        pr_number = int(m.group(1))
+        pr_number = next(iter(matched))
         if pr_number in seen:
             continue
         seen.add(pr_number)
