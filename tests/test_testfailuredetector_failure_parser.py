@@ -155,3 +155,25 @@ class TestParseAndDeduplicate:
     def test_display_name(self) -> None:
         f = UniqueFailure(test_name="my test", test_file="tests/foo.tcl")
         assert f.display_name == "my test in tests/foo.tcl"
+
+    def test_separator_in_test_name_does_not_collide(self) -> None:
+        """Two distinct (name, file) pairs that would join to the same string
+        under a ' in ' separator must stay separate. The grouping key is a
+        tuple, so a separator appearing inside a test name can't cause a
+        collision."""
+        data = {
+            "job-1": {
+                "suite": [
+                    # Under f"{name} in {file}" both collapse to
+                    # "foo in bar.tcl in baz.tcl" — but they are different tests.
+                    {"test_name": "foo in bar.tcl", "test_file": "baz.tcl", "error": "a"},
+                    {"test_name": "foo", "test_file": "bar.tcl in baz.tcl", "error": "b"},
+                ]
+            }
+        }
+        results = parse_and_deduplicate(data, {})
+        assert len(results) == 2
+        assert {(f.test_name, f.test_file) for f in results} == {
+            ("foo in bar.tcl", "baz.tcl"),
+            ("foo", "bar.tcl in baz.tcl"),
+        }

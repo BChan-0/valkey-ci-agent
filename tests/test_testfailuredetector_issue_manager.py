@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -58,9 +59,34 @@ class TestBuildIssueTitle:
 
 
 class TestFingerprint:
-    def test_combines_name_and_file(self) -> None:
+    def test_is_stable_hex_token(self) -> None:
+        """Hashed, not raw: a fixed-shape lowercase-hex token safe to embed in
+        an HTML comment marker and a search query."""
         fp = fingerprint_for(_make_failure())
-        assert fp == "PSYNC2 test::tests/integration/replication-psync.tcl"
+        assert re.fullmatch(r"[0-9a-f]{20}", fp)
+
+    def test_deterministic(self) -> None:
+        assert fingerprint_for(_make_failure()) == fingerprint_for(_make_failure())
+
+    def test_distinguishes_name_and_file(self) -> None:
+        base = fingerprint_for(_make_failure())
+        assert fingerprint_for(_make_failure(test_name="other")) != base
+        assert fingerprint_for(_make_failure(test_file="other.tcl")) != base
+
+    def test_digits_are_significant(self) -> None:
+        """PSYNC2 vs PSYNC3 must not collapse — the identity is not normalized."""
+        assert (
+            fingerprint_for(_make_failure(test_name="PSYNC2"))
+            != fingerprint_for(_make_failure(test_name="PSYNC3"))
+        )
+
+    def test_unsafe_characters_do_not_leak(self) -> None:
+        """Quotes, newlines, and comment-breaking text are hashed away, so the
+        marker/query embedding can't be broken by hostile test names."""
+        fp = fingerprint_for(_make_failure(
+            test_name='evil "--> <!-- ' + "\n" + 'x', test_file="a\"b\nc",
+        ))
+        assert re.fullmatch(r"[0-9a-f]{20}", fp)
 
 
 class TestBuildIssueBody:

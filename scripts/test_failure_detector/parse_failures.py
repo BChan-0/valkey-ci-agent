@@ -43,7 +43,13 @@ def parse_and_deduplicate(
     Returns:
         List of UniqueFailure objects, deduplicated across jobs.
     """
-    grouped: dict[str, UniqueFailure] = {}
+    # Local grouping key: the (test_name, test_file) tuple. A tuple can't
+    # collide the way any single-separator string ("<name> in <file>" or
+    # "<name>::<file>") would when a test name contains that separator.
+    # This is independent of issue_renderer.fingerprint_for's marker key (a
+    # hash of the same pair) — they need not match: this groups failures within
+    # one run, that dedupes issues across runs. Both avoid separator collisions.
+    grouped: dict[tuple[str, str], UniqueFailure] = {}
 
     if not isinstance(all_failures, dict):
         logger.warning(
@@ -75,7 +81,7 @@ def parse_and_deduplicate(
                     logger.debug("Skipping entry with missing test_name or test_file: %s", entry)
                     continue
 
-                key = f"{test_name} in {test_file}"
+                key = (test_name, test_file)
 
                 if key not in grouped:
                     grouped[key] = UniqueFailure(
@@ -94,7 +100,7 @@ def parse_and_deduplicate(
                             url=job_urls.get(job_name, ""),
                         )
                     )
-                    logger.debug("%s in %s/%s", key, job_name, suite_name)
+                    logger.debug("%s in %s/%s", failure.display_name, job_name, suite_name)
 
     unique_failures = list(grouped.values())
     logger.info("Total unique failures: %d", len(unique_failures))

@@ -63,7 +63,7 @@ jobs:
           TARGET_TOKEN: ${{ steps.generate-token.outputs.token }}
           TARGET_REPO: ${{ inputs.repo || 'valkey-io/valkey' }}
           RUN_ID: ${{ inputs.run_id || '' }}
-          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run == true && 'true' || 'false' }} 
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run == true && 'true' || 'false' }}
         run: |
           set -euo pipefail
           args=(

@@ -17,6 +17,7 @@ import re
 from datetime import datetime, timezone
 from typing import Callable
 
+from scripts.common.incidents import compute_fingerprint
 from scripts.common.issue_dedup import IssueContent
 from scripts.test_failure_detector.parse_failures import UniqueFailure
 
@@ -26,8 +27,22 @@ _LABEL_NAME = "test-failure"
 
 
 def fingerprint_for(failure: UniqueFailure) -> str:
-    """Stable dedup key for a failure: test name + file."""
-    return f"{failure.test_name}::{failure.test_file}"
+    """Stable dedup key for a failure: a hash of test name + file.
+
+    The identity is still ``test_name`` + ``test_file``, hashed via
+    :func:`scripts.common.incidents.compute_fingerprint`, mirroring the 
+    fuzzer pipeline. Hashing yields a fixed-shape hex token that is safe in 
+    both places.
+
+    The name/file pair is the *identity*, so it goes in ``namespace`` (joined
+    in order, never normalized) rather than ``shapes`` — that keeps digits
+    significant so distinct tests like ``PSYNC2`` vs. ``PSYNC3`` stay separate,
+    and preserves order so a name/file swap can't collide.
+    """
+    return compute_fingerprint(
+        namespace=(MARKER_NAMESPACE, failure.test_name, failure.test_file),
+        shapes=(),
+    )
 
 
 def render_for(failure: UniqueFailure) -> Callable[[str, int], IssueContent]:
