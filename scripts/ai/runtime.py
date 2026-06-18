@@ -80,7 +80,7 @@ AGENT_PROFILES: dict[AgentProfileName, AgentProfile] = {
     "fuzzer_analysis_readonly": AgentProfile(
         name="fuzzer_analysis_readonly",
         allowed_tools="Read,Grep,Glob",
-        timeout=1200,
+        timeout=1800,
         effort="max",
         max_turns=200,
         writes_allowed=False,

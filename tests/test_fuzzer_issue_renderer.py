@@ -33,6 +33,50 @@ def test_build_title_from_anomaly():
     assert _build_title(_analysis()) == "[fuzzer-run] Node crash"
 
 
+def test_build_title_for_analyzer_failure():
+    """A run the analyzer could not verdict gets an honest title, not
+    "Anomalous behavior detected"."""
+    analysis = _analysis(
+        overall_status="warning", triage_verdict="needs-human-triage",
+        summary="Run 100: the analyzer could not complete. ... AI analysis failed: timeout after 1800s",
+        anomalies=[], root_cause_category=None, analyzer_incomplete=True,
+    )
+    assert _build_title(analysis) == "[fuzzer-run] Analyzer could not complete"
+
+
+def test_build_title_does_not_claim_failure_on_completed_triage_verdict():
+    """A completed analysis whose verdict is "needs-human-triage" must NOT be
+    mislabeled as an analyzer failure. This is the #104 conflation guard."""
+    analysis = _analysis(
+        overall_status="warning", triage_verdict="needs-human-triage",
+        summary="Cluster recovered but consensus was slow; a human should look.",
+        anomalies=[], root_cause_category=None, analyzer_incomplete=False,
+    )
+    assert _build_title(analysis) == "[fuzzer-run] Anomalous behavior detected"
+
+
+def test_build_title_for_missing_artifact_error():
+    """A run that could not be analyzed because artifacts were missing gets the
+    same honest title as an AI-analysis failure, not "Anomalous behavior"."""
+    from scripts.fuzzer.analyzer import _build_error_analysis
+    from scripts.fuzzer.models import FuzzerRunContext
+    ctx = FuzzerRunContext(repo="r", workflow_file="w", run_id=1, run_url="u",
+                           conclusion="failure", head_sha="h")
+    analysis = _build_error_analysis(ctx, "no fuzzer artifact bundle found")
+    assert _build_title(analysis) == "[fuzzer-run] Analyzer could not complete"
+
+
+def test_render_body_surfaces_analyzer_error():
+    analysis = _analysis(
+        overall_status="warning", triage_verdict="needs-human-triage",
+        summary="Run 100: the analyzer could not complete. ... AI analysis failed: timeout after 1800s",
+        anomalies=[], analyzer_incomplete=True,
+    )
+    body = _render_body(analysis, "<!-- marker -->", occurrences=1)
+    assert "timeout after 1800s" in body
+    assert "Anomalous behavior detected" not in body
+
+
 def test_render_body_contains_essentials():
     body = _render_body(_analysis(), "<!-- marker -->", occurrences=1)
     assert "<!-- marker -->" in body

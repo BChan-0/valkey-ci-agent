@@ -33,6 +33,10 @@ def _build_title(analysis: FuzzerRunAnalysis) -> str:
         return f"[fuzzer-run] {label}"
     if analysis.anomalies:
         return f"[fuzzer-run] {analysis.anomalies[0].title}"
+    # Set only by _build_incomplete_analysis, which produces no anomalies or
+    # root_cause_category, so this is reached only when both checks above miss.
+    if analysis.analyzer_incomplete:
+        return "[fuzzer-run] Analyzer could not complete"
     return "[fuzzer-run] Anomalous behavior detected"
 
 

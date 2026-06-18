@@ -20,6 +20,10 @@ from scripts.fuzzer.models import FuzzerRunAnalysis, FuzzerRunContext, FuzzerSig
 
 logger = logging.getLogger(__name__)
 
+# Total attempts for the AI analysis: one retry covers a transient Bedrock
+# stall (the per-attempt timeout lives in the fuzzer_analysis_readonly profile).
+_CLAUDE_MAX_ATTEMPTS = 2
+
 # (title, severity, pattern, is_bug_indicator)
 # A "bug indicator" upgrades the verdict from possible-core-valkey-bug to
 # likely-core-valkey-bug. RDB/AOF failures are anomalous but not necessarily
@@ -189,10 +193,24 @@ def _invoke_claude(context: FuzzerRunContext, anomalies: list[FuzzerSignal],
         deterministic_summary="\n".join(det_lines),
     )
 
-    result = run_agent("fuzzer_analysis_readonly", prompt, cwd=str(workdir))
-    if result.returncode != 0:
-        raise RuntimeError(f"Claude Code failed (rc={result.returncode}): {result.stderr[:300]}")
-    return _parse_claude_response(result.stdout)
+    # Retry once on a transient Bedrock stall (non-zero exit, typically a
+    # throttle or timeout). The monitor only ever looks at the latest run, so
+    # a dropped analysis is never revisited. A successful exit with
+    # unparseable output is deterministic - the same prompt yields the same
+    # bad output - so it is not retried. Mirrors backport.conflict_resolver.
+    last_error: RuntimeError | None = None
+    for attempt in range(_CLAUDE_MAX_ATTEMPTS):
+        result = run_agent("fuzzer_analysis_readonly", prompt, cwd=str(workdir))
+        if result.returncode == 0:
+            return _parse_claude_response(result.stdout)
+        last_error = RuntimeError(
+            f"Claude Code failed (rc={result.returncode}): {result.stderr[:300]}"
+        )
+        if attempt + 1 < _CLAUDE_MAX_ATTEMPTS:
+            logger.warning("Claude analysis failed, retrying: %s", last_error)
+    if last_error is None:  # _CLAUDE_MAX_ATTEMPTS was misconfigured to 0
+        raise RuntimeError("_CLAUDE_MAX_ATTEMPTS must be >= 1")
+    raise last_error
 
 
 def _format_source_note(context: FuzzerRunContext, *, valkey_ok: bool, fuzzer_ok: bool) -> str:
@@ -282,19 +300,22 @@ class FuzzerRunAnalyzer:
                 ))
         anomalies = _dedupe_signals(anomalies)
 
+        # Claude failed and deterministic scanning found nothing actionable.
+        # The run itself is not a fuzzer finding - the analyzer could not
+        # complete. File an honest agent-failure issue carrying the error
+        # rather than a "see findings" placeholder with no findings.
+        if claude_error and not claude_payload and not anomalies:
+            return _build_agent_failure_analysis(context, claude_error)
+
         if claude_payload:
             overall_status = str(claude_payload.get("overall_status") or "warning")
             triage_verdict = str(claude_payload.get("triage_verdict") or "needs-human-triage")
         else:
             overall_status, triage_verdict = _triage(anomalies)
-            if claude_error and not anomalies:
-                # Couldn't get a verdict from either signal - escalate.
-                overall_status, triage_verdict = "warning", "needs-human-triage"
 
         raw_summary = claude_payload.get("summary")
         summary = (raw_summary if isinstance(raw_summary, str) else "").strip() or (
-            f"Run {run_id}: {len(anomalies)} anomalies" if anomalies
-            else f"Run {run_id}: see findings"
+            f"Run {run_id}: {len(anomalies)} anomalies"
         )
         root_cause = claude_payload.get("root_cause_category")
         if not isinstance(root_cause, str):
@@ -324,20 +345,53 @@ class FuzzerRunAnalyzer:
         )
 
 
-def _build_error_analysis(context: FuzzerRunContext, reason: str) -> FuzzerRunAnalysis:
-    """Surface infrastructure failures (e.g. missing artifacts) for human triage.
+def _build_incomplete_analysis(
+    context: FuzzerRunContext, *, summary: str, bucket: str, shape: str,
+) -> FuzzerRunAnalysis:
+    """Build an analysis for a run the analyzer could not verdict.
 
-    Computes an explicit fingerprint from `(repo, workflow_file, "error")` and
-    the reason so different error classes (missing artifacts vs. Claude crash)
-    each get their own dedup bucket instead of all collapsing into one issue.
+    Covers both missing/unreadable artifacts and a failed AI analysis. The
+    `bucket` is the trailing fingerprint namespace element, so each failure
+    class dedupes on its own issue instead of collapsing together.
     """
     return FuzzerRunAnalysis(
         repo=context.repo, workflow_file=context.workflow_file, run_id=context.run_id,
         run_url=context.run_url, conclusion=context.conclusion, head_sha=context.head_sha,
         overall_status="warning", triage_verdict="needs-human-triage",
-        summary=f"Run {context.run_id}: {reason}",
-        incident_fingerprint=compute_fingerprint(
-            namespace=(context.repo, context.workflow_file, "error"),
-            shapes=[reason],
+        summary=summary,
+        scenario_id=context.scenario_id, seed=context.seed,
+        tested_valkey_sha=context.tested_valkey_sha,
+        reproduction_hint=(
+            f"valkey-fuzzer cluster --seed {context.seed}" if context.seed else None
         ),
+        incident_fingerprint=compute_fingerprint(
+            namespace=(context.repo, context.workflow_file, bucket),
+            shapes=[shape],
+        ),
+        analyzer_incomplete=True,
+    )
+
+
+def _build_agent_failure_analysis(
+    context: FuzzerRunContext, claude_error: str,
+) -> FuzzerRunAnalysis:
+    """The AI analysis failed on a run with no deterministic anomalies."""
+    return _build_incomplete_analysis(
+        context,
+        summary=(
+            f"Run {context.run_id}: the analyzer could not complete. Deterministic "
+            f"scanning found no anomalies and the AI analysis failed: {claude_error}"
+        ),
+        bucket="agent-failure",
+        shape="analyzer-incomplete",
+    )
+
+
+def _build_error_analysis(context: FuzzerRunContext, reason: str) -> FuzzerRunAnalysis:
+    """Artifacts were missing or unreadable, so the run could not be analyzed."""
+    return _build_incomplete_analysis(
+        context,
+        summary=f"Run {context.run_id}: {reason}",
+        bucket="error",
+        shape=reason,
     )

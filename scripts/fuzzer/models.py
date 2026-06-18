@@ -56,3 +56,7 @@ class FuzzerRunAnalysis:
     reproduction_hint: str | None = None
     incident_fingerprint: str | None = None
     suggested_labels: list[str] = field(default_factory=list)
+    # True when the analyzer itself could not produce a verdict (missing
+    # artifacts, or the AI analysis failed). Distinct from a completed analysis
+    # whose verdict happens to be "needs-human-triage".
+    analyzer_incomplete: bool = False

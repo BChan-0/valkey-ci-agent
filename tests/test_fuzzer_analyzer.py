@@ -177,3 +177,95 @@ def test_build_error_analysis_fingerprint_is_stable():
     a = _build_error_analysis(_ctx(), "no fuzzer artifact bundle found")
     b = _build_error_analysis(_ctx(), "no fuzzer artifact bundle found")
     assert a.incident_fingerprint == b.incident_fingerprint
+
+
+def test_invoke_claude_retries_once_then_succeeds(monkeypatch, tmp_path):
+    """A transient first-attempt failure is retried; the second success wins."""
+    from scripts.fuzzer import analyzer as analyzer_mod
+
+    monkeypatch.setattr(analyzer_mod, "shallow_clone_at_sha", lambda *a, **kw: True)
+    results = [
+        MagicMock(returncode=1, stdout="", stderr="timeout after 1800s"),
+        MagicMock(returncode=0, stdout='{"overall_status": "normal"}', stderr=""),
+    ]
+    calls = {"n": 0}
+
+    def fake_run_agent(*a, **kw):
+        out = results[calls["n"]]
+        calls["n"] += 1
+        return out
+
+    monkeypatch.setattr(analyzer_mod, "run_agent", fake_run_agent)
+    payload = analyzer_mod._invoke_claude(_ctx(head_sha="abc"), [], tmp_path)
+    assert payload["overall_status"] == "normal"
+    assert calls["n"] == 2
+
+
+def test_invoke_claude_does_not_retry_on_parse_failure(monkeypatch, tmp_path):
+    """A successful exit with unparseable output is deterministic, so it is
+    raised immediately rather than burning a second Bedrock attempt."""
+    from scripts.fuzzer import analyzer as analyzer_mod
+
+    monkeypatch.setattr(analyzer_mod, "shallow_clone_at_sha", lambda *a, **kw: True)
+    calls = {"n": 0}
+
+    def fake_run_agent(*a, **kw):
+        calls["n"] += 1
+        return MagicMock(returncode=0, stdout="not json", stderr="")
+
+    monkeypatch.setattr(analyzer_mod, "run_agent", fake_run_agent)
+    with pytest.raises(ValueError):
+        analyzer_mod._invoke_claude(_ctx(head_sha="abc"), [], tmp_path)
+    assert calls["n"] == 1
+
+
+def test_invoke_claude_raises_after_retry_exhausted(monkeypatch, tmp_path):
+    """Both attempts failing surfaces the last error for the caller to handle."""
+    from scripts.fuzzer import analyzer as analyzer_mod
+
+    monkeypatch.setattr(analyzer_mod, "shallow_clone_at_sha", lambda *a, **kw: True)
+    monkeypatch.setattr(
+        analyzer_mod, "run_agent",
+        lambda *a, **kw: MagicMock(returncode=1, stdout="", stderr="timeout after 1800s"),
+    )
+    with pytest.raises(RuntimeError, match="timeout after 1800s"):
+        analyzer_mod._invoke_claude(_ctx(head_sha="abc"), [], tmp_path)
+
+
+def test_invoke_claude_guards_against_zero_attempts(monkeypatch, tmp_path):
+    """A misconfigured attempt count fails loud, never `raise None`."""
+    from scripts.fuzzer import analyzer as analyzer_mod
+
+    monkeypatch.setattr(analyzer_mod, "shallow_clone_at_sha", lambda *a, **kw: True)
+    monkeypatch.setattr(analyzer_mod, "run_agent", lambda *a, **kw: None)
+    monkeypatch.setattr(analyzer_mod, "_CLAUDE_MAX_ATTEMPTS", 0)
+    with pytest.raises(RuntimeError, match=">= 1"):
+        analyzer_mod._invoke_claude(_ctx(head_sha="abc"), [], tmp_path)
+
+
+def test_agent_failure_analysis_carries_error_and_distinct_fingerprint():
+    """A clean run + Claude failure produces an honest, triageable analysis
+    that dedupes separately from artifact errors and real findings."""
+    from scripts.fuzzer.analyzer import _build_agent_failure_analysis, _build_error_analysis
+    af = _build_agent_failure_analysis(
+        _ctx(seed="2153362329"), "Claude Code failed (rc=1): timeout after 1800s",
+    )
+    assert "timeout after 1800s" in af.summary
+    assert af.triage_verdict == "needs-human-triage"
+    assert af.analyzer_incomplete is True
+    assert af.anomalies == []
+    assert af.suggested_labels == []
+    assert af.reproduction_hint == "valkey-fuzzer cluster --seed 2153362329"
+    # Distinct dedup bucket from artifact-handling errors.
+    err = _build_error_analysis(_ctx(), "no fuzzer artifact bundle found")
+    assert err.analyzer_incomplete is True
+    assert af.incident_fingerprint
+    assert af.incident_fingerprint != err.incident_fingerprint
+
+
+def test_agent_failure_analysis_fingerprint_is_stable():
+    """Repeated Bedrock outages collapse into one issue."""
+    from scripts.fuzzer.analyzer import _build_agent_failure_analysis
+    a = _build_agent_failure_analysis(_ctx(), "timeout after 1800s")
+    b = _build_agent_failure_analysis(_ctx(), "a totally different error string")
+    assert a.incident_fingerprint == b.incident_fingerprint
