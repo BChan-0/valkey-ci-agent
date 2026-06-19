@@ -114,6 +114,38 @@ def _reset_worktree(repo_dir: str) -> None:
     git_output(repo_dir, "clean", "-fd")
 
 
+# Signatures that mean the verify command failed because the environment is
+# missing something the job's `uses:` setup would have installed, not because
+# the fix is wrong. The build/test never got to judge the fix, so a failure
+# matching these is a handoff candidate, not a refusal. Heuristic over the
+# common toolchains; deliberately specific to avoid swallowing genuine
+# test failures.
+_MISSING_DEPENDENCY_PATTERNS = re.compile(
+    r"""
+    ModuleNotFoundError                  # python import
+    | No\ module\ named                  # python import (older phrasing)
+    | ImportError:\ cannot\ import       # python import
+    | command\ not\ found                # shell: missing binary (bash)
+    | sh:\ \d+:\ .+:\ not\ found         # shell: missing binary (dash/sh)
+    | cannot\ find\ -l                   # linker: missing library
+    | Package\ .*\ was\ not\ found       # pkg-config
+    | error:\ could\ not\ find\ .*\b(cargo|rustc)\b
+    | npm\ ERR!.*\bENOENT\b              # node: missing
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def looks_like_missing_dependency(output: str) -> bool:
+    """True if the verify output indicates a missing build/runtime dependency.
+
+    Distinguishes "the job installs this via an unreplayed setup step" from
+    "the fix did not work". Used to decide handoff vs refusal when the command
+    ran and exited nonzero.
+    """
+    return bool(_MISSING_DEPENDENCY_PATTERNS.search(output))
+
+
 @dataclass
 class LoopResult:
     """Outcome of the fix-feedback loop."""
@@ -124,6 +156,11 @@ class LoopResult:
     changed_paths: tuple[str, ...]
     attempts: int
     detail: str
+    # Set when a fix was authored but verification could not run here (e.g. the
+    # job's setup cannot be reproduced locally). The patch is carried for handoff
+    # to a human rather than pushed unverified.
+    handoff: bool = False
+    handoff_patch: str = ""
 
 
 @dataclass
@@ -232,8 +269,35 @@ def run_fix_loop(
             container_image=container_image,
         )
         last_run = run_result
-        if not run_result.ran:
-            last_detail = f"verification could not run: {run_result.output_tail[:300]}"
+        # A fix can fail to verify here for two innocent reasons: the command
+        # could not start at all (ran=False), or it ran but the environment was
+        # missing a dependency the job's setup would have installed. In both
+        # cases the build/test never judged the fix, so we hand the patch off
+        # for a human and let real CI decide - but only if the skeptic approves
+        # it first, so we never hand off a patch that weakens a test.
+        unverifiable = not run_result.ran or (
+            not run_result.passed and looks_like_missing_dependency(run_result.output_tail)
+        )
+        if unverifiable:
+            reviewed = build_and_review_patch(repo_dir, changed, proposal, review_func=review_func)
+            if reviewed.ok:
+                detail = (
+                    "could not verify the fix here "
+                    "(missing environment dependency or unrunnable command); "
+                    "handing off the patch for review"
+                )
+                result = LoopResult(
+                    success=False, run_result=run_result, review=reviewed.review,
+                    changed_paths=changed, attempts=attempt, detail=detail,
+                    handoff=True, handoff_patch=reviewed.patch,
+                )
+                reset_func(repo_dir)
+                return result
+            # Skeptic rejected it, or there was no patch: not safe to hand off.
+            last_detail = reviewed.detail or (
+                "verification could not run (missing environment dependency or "
+                "unrunnable command) and produced no patch"
+            )
             break
         if not run_result.passed:
             feedback = (

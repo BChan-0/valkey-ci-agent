@@ -23,6 +23,7 @@ import tempfile
 from pathlib import Path
 
 from scripts.ci_fix.models import FixProposal
+from scripts.ci_fix.port_discovery import resolve_default_branch
 from scripts.common.git_auth import github_https_url
 from scripts.common.git_clone import REPO_RE, SHA_RE
 from scripts.common.proc import BOT_EMAIL, BOT_NAME, EmptyPatch, build_approved_patch, git_output, run_git
@@ -106,6 +107,115 @@ def commit_and_push_fix(
             raise PushRefused(f"Refusing to push: git failed: {detail}") from exc
 
         return git_output(str(clean_repo), "rev-parse", "HEAD").strip()
+
+
+def commit_and_push_port(
+    repo_dir: str,
+    *,
+    head_repo_full_name: str,
+    head_branch: str,
+    head_sha: str,
+    unstable_fix_commit: str,
+    git_env: dict[str, str],
+) -> str:
+    """Cherry-pick an existing upstream fix onto the PR branch and push it.
+
+    Unlike an authored fix, a PORT carries an already-merged upstream commit, so
+    we preserve its original authorship and add the standard ``cherry picked
+    from`` trailer rather than re-authoring it as the bot. The same push
+    discipline applies: namespaced branch, validated repo/SHA, fast-forward-only
+    push from a fresh clone. A conflicting or empty cherry-pick, or any git
+    failure, becomes ``PushRefused`` so the outcome is always a comment.
+    """
+    if not head_branch.startswith(ALLOWED_BRANCH_PREFIX):
+        raise PushRefused(
+            f"Refusing to push to {head_branch!r}: ci_fix only pushes to branches "
+            f"under {ALLOWED_BRANCH_PREFIX}."
+        )
+    if not REPO_RE.fullmatch(head_repo_full_name):
+        raise PushRefused(f"Refusing to push to malformed repo {head_repo_full_name!r}.")
+    if not SHA_RE.fullmatch(head_sha):
+        raise PushRefused(f"Refusing to push from malformed head SHA {head_sha!r}.")
+    if not SHA_RE.fullmatch(unstable_fix_commit):
+        raise PushRefused(f"Refusing to port malformed commit {unstable_fix_commit!r}.")
+    if not _is_valid_branch_name(head_branch):
+        raise PushRefused(f"Refusing to push to malformed branch {head_branch!r}.")
+
+    with tempfile.TemporaryDirectory(prefix="ci-fix-port-") as tmpdir:
+        clean_repo = Path(tmpdir) / "repo"
+        _clone_clean(head_repo_full_name, clean_repo)
+        try:
+            # The fix commit lives on the default branch and may not be in the
+            # blobless clone yet; fetch the exact object before picking.
+            run_git(str(clean_repo), "fetch", "origin", unstable_fix_commit)
+            run_git(str(clean_repo), "checkout", head_sha)
+            run_git(str(clean_repo), "checkout", "-B", head_branch)
+            # Code, not the AI, owns "this is a real already-merged upstream
+            # fix". Verify the commit is reachable from the default branch and
+            # is not already on the PR head, so a model-chosen SHA cannot skip
+            # local verification by pointing at an arbitrary or already-present
+            # commit. A SHA that fails this is refused, not ported.
+            _verify_portable_commit(str(clean_repo), unstable_fix_commit, head_sha)
+            # The cherry-pick keeps the upstream commit's author and sign-off,
+            # but it still needs a committer identity to create the commit (a
+            # fresh clone has none). The bot is the committer, the human stays
+            # the author, which is the normal backport shape.
+            run_git(str(clean_repo), "config", "user.name", BOT_NAME)
+            run_git(str(clean_repo), "config", "user.email", BOT_EMAIL)
+            # -x records "cherry picked from commit <sha>".
+            run_git(str(clean_repo), "cherry-pick", "-x", unstable_fix_commit)
+
+            run_git(str(clean_repo), "remote", "set-url", "origin", github_https_url(head_repo_full_name))
+            run_git(str(clean_repo), "push", "origin", f"HEAD:{head_branch}", env=git_env)
+        except subprocess.CalledProcessError as exc:
+            detail = (exc.stderr or str(exc)).strip()[:300]
+            raise PushRefused(f"Refusing to push: git failed: {detail}") from exc
+
+        return git_output(str(clean_repo), "rev-parse", "HEAD").strip()
+
+
+def _verify_portable_commit(clean_repo: str, fix_commit: str, head_sha: str) -> None:
+    """Refuse unless ``fix_commit`` is a genuine upstream fix missing from head.
+
+    A PORT skips local verification because the commit is already merged and
+    tested on the default branch. That exception is only safe if *code*, not the
+    AI, proves the SHA is exactly that. Two deterministic checks:
+
+    - the commit is reachable from the default branch (it really is merged
+      upstream, not an arbitrary or fabricated SHA); and
+    - the commit is not already an ancestor of the PR head (porting it actually
+      adds the missing fix rather than being a no-op).
+
+    A SHA that fails either check raises ``PushRefused`` instead of being
+    cherry-picked.
+    """
+    default_branch = resolve_default_branch(clean_repo)
+    ref = f"origin/{default_branch}"
+    try:
+        git_output(clean_repo, "rev-parse", "--verify", ref)
+    except subprocess.CalledProcessError:
+        run_git(
+            clean_repo, "fetch", "origin",
+            f"refs/heads/{default_branch}:refs/remotes/origin/{default_branch}",
+        )
+    if not _is_ancestor(clean_repo, fix_commit, ref):
+        raise PushRefused(
+            f"Refusing to port {fix_commit[:12]}: it is not reachable from {ref}, "
+            "so it is not a merged upstream fix."
+        )
+    if _is_ancestor(clean_repo, fix_commit, head_sha):
+        raise PushRefused(
+            f"Refusing to port {fix_commit[:12]}: it is already present on the PR head."
+        )
+
+
+def _is_ancestor(repo_dir: str, maybe_ancestor: str, descendant: str) -> bool:
+    """True if ``maybe_ancestor`` is an ancestor of ``descendant`` (or equal)."""
+    try:
+        git_output(repo_dir, "merge-base", "--is-ancestor", maybe_ancestor, descendant)
+        return True
+    except subprocess.CalledProcessError:
+        return False
 
 
 def _clone_clean(head_repo_full_name: str, dest: Path) -> None:
