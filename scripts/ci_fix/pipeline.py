@@ -30,8 +30,10 @@ from scripts.ci_fix.models import (
     FixProposal,
     FixRequest,
     OutcomeKind,
+    ReviewVerdict,
 )
-from scripts.ci_fix.push import PushRefused, commit_and_push_fix
+from scripts.ci_fix.port_discovery import PortCandidate, discover_port_candidates
+from scripts.ci_fix.push import PushRefused, commit_and_push_fix, commit_and_push_port
 from scripts.ci_fix.review import (
     LoopResult,
     build_and_review_patch,
@@ -56,6 +58,7 @@ logger = logging.getLogger(__name__)
 Diagnose = Callable[..., FixProposal]
 RunLoop = Callable[..., LoopResult]
 Push = Callable[..., str]
+PortPush = Callable[..., str]
 
 
 def run_ci_fix(
@@ -72,6 +75,7 @@ def run_ci_fix(
     diagnose_func: Diagnose = diagnose_failure,
     run_loop_func: RunLoop = run_fix_loop,
     push_func: Push = commit_and_push_fix,
+    port_push_func: PortPush = commit_and_push_port,
     macos_verifier: VerifyBackend | None = None,
 ) -> FixOutcome:
     """Run the whole pipeline and return a terminal ``FixOutcome``."""
@@ -89,7 +93,7 @@ def run_ci_fix(
             Path(workdir_str), request, failed_jobs,
             artifact_client=artifact_client, git_env=git_env,
             diagnose_func=diagnose_func, run_loop_func=run_loop_func, push_func=push_func,
-            macos_verifier=macos_verifier,
+            port_push_func=port_push_func, macos_verifier=macos_verifier,
         )
     run_url = f"https://github.com/{request.repo_full_name}/actions/runs/{request.run_id}"
     return replace(outcome, failing_run_url=run_url)
@@ -105,6 +109,7 @@ def _run_in_workspace(
     diagnose_func: Diagnose,
     run_loop_func: RunLoop,
     push_func: Push,
+    port_push_func: PortPush,
     macos_verifier: VerifyBackend | None,
 ) -> FixOutcome:
     logs = artifact_client.download_run_logs(request.repo_full_name, request.run_id)
@@ -122,9 +127,19 @@ def _run_in_workspace(
             summary=f"Could not clone {request.repo_full_name} at {request.head_sha[:12]}.",
         )
 
-    proposal = diagnose_func(str(logs_dir), str(repo_dir), hint=request.hint)
+    port_candidates = discover_port_candidates(str(repo_dir), str(logs_dir))
+    proposal = diagnose_func(
+        str(logs_dir), str(repo_dir), hint=request.hint,
+        port_candidates=port_candidates,
+    )
     if proposal.path is FixPath.REFUSE:
         return _refuse(proposal, proposal.reasoning or "No safe fix found.")
+
+    if proposal.path is FixPath.PORT:
+        return _port_and_push(
+            repo_dir, request, proposal, failed_jobs, git_env=git_env,
+            port_push_func=port_push_func, port_candidates=port_candidates,
+        )
 
     plan = _plan_verification(repo_dir, request, proposal, failed_jobs)
     if isinstance(plan, str):  # a refusal reason
@@ -180,6 +195,13 @@ def _loop_and_push(
 ) -> FixOutcome:
     """Local/Docker: apply, verify in-loop (retry on fail), review, push on green."""
     loop = run_loop_func(str(repo_dir), proposal, container_image=plan.image)
+    if loop.handoff:
+        return FixOutcome(
+            kind=OutcomeKind.HANDOFF, summary=loop.detail, proposal=proposal,
+            run_result=loop.run_result, review=loop.review,
+            handoff_patch=loop.handoff_patch,
+            other_failing_checks=proposal.other_failing_checks,
+        )
     if not loop.success:
         return FixOutcome(
             kind=OutcomeKind.REFUSED, summary=loop.detail, proposal=proposal,
@@ -191,6 +213,69 @@ def _loop_and_push(
         repo_dir, request, proposal, loop.changed_paths,
         review=loop.review, run_result=loop.run_result,
         verify_backend=backend, git_env=git_env, push_func=push_func,
+    )
+
+
+def _port_and_push(
+    repo_dir: Path, request: FixRequest, proposal: FixProposal, failed_jobs: tuple[str, ...],
+    *, git_env: dict[str, str], port_push_func: PortPush = commit_and_push_port,
+    port_candidates: tuple[PortCandidate, ...] = (),
+) -> FixOutcome:
+    """Apply an already-merged upstream fix and publish it.
+
+    PORT is the only path allowed to rely on the PR's normal CI as the
+    authoritative verifier. That trust is bounded by code: the SHA must be one
+    of the candidates discovered from this failure's logs (so the model cannot
+    point at an arbitrary default-branch commit), the hinted job must be a real
+    failed job, and the push path independently re-verifies the commit's
+    ancestry. Original authorship is preserved.
+    """
+    job = _match_failed_job(proposal.failing_job_hint, failed_jobs)
+    if job is None:
+        return _refuse(
+            proposal,
+            f"The named job {proposal.failing_job_hint or '(none)'!r} is not among the failed "
+            f"jobs of the linked run ({', '.join(failed_jobs) or 'none found'}); "
+            "refusing rather than porting a fix for a job that did not fail.",
+        )
+    if not proposal.unstable_fix_commit.strip():
+        return _refuse(proposal, "diagnosis chose PORT but did not name an upstream fix commit")
+
+    chosen = proposal.unstable_fix_commit.strip()
+    full_sha = _canonical_candidate_sha(chosen, port_candidates)
+    if full_sha is None:
+        return _refuse(
+            proposal,
+            f"The chosen commit {chosen[:12]} is not among the "
+            "fixes discovered for this failure; refusing to port a commit the code "
+            "did not surface as a candidate.",
+        )
+
+    try:
+        commit_sha = port_push_func(
+            str(repo_dir),
+            head_repo_full_name=request.head_repo_full_name,
+            head_branch=request.head_branch,
+            head_sha=request.head_sha,
+            unstable_fix_commit=full_sha,
+            git_env=git_env,
+        )
+    except PushRefused as exc:
+        return _refuse(proposal, str(exc))
+
+    review = ReviewVerdict(
+        approved=True,
+        reasoning=(
+            f"Ported upstream commit {full_sha[:12]} with its original "
+            "authorship; this PORT path relies on the PR's normal CI as the verification authority."
+        ),
+    )
+    return FixOutcome(
+        kind=OutcomeKind.PUSHED,
+        summary=f"Ported upstream fix for {proposal.failing_check}",
+        proposal=proposal, review=review, commit_sha=commit_sha,
+        verify_backend="upstream-port",
+        other_failing_checks=proposal.other_failing_checks,
     )
 
 
@@ -303,6 +388,31 @@ def _match_failed_job(hint: str, failed_jobs: tuple[str, ...]) -> str | None:
     if len(base_matches) == 1:
         return base_matches[0]
     return None  # zero matches, or ambiguous (multiple matrix legs)
+
+
+def _canonical_candidate_sha(
+    chosen: str, candidates: tuple[PortCandidate, ...],
+) -> str | None:
+    """Resolve the model's chosen commit to a discovered candidate's full SHA.
+
+    The diagnosis prompt renders candidates as short (12-char) SHAs, so the
+    model echoes back a short SHA while the candidate set carries full 40-char
+    SHAs. Match by prefix in either direction and return the candidate's full
+    SHA, which the push path then ancestry-verifies. Returns None when the
+    chosen SHA matches no candidate, or when a short prefix is ambiguous across
+    more than one candidate (refuse rather than guess).
+    """
+    chosen = chosen.strip().lower()
+    if not chosen:
+        return None
+    matches = {
+        c.sha
+        for c in candidates
+        if c.sha.lower().startswith(chosen) or chosen.startswith(c.sha.lower())
+    }
+    if len(matches) == 1:
+        return next(iter(matches))
+    return None  # zero matches, or an ambiguous prefix
 
 
 _MAX_WORKFLOW_BYTES = 1024 * 1024  # workflow YAML over 1 MiB is not a real workflow

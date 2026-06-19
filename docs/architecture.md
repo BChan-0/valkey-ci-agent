@@ -128,13 +128,21 @@ ci_fix/main.py (workflow_dispatch event)
                                     not the AI, owns this)
        common.workflow_artifacts -> download the failed run's logs
        common.git_clone          -> shallow-clone the repo at the failed SHA
+       port_discovery            -> code-discovers default-branch candidates
+                                    for likely missing backports
        diagnose.diagnose_failure -> read-only AI returns a FixProposal
-                                    (port | author | refuse) + a failing-job hint
+                                    (port | author | refuse) + a failing-job hint,
+                                    using the discovered port candidates so
+                                    missing backports are preferred over refusals
        pipeline._plan_verification
                                  -> code matches the hint to a real failed job
                                     and classifies its workflow environment
                                     (verify.workflow_env) into a VerificationPlan:
                                     local | docker(image) | macos | refuse
+       port:
+         apply.apply_port_commit -> cherry-pick the upstream fix commit without
+                                    committing; push and rely on this PR's
+                                    normal CI as the verification authority
        local/docker:
          review.run_fix_loop     -> apply (edit-only AI)
                                     -> runner.run_verification_command (code runs
@@ -165,9 +173,17 @@ clone at the gated SHA. This is targeted verification of the one failing check,
 not a replay of the whole CI job.
 
 Nothing about the test framework is hardcoded. The diagnosis reads the target
-repo's own CI workflow files to learn how it builds and runs tests, so the
-same engine works for any repo with a comment-triggerable PR - not just Valkey
-core's Tcl suite.
+repo's own CI workflow files to learn how it builds and runs tests, and the
+port-discovery and verification logic resolve the default branch from the
+clone (so a repo whose default is `main`, like Valkey Search, works the same as
+Valkey core's `unstable`). The engine is repo-agnostic in principle.
+
+The deployment is not yet. `ci-fix.yml` and `ci-fix-comment-poll.yml` are
+operationally scoped to `valkey-io/valkey`: the workflow guards on the repo,
+mints a token for it, and the poller watches only it. Onboarding another repo
+(e.g. Valkey Search) still needs a registry-driven token/poll/dispatch path in
+the workflows; the Python engine being repo-agnostic is a precondition, not the
+whole job.
 
 Every failure mode - un-runnable variant, a real product bug, a flaky test, a
 moved branch, a non-member commenter - returns a `FixOutcome` that becomes an

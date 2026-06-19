@@ -103,11 +103,62 @@ def test_gives_up_after_max_attempts():
     assert "review rejected" in result.detail
 
 
-def test_unrunnable_command_breaks_loop():
-    unrunnable = RunResult(ran=False, passed=False, exit_code=-1, command="c", output_tail="no cwd")
+def test_unrunnable_command_hands_off_with_patch():
+    """A verify command that cannot run here is not a failed fix: the loop hands
+    off the authored patch for a human rather than refusing as if it failed."""
+    unrunnable = RunResult(ran=False, passed=False, exit_code=-1, command="c", output_tail="no jsonschema")
     result = _loop(run_command=lambda *a, **k: unrunnable)
     assert result.success is False
-    assert "could not run" in result.detail
+    assert result.handoff is True
+    assert result.handoff_patch == "the diff"
+    assert "could not verify" in result.detail
+
+
+def test_missing_dependency_failure_hands_off():
+    """A ran-and-failed verify caused by a missing dependency (the job's setup
+    was not replayed) is a handoff, not a refusal: the build never judged the
+    fix. This is the common jsonschema/uses:-setup case."""
+    missing_dep = RunResult(
+        ran=True, passed=False, exit_code=1, command="c",
+        output_tail="Traceback...\nModuleNotFoundError: No module named 'jsonschema'",
+    )
+    result = _loop(run_command=lambda *a, **k: missing_dep)
+    assert result.success is False
+    assert result.handoff is True
+    assert result.handoff_patch == "the diff"
+
+
+def test_genuine_test_failure_does_not_hand_off():
+    """A ran-and-failed verify with no dependency signature is a real fix
+    failure: retry then refuse, never hand off."""
+    result = _loop(max_attempts=1, run_command=lambda *a, **k: _failed())
+    assert result.success is False
+    assert result.handoff is False
+    assert "test still failing" in result.detail
+
+
+def test_rejected_review_is_not_handed_off():
+    """When verification cannot run but the skeptic rejects the patch, it must
+    not be handed off: handoff is gated on review approval, not patch presence."""
+    unrunnable = RunResult(ran=False, passed=False, exit_code=-1, command="c", output_tail="cannot run")
+    result = _loop(run_command=lambda *a, **k: unrunnable, review_func=lambda *a, **k: _rejected())
+    assert result.handoff is False
+    assert result.handoff_patch == ""
+    assert "review rejected" in result.detail
+
+
+def test_dependency_signatures_do_not_match_generic_failures():
+    """The dep-signature heuristic must not swallow ordinary failures: a generic
+    'not found' message or a bad-include compile error is a real fix failure,
+    not a missing-dependency handoff."""
+    from scripts.ci_fix.review import looks_like_missing_dependency
+    assert looks_like_missing_dependency("Error: not found") is False
+    assert looks_like_missing_dependency("assertion failed: key not found") is False
+    assert looks_like_missing_dependency("fatal error: wrongheader.h: No such file") is False
+    # but real toolchain/dependency signals still match
+    assert looks_like_missing_dependency("ModuleNotFoundError: No module named 'x'") is True
+    assert looks_like_missing_dependency("./run: line 3: pytest: command not found") is True
+    assert looks_like_missing_dependency("sh: 1: cmake: not found") is True
 
 
 def test_worktree_reset_on_failure():
