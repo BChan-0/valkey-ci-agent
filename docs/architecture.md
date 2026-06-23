@@ -10,6 +10,7 @@ and fuzzer monitoring (scheduled), and the CI test-fix bot (on-demand).
 scripts/
   backport/    Backport workflow
   fuzzer/      Fuzzer monitor workflow
+  test_failure_detector/ Test Failure Detector workflow
   ci_fix/      CI test-fix bot
   ai/          Claude Code subprocess orchestration
   common/      Shared infrastructure
@@ -261,6 +262,25 @@ permissions used by the workflows.
 Same-owner `push_repo` values are rejected so staging repositories do not become
 the normal deployment model.
 
+## Test Failure Detector Flow
+
+```text
+main.py (daily cron or manual dispatch)
+  -> get_latest_daily_run() or use provided run_id
+  -> download_all_test_failures() from the run's artifacts
+  -> get_job_urls() for CI links
+  -> parse_and_deduplicate() groups by {test_name, test_file}
+  -> process_failures() creates/updates GitHub issues
+```
+
+### Entry Points
+
+- `scripts/test_failure_detector/main.py` - CLI entry point and pipeline orchestration
+- `scripts/test_failure_detector/download.py` - workflow run discovery and artifact download
+- `scripts/test_failure_detector/parse_failures.py` - JSON parsing and deduplication
+- `scripts/test_failure_detector/manage_issues.py` - orchestration over the shared dedup publisher to create/update issues
+- `scripts/test_failure_detector/issue_renderer.py` - test-failure-specific title/body/comment rendering and label assignment
+
 ## Planned Workflows
 
 Future sibling modules and extensions:
@@ -269,3 +289,4 @@ Future sibling modules and extensions:
 - **Autonomous CI-fix poller** - the CI-fix engine, driven by a poller that
   detects red backport PRs (or test-failure issues) instead of a maintainer
   `@`-mention. Same pipeline, a different front door.
+- **Additional Daily CI Analysis** - detect flaky tests, generate fix PRs

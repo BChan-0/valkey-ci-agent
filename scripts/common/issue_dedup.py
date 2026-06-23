@@ -55,6 +55,8 @@ class IssueDedupPublisher:
         fingerprint: str,
         render: Callable[[str, int], IssueContent],
         idempotency_key: str | None = None,
+        body_transform: Callable[[str], str] | None = None,
+        title_fallback: str | None = None,
     ) -> tuple[str, str]:
         """Create or update the issue for ``fingerprint``.
 
@@ -70,6 +72,21 @@ class IssueDedupPublisher:
         occurrence counter when the same key is seen again. Use this to
         guard against re-runs of the same source event (e.g. the same
         workflow run id) inflating the count.
+
+        ``body_transform`` is an optional hook applied only on the *update*
+        path: it receives the existing issue body and returns a modified
+        body, letting callers carry state forward that ``render`` can't see
+        (e.g. merging a running list of failing environments into the
+        already-published body). It runs before the marker/occurrence/
+        idempotency machinery, so those markers stay authoritative regardless
+        of what the transform returns. Ignored when creating a new issue.
+
+        ``title_fallback`` migrates issues created under an older fingerprint
+        scheme. When the marker search misses, the publisher looks for an open
+        issue with this exact title; on a hit it adopts that issue and the
+        update re-stamps it with the current marker, so a format change does
+        not orphan it into a duplicate. The match must be exact and
+        case-sensitive. Pass the same title ``render`` produces.
         """
         repo = retry_github_call(
             lambda: self._gh.get_repo(repo_name),
@@ -77,6 +94,18 @@ class IssueDedupPublisher:
         )
         marker = f"<!-- {self._ns}:{fingerprint} -->"
         existing = self._find_existing(repo_name, marker)
+
+        # An issue from an older fingerprint scheme carries a different (or no)
+        # marker, so the marker search misses it. Fall back to an exact title
+        # match. The update path below re-stamps the current marker, so this
+        # only fires once per issue; later runs match on the marker.
+        if existing is None and title_fallback is not None:
+            existing = self._find_by_title(repo_name, title_fallback)
+            if existing is not None:
+                logger.info(
+                    "Adopting legacy issue #%s for %s via title fallback",
+                    existing.number, fingerprint,
+                )
 
         if existing is None:
             content = render(marker, 1)
@@ -96,6 +125,8 @@ class IssueDedupPublisher:
             return "created", issue.html_url
 
         body = existing.body or ""
+        if body_transform is not None:
+            body = body_transform(body)
 
         if idempotency_key is not None:
             last = _last_key_re(self._ns).search(body)
@@ -144,12 +175,38 @@ class IssueDedupPublisher:
         )
         for issue in results:
             if marker in (issue.body or ""):
-                # Reload via the actual repo so we get a mutable issue handle.
-                return retry_github_call(
-                    lambda: self._gh.get_repo(repo_name).get_issue(issue.number),
-                    retries=2, description=f"get issue #{issue.number}",
-                )
+                return self._reload(repo_name, issue.number)
         return None
+
+    def _find_by_title(self, repo_name: str, title: str) -> Any:
+        """Find an open issue whose title exactly equals ``title``, or None.
+
+        Migration fallback for when the marker search misses. A title can hold
+        characters that break search syntax (quotes, ``:``), so the query uses
+        word tokens only to narrow the candidates; the exact, case-sensitive
+        match is then verified in Python.
+        """
+        tokens = re.findall(r"\w+", title)
+        if not tokens:
+            return None
+        # Cap the tokens to keep the query short; the check below decides the match.
+        phrase = " ".join(tokens[:10])
+        query = f'{phrase} in:title repo:{repo_name} is:issue is:open'
+        results = retry_github_call(
+            lambda: list(self._gh.search_issues(query)),
+            retries=2, description="search issues by title",
+        )
+        for issue in results:
+            if issue.title == title:
+                return self._reload(repo_name, issue.number)
+        return None
+
+    def _reload(self, repo_name: str, number: int) -> Any:
+        """Reload an issue via its repo so we get a mutable issue handle."""
+        return retry_github_call(
+            lambda: self._gh.get_repo(repo_name).get_issue(number),
+            retries=2, description=f"get issue #{number}",
+        )
 
 
 def _occurrence_re(namespace: str) -> re.Pattern[str]:
