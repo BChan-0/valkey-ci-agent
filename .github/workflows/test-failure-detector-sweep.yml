@@ -28,7 +28,7 @@ jobs:
     name: "Detect test failures"
     if: >
       (github.event_name == 'workflow_dispatch' ||
-      github.repository == 'valkey-io/valkey-ci-agent')
+      github.repository == 'BChan-0/valkey-ci-agent')
     runs-on: ubuntu-latest
     steps:
       - name: Check out agent repository
@@ -46,22 +46,37 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Generate GitHub App token
+      # FORK TEST — DELETE this step before moving back to valkey-io/valkey-ci-agent.
+      # The fork has no VALKEYRIE_BOT_* secrets, so the App-token step below fails.
+      # Use the fork's TARGET_PAT (a classic/fine-grained PAT with actions:read +
+      # issues:write on the TARGET_REPO) as the cross-repo token instead, matching
+      # how this repo's other agent workflows fall back on the fork.
+      - name: Use TARGET_PAT (fork test)
         id: generate-token
-        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
-        with:
-          app-id: ${{ secrets.VALKEYRIE_BOT_APP_ID }}
-          private-key: ${{ secrets.VALKEYRIE_BOT_PRIVATE_KEY }}
-          owner: valkey-io
-          repositories: valkey
-          permission-actions: read
-          permission-issues: write
-          permission-metadata: read
+        run: echo "token=${{ secrets.TARGET_PAT }}" >> "$GITHUB_OUTPUT"
+      # === end FORK TEST ===
+
+      # EDIT BEFORE PR: Restore this App-token step (uncomment) and DELETE the
+      # "Use TARGET_PAT (fork test)" step above. Downstream reads
+      # steps.generate-token.outputs.token, so no other change is needed.
+      # - name: Generate GitHub App token
+      #   id: generate-token
+      #   uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
+      #   with:
+      #     app-id: ${{ secrets.VALKEYRIE_BOT_APP_ID }}
+      #     private-key: ${{ secrets.VALKEYRIE_BOT_PRIVATE_KEY }}
+      #     owner: valkey-io
+      #     repositories: valkey
+      #     permission-actions: read
+      #     permission-issues: write
+      #     permission-metadata: read
 
       - name: Run test failure detector
         env:
           TARGET_TOKEN: ${{ steps.generate-token.outputs.token }}
-          TARGET_REPO: ${{ inputs.repo || 'valkey-io/valkey' }}
+          # FORK TEST: scan the fork's own Daily runs on schedule (TARGET_PAT only
+          # has access to the fork). Restore 'valkey-io/valkey' before moving back.
+          TARGET_REPO: ${{ inputs.repo || 'BChan-0/valkey' }}
           RUN_ID: ${{ inputs.run_id || '' }}
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run == true && 'true' || 'false' }}
         run: |
