@@ -77,6 +77,10 @@ jobs:
           # FORK TEST: scan the fork's own Daily runs on schedule (TARGET_PAT only
           # has access to the fork). Restore 'valkey-io/valkey' before moving back.
           TARGET_REPO: ${{ inputs.repo || 'BChan-0/valkey' }}
+          # FORK TEST: the fork's Daily runs are triggered on the 'test-workflow'
+          # branch, not 'unstable', so scan that branch. DELETE before moving back
+          # to valkey-io/valkey-ci-agent (the detector defaults to 'unstable').
+          TARGET_BRANCH: test-workflow
           RUN_ID: ${{ inputs.run_id || '' }}
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run == true && 'true' || 'false' }}
         run: |
@@ -85,6 +89,7 @@ jobs:
             -m scripts.test_failure_detector.main
             --token "${TARGET_TOKEN}"
             --repo "${TARGET_REPO}"
+            --branch "${TARGET_BRANCH}"
             --verbose
           )
 
