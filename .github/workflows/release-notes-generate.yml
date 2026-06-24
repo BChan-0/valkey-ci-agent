@@ -1,0 +1,118 @@
+# Generate release notes for a Valkey release line from labelled PRs.
+#
+# A maintainer dispatches this with the release line (e.g. 9.1). The agent
+# clones valkey (full depth + tags), finds the PRs merged since the line's last
+# tag, keeps those labelled `release-notes`, asks Claude (via Bedrock) to write
+# one concise bullet per PR in the canonical categories, and opens/updates a PR
+# on valkey that edits the `## Unreleased` block of 00-RELEASENOTES. Untagged
+# PRs are listed in the PR body for a maintainer to triage.
+name: Generate Release Notes
+
+on:
+  workflow_dispatch:
+    inputs:
+      head_ref:
+        description: "Release line ref to generate notes for, e.g. 9.1"
+        required: true
+        type: string
+      base_branch:
+        description: "PR base branch (defaults to head_ref)"
+        required: false
+        type: string
+      tag_glob:
+        description: "Optional baseline-tag match glob, e.g. 9.1.*"
+        required: false
+        type: string
+      dry_run:
+        description: "Compute and log the notes without opening a PR"
+        required: false
+        type: boolean
+        default: false
+
+permissions: {}
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      # One run per release line; a re-run replaces the agent branch's commit.
+      group: release-notes-${{ inputs.head_ref }}
+      cancel-in-progress: false
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      CLAUDE_CODE_USE_BEDROCK: "1"
+      CI_AGENT_EVIDENCE_DIR: agent-evidence
+    steps:
+      - name: Check out agent repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.0
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.0.0
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          npm install -g @anthropic-ai/claude-code@2.1.153
+
+      - name: Generate GitHub App token
+        id: generate-token
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
+        with:
+          app-id: ${{ secrets.VALKEYRIE_BOT_APP_ID }}
+          private-key: ${{ secrets.VALKEYRIE_BOT_PRIVATE_KEY }}
+          owner: valkey-io
+          repositories: valkey
+          # contents:write to push the agent branch; pull-requests:write to open
+          # or update the notes PR; metadata:read is always required.
+          permission-contents: write
+          permission-pull-requests: write
+          permission-metadata: read
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: release-notes-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Generate release notes
+        shell: bash
+        env:
+          RELEASE_NOTES_GITHUB_TOKEN: ${{ steps.generate-token.outputs.token }}
+          RELEASE_NOTES_REPO: valkey-io/valkey
+          RELEASE_NOTES_HEAD_REF: ${{ inputs.head_ref }}
+          RELEASE_NOTES_BASE_BRANCH: ${{ inputs.base_branch || '' }}
+          RELEASE_NOTES_TAG_GLOB: ${{ inputs.tag_glob || '' }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${RELEASE_NOTES_HEAD_REF}" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+            echo "Invalid head_ref: ${RELEASE_NOTES_HEAD_REF}" >&2
+            exit 1
+          fi
+          args=(-m scripts.release_notes.main)
+          if [[ "${{ inputs.dry_run }}" == "true" ]]; then
+            args+=(--dry-run)
+          fi
+          python "${args[@]}"
+
+      - name: Upload agent evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-notes-agent-evidence-${{ github.run_id }}
+          path: agent-evidence
+          if-no-files-found: ignore
+          retention-days: 30
