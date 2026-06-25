@@ -1,0 +1,187 @@
+# Cut a Valkey release: generate notes all at once + bump version + drain prior RCs.
+#
+# A maintainer dispatches this with the source branch (e.g. unstable), the target
+# version, stage, and urgency. The agent generates the release notes in one shot
+# from the labelled PRs in range (Claude via Bedrock) -- there is no accumulated
+# ## Unreleased block on any branch -- then promotes them onto the long-running
+# release branch as a dated section, bumps src/version.h, and refreshes the
+# running contributor list, reusing valkey's own utils/releasetools primitives so
+# the format stays authoritative there. It opens one PR for the release branch
+# (for review); the source branch is never modified.
+#
+# Branch model (one long-running branch per minor line):
+#   rc1 of M.m.p -> create  pre-release-M.m.p
+#   rcN (N>1)     -> continue pre-release-M.m.p (keeps prior RCs' dated notes;
+#                    dedup is by graph range back to the last reachable RC tag)
+#   ga of M.m.p   -> create  M.m carrying the rc history, delete pre-release-M.m.p
+name: Cut Release Notes
+
+on:
+  workflow_dispatch:
+    inputs:
+      # EDIT BEFORE PR: restore the default to '' so a maintainer always passes
+      # the real source branch. Defaulted to the fork's stand-in-for-unstable
+      # branch only for fork testing.
+      source_ref:
+        description: "Source branch whose merged PRs are cut into the release, e.g. unstable or 9.1"
+        required: true
+        type: string
+        default: "feature/release-notes-automation"
+      version:
+        description: "Target version MAJOR.MINOR.PATCH, e.g. 9.1.0"
+        required: true
+        type: string
+      stage:
+        description: "Release stage: rc1..rcN or ga (rc1 has no prior RC tag, so it
+          defaults base_ref to the previous release M.(m-1).0 unless you set base_ref)"
+        required: true
+        type: string
+      urgency:
+        description: "Upgrade urgency"
+        required: true
+        type: choice
+        options:
+          - LOW
+          - MODERATE
+          - HIGH
+          - CRITICAL
+          - SECURITY
+      date:
+        description: "Release date YYYY-MM-DD (default: today)"
+        required: false
+        type: string
+      contrib_base_ref:
+        description: "Contributor range start (default: last tag, else root commit)"
+        required: false
+        type: string
+      # EDIT BEFORE PR: drop this default (leave ''), so the baseline is the most
+      # recent tag. The BChan-0 fork carries no release tags, so testing uses an
+      # explicit baseline branch (the fork's unstable) instead.
+      base_ref:
+        description: "Explicit baseline ref overriding tag resolution (branch/tag/SHA).
+          Leave empty for rc2+/ga (uses the nearest RC tag); required-ish for rc1, which
+          otherwise auto-defaults to the previous release M.(m-1).0."
+        required: false
+        type: string
+        default: "unstable"
+      dry_run:
+        description: "Compute and log the cut without pushing or opening PRs"
+        required: false
+        type: boolean
+        default: false
+
+permissions: {}
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  cut:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      # One cut per version+stage; a re-run replaces the release branch tip.
+      group: release-cut-${{ inputs.version }}-${{ inputs.stage }}
+      cancel-in-progress: false
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      CLAUDE_CODE_USE_BEDROCK: "1"
+      CI_AGENT_EVIDENCE_DIR: agent-evidence
+    steps:
+      - name: Check out agent repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.0
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.0.0
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          npm install -g @anthropic-ai/claude-code@2.1.153
+
+      # EDIT BEFORE PR — DELETE this step before moving back to valkey-io.
+      # The fork has no VALKEYRIE_BOT_* secrets, so the App-token step below
+      # fails. Use the fork's TARGET_PAT (a fine-grained PAT with contents:write
+      # + pull-requests:write on BChan-0/valkey) as the cross-repo token instead,
+      # matching how this repo's other agent workflows fall back on the fork.
+      - name: Use TARGET_PAT (fork test)
+        id: generate-token
+        run: echo "token=${{ secrets.TARGET_PAT }}" >> "$GITHUB_OUTPUT"
+      # === end FORK TEST ===
+
+      # EDIT BEFORE PR: Restore this App-token step (uncomment) and DELETE the
+      # "Use TARGET_PAT (fork test)" step above. Downstream reads
+      # steps.generate-token.outputs.token, so no other change is needed.
+      # - name: Generate GitHub App token
+      #   id: generate-token
+      #   uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
+      #   with:
+      #     app-id: ${{ secrets.VALKEYRIE_BOT_APP_ID }}
+      #     private-key: ${{ secrets.VALKEYRIE_BOT_PRIVATE_KEY }}
+      #     owner: valkey-io
+      #     repositories: valkey
+      #     # contents:write to push the release + reset branches; pull-requests:write
+      #     # to open both PRs; metadata:read is always required.
+      #     permission-contents: write
+      #     permission-pull-requests: write
+      #     permission-metadata: read
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: release-cut-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Cut release notes
+        shell: bash
+        env:
+          RELEASE_NOTES_GITHUB_TOKEN: ${{ steps.generate-token.outputs.token }}
+          # EDIT BEFORE PR: change RELEASE_NOTES_REPO back to valkey-io/valkey.
+          # Pointed at the BChan-0 fork for fork testing.
+          RELEASE_NOTES_REPO: BChan-0/valkey
+          RELEASE_NOTES_HEAD_REF: ${{ inputs.source_ref }}
+          RELEASE_NOTES_VERSION: ${{ inputs.version }}
+          RELEASE_NOTES_STAGE: ${{ inputs.stage }}
+          RELEASE_NOTES_URGENCY: ${{ inputs.urgency }}
+          RELEASE_NOTES_DATE: ${{ inputs.date || '' }}
+          RELEASE_NOTES_CONTRIB_BASE: ${{ inputs.contrib_base_ref || '' }}
+          # EDIT BEFORE PR: this passes the explicit baseline (fork has no tags).
+          RELEASE_NOTES_BASE_REF: ${{ inputs.base_ref || '' }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${RELEASE_NOTES_HEAD_REF}" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+            echo "Invalid source_ref: ${RELEASE_NOTES_HEAD_REF}" >&2
+            exit 1
+          fi
+          if [[ ! "${RELEASE_NOTES_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid version (want MAJOR.MINOR.PATCH): ${RELEASE_NOTES_VERSION}" >&2
+            exit 1
+          fi
+          if [[ ! "${RELEASE_NOTES_STAGE}" =~ ^(ga|rc[1-9][0-9]*)$ ]]; then
+            echo "Invalid stage (want ga or rcN): ${RELEASE_NOTES_STAGE}" >&2
+            exit 1
+          fi
+          args=(-m scripts.release_notes.main --cut)
+          if [[ "${{ inputs.dry_run }}" == "true" ]]; then
+            args+=(--dry-run)
+          fi
+          python "${args[@]}"
+
+      - name: Upload agent evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-cut-agent-evidence-${{ github.run_id }}
+          path: agent-evidence
+          if-no-files-found: ignore
+          retention-days: 30

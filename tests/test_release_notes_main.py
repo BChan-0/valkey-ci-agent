@@ -1,39 +1,23 @@
-"""Tests for the release-notes entry point (orchestration mocked)."""
+"""Tests for the release-cut entry point (orchestration mocked).
+
+main is now cut-only: it always dispatches to release_cut.cut(). The cut
+internals are tested in test_release_notes_release_cut.py; here we cover
+argument validation, the baseline-glob/base-ref resolution, and that the parsed
+inputs reach cut().
+"""
 
 from __future__ import annotations
 
-import os
-import shutil
 from unittest.mock import MagicMock
 
 import pytest
 
 from scripts.release_notes import main as main_mod
 from scripts.release_notes.main import main
-from scripts.release_notes.models import (
-    CategorizedBullet,
-    DiscoveryResult,
-    GenerationResult,
-    MergedPR,
-)
-
-_FIXTURE_CLONE = os.path.join(os.path.dirname(__file__), "fixtures", "valkey_clone")
-
-
-def _discovery(prs=()):
-    return DiscoveryResult(base_tag="9.1.0-rc1", base_sha="s", head_ref="9.1", head_sha="h", prs=prs)
 
 
 @pytest.fixture
-def clone(tmp_path):
-    """A throwaway copy of the fixture clone so a run never mutates the committed one."""
-    dest = tmp_path / "clone"
-    shutil.copytree(_FIXTURE_CLONE, dest)
-    return str(dest)
-
-
-@pytest.fixture
-def patched(monkeypatch, clone):
+def patched(monkeypatch, tmp_path):
     monkeypatch.setattr(main_mod, "Github", MagicMock())
     monkeypatch.setattr(main_mod, "retry_github_call", lambda op, **k: op())
     auth = MagicMock()
@@ -41,134 +25,156 @@ def patched(monkeypatch, clone):
     monkeypatch.setattr(main_mod, "GitAuth", lambda *a, **k: auth)
     monkeypatch.setattr(main_mod, "github_https_url", lambda name: f"https://github.com/{name}.git")
     monkeypatch.setattr(main_mod, "run_git", lambda *a, **k: MagicMock())
-    monkeypatch.setattr(main_mod.tempfile, "mkdtemp", lambda *a, **k: clone)
+    monkeypatch.setattr(main_mod.tempfile, "mkdtemp", lambda *a, **k: str(tmp_path / "clone"))
+    monkeypatch.setattr(main_mod.shutil, "rmtree", lambda *a, **k: None)
     return monkeypatch
 
+
+def _capture_cut(patched):
+    captured = {}
+
+    def _cut(repo, **kwargs):
+        captured.update(kwargs)
+        return 0
+
+    patched.setattr(main_mod.cut_mod, "cut", _cut)
+    return captured
+
+
+# --- argument validation ---
 
 def test_missing_token_is_usage_error(monkeypatch):
     monkeypatch.delenv("RELEASE_NOTES_GITHUB_TOKEN", raising=False)
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     monkeypatch.delenv("TARGET_TOKEN", raising=False)
     with pytest.raises(SystemExit) as exc:
-        main(["--head-ref", "9.1"])
+        main(["--head-ref", "unstable", "--version", "9.1.0", "--stage", "rc1", "--urgency", "LOW"])
     assert exc.value.code == 2
 
 
 def test_missing_head_ref_is_usage_error():
     with pytest.raises(SystemExit) as exc:
-        main(["--token", "t"])
+        main(["--token", "t", "--version", "9.1.0", "--stage", "rc1", "--urgency", "LOW"])
     assert exc.value.code == 2
 
 
-def test_empty_range_is_noop(patched):
-    patched.setattr(main_mod.discover_mod, "discover", lambda *a, **k: _discovery(()))
-    publish = MagicMock()
-    patched.setattr(main_mod.publish_mod, "publish", publish)
-    rc = main(["--token", "t", "--repo", "valkey-io/valkey", "--head-ref", "9.1"])
+def test_missing_version_stage_urgency_is_usage_error():
+    with pytest.raises(SystemExit) as exc:
+        main(["--token", "t", "--head-ref", "unstable"])
+    assert exc.value.code == 2
+
+
+# --- dispatch + arg threading ---
+
+def test_dispatches_to_cut_with_parsed_args(patched):
+    captured = _capture_cut(patched)
+    rc = main(["--token", "t", "--head-ref", "unstable",
+               "--version", "9.1.0", "--stage", "rc2", "--urgency", "HIGH"])
     assert rc == 0
-    publish.assert_not_called()
+    assert captured["version"] == "9.1.0"
+    assert captured["stage"] == "rc2"
+    assert captured["urgency"] == "HIGH"
+    assert captured["source_ref"] == "unstable"
 
 
-def test_dry_run_prints_without_publishing(patched, capsys):
-    prs = (MergedPR(number=40, title="t", author="a", url="u", labels=("release-notes",)),)
-    patched.setattr(main_mod.discover_mod, "discover", lambda *a, **k: _discovery(prs))
-    patched.setattr(main_mod.generate_mod, "generate", lambda *a, **k: GenerationResult(
-        bullets=(CategorizedBullet(pr_number=40, author="a", category="Bug Fixes", text="fix"),)))
-    publish = MagicMock()
-    patched.setattr(main_mod.publish_mod, "publish", publish)
-    rc = main(["--token", "t", "--head-ref", "9.1", "--dry-run"])
-    assert rc == 0
-    publish.assert_not_called()
-    out = capsys.readouterr().out
-    assert "## Unreleased" in out
-    assert "* fix by @a (#40)" in out
+def test_dry_run_threads_through(patched):
+    captured = _capture_cut(patched)
+    main(["--token", "t", "--head-ref", "unstable", "--version", "9.1.0",
+          "--stage", "rc1", "--urgency", "LOW", "--dry-run"])
+    assert captured["dry_run"] is True
 
 
-def test_full_run_publishes_and_writes_file(patched, clone):
-    prs = (MergedPR(number=40, title="t", author="a", url="u", labels=("release-notes",)),)
-    patched.setattr(main_mod.discover_mod, "discover", lambda *a, **k: _discovery(prs))
-    patched.setattr(main_mod.generate_mod, "generate", lambda *a, **k: GenerationResult(
-        bullets=(CategorizedBullet(pr_number=40, author="a", category="Bug Fixes", text="fix"),)))
+def test_cut_failure_returns_one(patched):
+    def _cut(repo, **kwargs):
+        raise RuntimeError("boom")
 
-    # The clone is removed in main's finally block, so read the written file
-    # from inside the publish mock (which runs before cleanup).
-    seen = {}
+    patched.setattr(main_mod.cut_mod, "cut", _cut)
+    rc = main(["--token", "t", "--head-ref", "unstable", "--version", "9.1.0",
+               "--stage", "rc1", "--urgency", "LOW"])
+    assert rc == 1
 
-    def _publish(repo, repo_dir, **kwargs):
-        seen["written"] = open(os.path.join(repo_dir, "00-RELEASENOTES"), encoding="utf-8").read()
-        return "https://x/pr/1"
 
-    patched.setattr(main_mod.publish_mod, "publish", _publish)
-    rc = main(["--token", "t", "--head-ref", "9.1"])
-    assert rc == 0
-    assert "* fix by @a (#40)" in seen["written"]
-    # The temp clone is cleaned up after the run.
-    assert not os.path.exists(clone)
-
+# --- baseline glob / base-ref resolution ---
 
 class TestDefaultTagGlob:
-    def test_bare_minor_line(self) -> None:
-        assert main_mod._default_tag_glob("9.1") == "9.1.*"
+    def test_rc2_makes_rc_glob(self) -> None:
+        # rc2+ anchors to the prior RC of this version.
+        assert main_mod._default_tag_glob("9.1.0", "rc2") == "9.1.0-rc*"
+        assert main_mod._default_tag_glob("9.1.0", "rc10") == "9.1.0-rc*"
 
-    def test_prefixed_ref(self) -> None:
-        assert main_mod._default_tag_glob("release/9.1") == "9.1.*"
+    def test_rc1_has_no_glob(self) -> None:
+        # rc1 has no rc0 to anchor to -> no glob (uses base_ref instead).
+        assert main_mod._default_tag_glob("9.1.0", "rc1") is None
 
-    def test_non_version_ref_is_none(self) -> None:
-        assert main_mod._default_tag_glob("unstable") is None
+    def test_ga_has_no_glob(self) -> None:
+        # GA continues an existing line; the no-glob nearest tag is correct.
+        assert main_mod._default_tag_glob("9.1.0", "ga") is None
 
-    def test_full_version_is_none(self) -> None:
-        # A full M.m.p is not a release line; leave the glob unset.
-        assert main_mod._default_tag_glob("9.1.0") is None
-
-
-def test_default_tag_glob_passed_to_discover(patched):
-    seen = {}
-
-    def _discover(repo, repo_dir, head_ref, *, tag_glob=None):
-        seen["tag_glob"] = tag_glob
-        return _discovery(())
-
-    patched.setattr(main_mod.discover_mod, "discover", _discover)
-    main(["--token", "t", "--head-ref", "9.1"])
-    assert seen["tag_glob"] == "9.1.*"
+    def test_non_version_is_none(self) -> None:
+        assert main_mod._default_tag_glob("9.1", "rc2") is None
 
 
-def test_all_skipped_refuses_to_blank_existing_block(patched, clone):
-    # An included PR exists but the model returns zero bullets -> must NOT wipe
-    # the (populated) block and must fail rather than publish an empty change.
-    from scripts.release_notes import render as render_mod
-    fmt = render_mod.load_format_module(clone)
-    # Seed the fixture with an existing bullet so a wipe would be destructive.
-    notes = os.path.join(clone, "00-RELEASENOTES")
-    existing = open(notes, encoding="utf-8").read()
-    seeded = render_mod.apply_to_file(
-        existing,
-        render_mod.group_bullets(
-            [CategorizedBullet(pr_number=1, author="x", category="Bug Fixes", text="prior note")], fmt),
-        fmt,
-    )
-    open(notes, "w", encoding="utf-8").write(seeded)
+class TestDefaultBaseRefForRc1:
+    def test_previous_minor_ga(self) -> None:
+        assert main_mod._default_base_ref_for_rc1("9.1.0") == "9.0.0"
 
-    prs = (MergedPR(number=40, title="t", author="a", url="u", labels=("release-notes",)),)
-    patched.setattr(main_mod.discover_mod, "discover", lambda *a, **k: _discovery(prs))
-    patched.setattr(main_mod.generate_mod, "generate",
-                    lambda *a, **k: GenerationResult(bullets=(), skipped=(40,)))
-    publish = MagicMock()
-    patched.setattr(main_mod.publish_mod, "publish", publish)
-    rc = main(["--token", "t", "--head-ref", "9.1"])
-    assert rc == 1
-    publish.assert_not_called()
+    def test_patch_release(self) -> None:
+        assert main_mod._default_base_ref_for_rc1("9.2.3") == "9.1.0"
+
+    def test_first_minor_of_major_has_none(self) -> None:
+        # 9.0.0 has no obvious previous-minor GA on the same major.
+        assert main_mod._default_base_ref_for_rc1("9.0.0") is None
+
+    def test_non_version_is_none(self) -> None:
+        assert main_mod._default_base_ref_for_rc1("9.1") is None
 
 
-def test_all_triage_still_publishes(patched):
-    # No included PRs, but an untagged PR exists -> still open a PR with the triage table.
-    prs = (MergedPR(number=50, title="untagged", author="z", url="u", labels=()),)
-    patched.setattr(main_mod.discover_mod, "discover", lambda *a, **k: _discovery(prs))
-    patched.setattr(main_mod.generate_mod, "generate", lambda *a, **k: GenerationResult())
-    publish = MagicMock(return_value="https://x/pr/2")
-    patched.setattr(main_mod.publish_mod, "publish", publish)
-    rc = main(["--token", "t", "--head-ref", "9.1"])
-    assert rc == 0
-    publish.assert_called_once()
-    _, kwargs = publish.call_args
-    assert [p.number for p in kwargs["triage"]] == [50]
+def test_rc2_default_glob_passed_to_cut(patched):
+    captured = _capture_cut(patched)
+    main(["--token", "t", "--head-ref", "unstable",
+          "--version", "9.1.0", "--stage", "rc2", "--urgency", "LOW"])
+    assert captured["tag_glob"] == "9.1.0-rc*"
+    assert captured["base_ref"] is None
+
+
+def test_rc1_without_base_ref_warns_and_defaults(patched, caplog):
+    captured = _capture_cut(patched)
+    import logging
+    with caplog.at_level(logging.WARNING):
+        main(["--token", "t", "--head-ref", "unstable",
+              "--version", "9.1.0", "--stage", "rc1", "--urgency", "LOW"])
+    # Defaults base_ref to the previous release, and suppresses the doomed glob.
+    assert captured["base_ref"] == "9.0.0"
+    assert captured["tag_glob"] is None
+    assert any("rc1" in r.message and "9.0.0" in r.message for r in caplog.records)
+
+
+def test_rc1_with_explicit_base_ref_no_override(patched, caplog):
+    captured = _capture_cut(patched)
+    import logging
+    with caplog.at_level(logging.WARNING):
+        main(["--token", "t", "--head-ref", "unstable", "--version", "9.1.0",
+              "--stage", "rc1", "--urgency", "LOW", "--base-ref", "9.0.4"])
+    assert captured["base_ref"] == "9.0.4"  # user value wins, not the derived default
+    assert captured["tag_glob"] is None
+    # No rc1 baseline warning when the user supplied one.
+    assert not any("Defaulting --base-ref" in r.message for r in caplog.records)
+
+
+def test_rc1_first_minor_warns_without_default(patched, caplog):
+    captured = _capture_cut(patched)
+    import logging
+    with caplog.at_level(logging.WARNING):
+        main(["--token", "t", "--head-ref", "unstable",
+              "--version", "9.0.0", "--stage", "rc1", "--urgency", "LOW"])
+    # No previous-minor could be derived -> base_ref stays None, loud warning.
+    assert captured["base_ref"] is None
+    assert any("no previous-minor release" in r.message for r in caplog.records)
+
+
+def test_explicit_base_ref_overrides_glob(patched):
+    captured = _capture_cut(patched)
+    main(["--token", "t", "--head-ref", "feature/release-notes-automation",
+          "--version", "9.1.0", "--stage", "rc2", "--urgency", "LOW", "--base-ref", "unstable"])
+    assert captured["base_ref"] == "unstable"
+    assert captured["tag_glob"] is None

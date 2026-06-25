@@ -172,15 +172,28 @@ def hydrate_prs(repo: Any, pr_to_sha: dict[int, str]) -> list[MergedPR]:
     return prs
 
 
-def discover(repo: Any, repo_dir: str, head_ref: str, *, tag_glob: str | None = None) -> DiscoveryResult:
+def discover(
+    repo: Any, repo_dir: str, head_ref: str, *,
+    tag_glob: str | None = None, base_ref: str | None = None,
+) -> DiscoveryResult:
     """Resolve the release range and return a deduplicated :class:`DiscoveryResult`.
 
     ``repo`` is a PyGithub repository; ``repo_dir`` is a full-depth local clone
     of the same repo with tags fetched (a shallow clone breaks ``describe`` and
     the range walk). Dispositions are unset -- :func:`classify.classify` fills
     them.
+
+    ``base_ref`` is an explicit baseline (a branch, tag, or SHA) that overrides
+    tag resolution -- the escape hatch for a line with no reachable tag (e.g. a
+    fork that carries no release tags). When set, the range is ``base_ref..head``
+    directly; otherwise the most recent tag (optionally filtered by ``tag_glob``)
+    is used.
     """
-    base_tag, base_sha = resolve_last_tag(repo_dir, head_ref, tag_glob=tag_glob)
+    if base_ref:
+        base_tag = base_ref
+        base_sha = git_output(repo_dir, "rev-parse", base_ref).strip()
+    else:
+        base_tag, base_sha = resolve_last_tag(repo_dir, head_ref, tag_glob=tag_glob)
     head_sha = git_output(repo_dir, "rev-parse", head_ref).strip()
     commits = list_range_commits(repo_dir, base_tag, head_ref)
     pr_to_sha = resolve_commit_prs(repo, commits)

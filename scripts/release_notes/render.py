@@ -16,17 +16,14 @@ splicing the filled block into the file in place of the existing one.
 
 from __future__ import annotations
 
-import importlib.util
 import logging
-import os
 import re
 from typing import Any, Sequence
 
+from scripts.release_notes.clone_tools import load_releasetools_module
 from scripts.release_notes.models import CategorizedBullet
 
 logger = logging.getLogger(__name__)
-
-_FORMAT_REL_PATH = os.path.join("utils", "releasetools", "release_notes.py")
 
 # A GitHub login is [A-Za-z0-9-]; the attribution regex check_release_notes uses
 # is ``by @([\w-]+)``. Anything outside that set (a space, '.', '@', parens from
@@ -48,21 +45,12 @@ def _one_line(text: str) -> str:
 
 
 def load_format_module(valkey_clone_dir: str) -> Any:
-    """Import the valkey format module from *valkey_clone_dir*.
+    """Import the valkey ``release_notes`` format module from *valkey_clone_dir*.
 
-    Loaded by path (not added to ``sys.path``) so the agent process picks up no
-    other sibling modules from the clone. Raises :class:`FileNotFoundError` if
-    the clone predates the release tooling.
+    Thin wrapper over :func:`clone_tools.load_releasetools_module` kept for the
+    existing call sites; the format stays authoritative in the valkey repo.
     """
-    path = os.path.join(valkey_clone_dir, _FORMAT_REL_PATH)
-    if not os.path.isfile(path):
-        raise FileNotFoundError(f"valkey format module not found at {path}")
-    spec = importlib.util.spec_from_file_location("valkey_release_notes_format", path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"could not load format module from {path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    return load_releasetools_module(valkey_clone_dir, "release_notes")
 
 
 def format_bullet(bullet: CategorizedBullet) -> str:

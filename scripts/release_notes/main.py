@@ -1,13 +1,16 @@
-"""Entry point for the AI release-notes generator.
+"""Entry point for the AI release-notes cut.
 
-Driven by ``workflow_dispatch``: a maintainer supplies the release line
-(``--head-ref``, e.g. ``9.1``) and the workflow regenerates that line's
-``## Unreleased`` notes from the labelled PRs merged since its last tag, then
-opens or updates a PR on valkey carrying the change.
+Driven by ``workflow_dispatch``: a maintainer supplies the source branch
+(``--head-ref``), the target ``--version``/``--stage``/``--urgency``, and the
+agent cuts the release in one shot. There is no accumulated ``## Unreleased``
+block -- the notes for a release are generated all at once from the labelled
+PRs in range, promoted into a dated section, and the version is bumped.
 
-Pipeline: clone valkey (full depth + tags) -> :mod:`discover` the range ->
-:mod:`classify` by label -> :mod:`generate` bullets via Claude/Bedrock ->
-:mod:`render` into the canonical ``00-RELEASENOTES`` -> :mod:`publish` the PR.
+Pipeline: clone valkey (full depth + tags) -> :mod:`discover` the range (the
+``release-notes``-labelled PRs from HEAD back to the most recent reachable RC
+tag) -> :mod:`generate` bullets via Claude/Bedrock -> :mod:`release_cut`
+promotes them onto the release line (dated section + ``src/version.h`` bump +
+running contributor list, draining prior RCs) and opens the PR.
 
 Returns 0 on success or a benign no-op (empty range), 1 on failure, and 2 on a
 usage error (argparse). Orchestration is wrapped so a GitHub/AI error is logged
@@ -17,6 +20,7 @@ and surfaced as a non-zero exit rather than an uncaught crash.
 from __future__ import annotations
 
 import argparse
+import datetime
 import logging
 import os
 import re
@@ -33,20 +37,19 @@ from github import Auth, Github
 from scripts.common.git_auth import GitAuth, github_https_url
 from scripts.common.github_client import retry_github_call
 from scripts.common.proc import run_git
-from scripts.release_notes import discover as discover_mod
-from scripts.release_notes import generate as generate_mod
-from scripts.release_notes import publish as publish_mod
-from scripts.release_notes import render as render_mod
-from scripts.release_notes.classify import classify
+from scripts.release_notes import release_cut as cut_mod
 
 logger = logging.getLogger(__name__)
 
 # Config via env so the workflow can pass GitHub Actions context directly; the
 # RELEASE_NOTES_ prefix mirrors the CI_FIX_/FUZZER_ convention.
-_REPO = os.environ.get("RELEASE_NOTES_REPO", "valkey-io/valkey")
+# EDIT BEFORE PR: change the default repo back to valkey-io/valkey. Pointed at
+# the BChan-0 fork for fork testing (the workflow also passes RELEASE_NOTES_REPO
+# explicitly, so this default only matters for a bare CLI invocation).
+_REPO = os.environ.get("RELEASE_NOTES_REPO", "BChan-0/valkey")
 _HEAD_REF = os.environ.get("RELEASE_NOTES_HEAD_REF", "")
-_BASE_BRANCH = os.environ.get("RELEASE_NOTES_BASE_BRANCH", "")
 _TAG_GLOB = os.environ.get("RELEASE_NOTES_TAG_GLOB", "")
+_BASE_REF = os.environ.get("RELEASE_NOTES_BASE_REF", "")
 
 
 def _token() -> str:
@@ -58,20 +61,49 @@ def _token() -> str:
     )
 
 
-def _default_tag_glob(head_ref: str) -> str | None:
-    """Derive a baseline-tag match glob from a ``M.m`` release line.
+def _default_tag_glob(version: str, stage: str) -> str | None:
+    """Derive the baseline-tag match glob for this cut, or None.
 
     ``git describe`` returns the tag with the shortest graph distance to HEAD
-    *regardless of release line*, so without a glob a 9.1 branch could pick up a
-    9.0 tag that happens to be a nearer ancestor. A release line named like
-    ``9.1`` (or ``release/9.1``) constrains the baseline to ``9.1.*`` tags. A
-    ref that is not a bare ``M.m`` returns None -- the caller may still pass an
-    explicit ``--tag-glob``.
+    *regardless of release line*, so a glob is needed to pin the baseline to the
+    intended boundary. The boundary depends on the stage:
+
+    * **rc2+** -- the prior RC of *this* version: ``<version>-rc*`` (so a cut of
+      9.1.0-rc3 walks back only to 9.1.0-rc2).
+    * **rc1 / ga / anything else** -- ``None``. rc1 has no prior same-version RC
+      to anchor to (there is no rc0), and its true baseline is the *previous*
+      release, which is not reachable from the source branch in valkey's
+      fork-at-freeze model. So rc1 cannot resolve a tag automatically and must
+      use ``--base-ref`` (see :func:`_default_base_ref_for_rc1`); ga continues an
+      existing release line where the no-glob nearest tag is already correct.
+
+    A version that is not ``M.m.p`` also returns None.
     """
-    tail = head_ref.rsplit("/", 1)[-1]
-    if re.fullmatch(r"\d+\.\d+", tail):
-        return f"{tail}.*"
+    m = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", version.strip())
+    if not m:
+        return None
+    rc = re.fullmatch(r"rc([1-9]\d*)", stage.strip().lower())
+    if rc and int(rc.group(1)) >= 2:
+        return f"{version.strip()}-rc*"
     return None
+
+
+def _default_base_ref_for_rc1(version: str) -> str | None:
+    """Best-effort previous-release baseline for an rc1 cut, e.g. 9.1.0 -> 9.0.0.
+
+    rc1 of ``M.m.p`` covers everything since the previous minor's GA. We can only
+    *guess* that tag's name (``M.(m-1).0``); whether it is actually reachable as
+    a range base is checked at clone time. Returns None when the version is not
+    ``M.m.p`` or there is no previous minor (``M.0.*``), in which case the user
+    must supply ``--base-ref`` explicitly.
+    """
+    m = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", version.strip())
+    if not m:
+        return None
+    major, minor, _ = (int(g) for g in m.groups())
+    if minor == 0:
+        return None  # first minor of a major: no obvious previous-minor GA
+    return f"{major}.{minor - 1}.0"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -79,14 +111,27 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--token", default=_token(), help="GitHub token (App installation or PAT)")
     parser.add_argument("--repo", default=_REPO, help="Target repo, owner/name")
     parser.add_argument("--head-ref", default=_HEAD_REF,
-                        help="Release line branch name, e.g. 9.1 (a short branch/tag name, "
-                             "not a full ref or SHA -- it is passed to `git clone --branch`)")
-    parser.add_argument("--base-branch", default=_BASE_BRANCH,
-                        help="PR base branch (defaults to --head-ref)")
+                        help="Source branch whose merged PRs are cut, e.g. unstable "
+                             "(a short branch/tag name -- it is passed to `git clone --branch`)")
+    parser.add_argument("--version", default=os.environ.get("RELEASE_NOTES_VERSION", ""),
+                        help="Target version MAJOR.MINOR.PATCH, e.g. 9.1.0")
+    parser.add_argument("--stage", default=os.environ.get("RELEASE_NOTES_STAGE", ""),
+                        help="Release stage: rc1..rcN or ga")
+    parser.add_argument("--urgency", default=os.environ.get("RELEASE_NOTES_URGENCY", ""),
+                        help="Upgrade urgency: LOW, MODERATE, HIGH, CRITICAL, SECURITY")
+    parser.add_argument("--date", default=os.environ.get("RELEASE_NOTES_DATE", ""),
+                        help="Release date YYYY-MM-DD (default: today)")
     parser.add_argument("--tag-glob", default=_TAG_GLOB,
-                        help="Optional --match glob restricting the baseline tag, e.g. '9.1.*'")
+                        help="Optional --match glob restricting the baseline tag, e.g. '9.1.0-rc*'")
+    parser.add_argument("--base-ref", default=_BASE_REF,
+                        help="Explicit baseline ref (branch/tag/SHA) overriding tag resolution. "
+                             "Use when the line has no reachable tag, e.g. a fork.")
+    parser.add_argument("--contrib-base-ref", default=os.environ.get("RELEASE_NOTES_CONTRIB_BASE", ""),
+                        help="Contributor range start (default: last tag, else root commit)")
+    parser.add_argument("--security-fix", action="append", default=None, dest="security_fixes",
+                        help="A Security Fixes bullet (repeatable)")
     parser.add_argument("--dry-run", action="store_true",
-                        help="Compute and print the notes without pushing or opening a PR")
+                        help="Compute and print the cut without pushing or opening a PR")
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -94,125 +139,100 @@ def main(argv: list[str] | None = None) -> int:
     if not args.token:
         parser.error("a GitHub token is required (--token or RELEASE_NOTES_GITHUB_TOKEN/GITHUB_TOKEN)")
     if not args.head_ref:
-        parser.error("--head-ref (release line, e.g. 9.1) is required")
+        parser.error("--head-ref (source branch, e.g. unstable) is required")
+    if not (args.version and args.stage and args.urgency):
+        parser.error("--version, --stage, and --urgency are required")
 
-    base_branch = args.base_branch or args.head_ref
-    tag_glob = args.tag_glob or _default_tag_glob(args.head_ref)
+    base_ref = args.base_ref or None
+
+    # rc1 has no prior same-version RC tag and, in valkey's fork-at-freeze model,
+    # no reachable release tag from the source branch -- so tag resolution can't
+    # find its baseline. rc1's true baseline is the previous release. If the user
+    # did not pass --base-ref, warn loudly and default to the derived previous
+    # release (M.(m-1).0); the cut still fails clearly at clone time if that ref
+    # is absent, but most cuts get a sensible default instead of a hard error.
+    if args.stage.strip().lower() == "rc1" and base_ref is None:
+        derived = _default_base_ref_for_rc1(args.version)
+        if derived:
+            logger.warning(
+                "rc1 of %s has no reachable baseline tag (there is no rc0, and release "
+                "tags are not reachable from %r). Defaulting --base-ref to the previous "
+                "release %r. Pass --base-ref explicitly to override (e.g. the previous "
+                "release tag or its branch).",
+                args.version, args.head_ref, derived,
+            )
+            base_ref = derived
+        else:
+            logger.warning(
+                "rc1 of %s has no reachable baseline tag and no previous-minor release "
+                "could be derived. Pass --base-ref explicitly (the previous release tag "
+                "or branch); the cut will otherwise fail to resolve a baseline.",
+                args.version,
+            )
+
+    # An explicit (or rc1-defaulted) base_ref overrides tag resolution, so don't
+    # also derive a glob.
+    tag_glob = None if base_ref else (args.tag_glob or _default_tag_glob(args.version, args.stage))
 
     try:
-        return _run(
+        return _run_cut(
             token=args.token,
             repo_full_name=args.repo,
-            head_ref=args.head_ref,
-            base_branch=base_branch,
+            source_ref=args.head_ref,
+            version=args.version,
+            stage=args.stage,
+            urgency=args.urgency,
+            date=args.date or None,
             tag_glob=tag_glob,
+            base_ref=base_ref,
+            contrib_base_ref=args.contrib_base_ref or None,
+            security_fixes=args.security_fixes,
             dry_run=args.dry_run,
         )
     except Exception:  # noqa: BLE001 - never crash the workflow uncaught
-        logger.exception("Release-notes generation failed")
+        logger.exception("Release cut failed")
         return 1
 
 
-def _run(
+def _run_cut(
     *,
     token: str,
     repo_full_name: str,
-    head_ref: str,
-    base_branch: str,
+    source_ref: str,
+    version: str,
+    stage: str,
+    urgency: str,
+    date: str | None,
     tag_glob: str | None,
+    base_ref: str | None,
+    contrib_base_ref: str | None,
+    security_fixes: list[str] | None,
     dry_run: bool,
 ) -> int:
     gh = Github(auth=Auth.Token(token))
     repo = retry_github_call(
         lambda: gh.get_repo(repo_full_name), retries=3, description=f"get repo {repo_full_name}",
     )
-
-    with GitAuth(token, prefix="release-notes-git-askpass-") as auth:
+    resolved_date = date or datetime.date.today().isoformat()
+    with GitAuth(token, prefix="release-cut-git-askpass-") as auth:
         git_env = auth.env()
-        clone_dir = tempfile.mkdtemp(prefix="release-notes-")
+        clone_dir = tempfile.mkdtemp(prefix="release-cut-")
         try:
-            # Full depth + tags: shallow clones break `git describe` and the
-            # range walk that discovery depends on.
-            run_git(None, "clone", "--branch", head_ref, github_https_url(repo_full_name), clone_dir,
-                    env=git_env)
+            run_git(None, "clone", "--branch", source_ref, github_https_url(repo_full_name),
+                    clone_dir, env=git_env)
             run_git(clone_dir, "fetch", "--tags", "origin", env=git_env)
-            return _generate_in_clone(
-                repo, clone_dir,
-                repo_full_name=repo_full_name, head_ref=head_ref, base_branch=base_branch,
-                tag_glob=tag_glob, dry_run=dry_run, git_env=git_env,
+            return cut_mod.cut(
+                repo,
+                repo_full_name=repo_full_name,
+                source_clone_dir=clone_dir,
+                valkey_clone_dir=clone_dir,
+                source_ref=source_ref,
+                version=version, stage=stage, urgency=urgency, date=resolved_date,
+                tag_glob=tag_glob, base_ref=base_ref, contrib_base_ref=contrib_base_ref,
+                security_fixes=security_fixes, token=token, git_env=git_env, dry_run=dry_run,
             )
         finally:
             shutil.rmtree(clone_dir, ignore_errors=True)
-
-
-def _generate_in_clone(
-    repo: object,
-    clone_dir: str,
-    *,
-    repo_full_name: str,
-    head_ref: str,
-    base_branch: str,
-    tag_glob: str | None,
-    dry_run: bool,
-    git_env: dict[str, str],
-) -> int:
-    result = discover_mod.discover(repo, clone_dir, head_ref, tag_glob=tag_glob)
-    if not result.prs:
-        logger.info("No PRs in %s..%s; nothing to do.", result.base_tag, head_ref)
-        return 0
-
-    include, _exclude, triage = classify(result.prs)
-    logger.info(
-        "%d included, %d excluded, %d triage", len(include),
-        len(result.prs) - len(include) - len(triage), len(triage),
-    )
-
-    fmt = render_mod.load_format_module(clone_dir)
-    gen = generate_mod.generate(include, repo_dir=clone_dir, categories=fmt.CATEGORIES)
-    grouped = render_mod.group_bullets(gen.bullets, fmt)
-
-    notes_path = os.path.join(clone_dir, publish_mod.NOTES_FILE)
-    with open(notes_path, "r", encoding="utf-8") as fh:
-        existing = fh.read()
-    updated = render_mod.apply_to_file(existing, grouped, fmt)
-
-    # Refuse to blank an existing block: if PRs were included but the model
-    # produced no bullets (every PR skipped, or a batch failed to parse), the
-    # rendered block is empty. Writing it would *delete* notes already in the
-    # file. Treat that as a failure unless there is genuinely nothing to lose.
-    wipes_existing = not grouped and render_mod.apply_to_file(existing, {}, fmt) != existing
-    if include and not gen.bullets and wipes_existing:
-        logger.error(
-            "%d PR(s) were included but no bullets were generated; refusing to blank %s. "
-            "Skipped: %s", len(include), publish_mod.NOTES_FILE, list(gen.skipped),
-        )
-        return 1
-
-    if dry_run:
-        logger.info("[dry-run] would write %s and open a PR on %s", publish_mod.NOTES_FILE, base_branch)
-        print(updated)
-        if triage:
-            print("\n=== Needs triage ===")
-            for pr in triage:
-                print(f"  #{pr.number} {pr.title} (@{pr.author or 'unknown'})")
-        return 0
-
-    if updated == existing and not triage:
-        logger.info("No change to %s and nothing to triage; skipping PR.", publish_mod.NOTES_FILE)
-        return 0
-
-    with open(notes_path, "w", encoding="utf-8") as fh:
-        fh.write(updated)
-
-    url = publish_mod.publish(
-        repo, clone_dir,
-        base_repo=repo_full_name, push_repo=None,
-        head_ref=head_ref, base_branch=base_branch, base_tag=result.base_tag,
-        included=len(gen.bullets), skipped=list(gen.skipped), triage=triage,
-        git_env=git_env,
-    )
-    logger.info("Release-notes PR ready: %s", url)
-    return 0
 
 
 if __name__ == "__main__":

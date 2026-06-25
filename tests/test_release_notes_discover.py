@@ -179,3 +179,27 @@ class TestDiscover:
         result = discover_mod.discover(gh_repo, repo_dir, "main", tag_glob="9.1.*")
         assert result.base_tag == "9.1.0-rc1"
         assert {p.number for p in result.prs} == {2, 3}
+
+    def test_explicit_base_ref_overrides_tag(self, tmp_path) -> None:
+        # A repo with NO tags (like a fork) -- tag resolution would raise, but an
+        # explicit base_ref makes the range base_ref..head work directly.
+        repo_dir = _init_repo(tmp_path)
+        _commit(repo_dir, "root (#1)")
+        run_git(repo_dir, "branch", "base")
+        _commit(repo_dir, "feat (#2)")
+
+        gh_repo = MagicMock()
+
+        def _get_pull(n):
+            p = MagicMock()
+            p.title = f"PR {n}"
+            p.user.login = "dev"
+            p.html_url = f"https://x/{n}"
+            p.merge_commit_sha = ""
+            p.labels = []
+            return p
+
+        gh_repo.get_pull.side_effect = _get_pull
+        result = discover_mod.discover(gh_repo, repo_dir, "main", base_ref="base")
+        assert result.base_tag == "base"
+        assert {p.number for p in result.prs} == {2}  # only commits after base
