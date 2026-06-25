@@ -18,6 +18,7 @@ env:
 
 jobs:
   monitor:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.repository == 'valkey-io/valkey-ci-agent' }}
     runs-on: ubuntu-latest
     timeout-minutes: 180
     permissions:
