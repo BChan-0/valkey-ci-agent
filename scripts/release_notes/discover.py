@@ -22,6 +22,7 @@ auto-merge.
 from __future__ import annotations
 
 import logging
+import subprocess
 from typing import Any
 
 from scripts.backport.utils import pr_numbers_from_commit_subjects
@@ -172,6 +173,28 @@ def hydrate_prs(repo: Any, pr_to_sha: dict[int, str]) -> list[MergedPR]:
     return prs
 
 
+def _resolve_base_ref(repo_dir: str, base_ref: str) -> str:
+    """Return a ref name for *base_ref* that resolves in *repo_dir*.
+
+    The clone is made with ``git clone --branch <source>``, so only the source
+    branch becomes a local ref; every other branch exists solely as its
+    remote-tracking ref ``origin/<name>``. A ``--base-ref`` naming such a branch
+    (e.g. a fork passing ``unstable``) therefore fails a bare ``rev-parse``. Try
+    the name as given first -- it covers tags, SHAs, and the source branch -- and
+    fall back to ``origin/<name>`` for any other branch. The returned name is
+    used both to resolve the base SHA and as the range/contributor baseline, so
+    every downstream ``base..head`` walk sees a name git can resolve.
+    """
+    try:
+        git_output(repo_dir, "rev-parse", "--verify", "--quiet", f"{base_ref}^{{commit}}")
+        return base_ref
+    except subprocess.CalledProcessError:
+        remote = f"origin/{base_ref}"
+        git_output(repo_dir, "rev-parse", "--verify", "--quiet", f"{remote}^{{commit}}")
+        logger.info("Base ref %r resolved via remote-tracking ref %r", base_ref, remote)
+        return remote
+
+
 def discover(
     repo: Any, repo_dir: str, head_ref: str, *,
     tag_glob: str | None = None, base_ref: str | None = None,
@@ -190,8 +213,11 @@ def discover(
     is used.
     """
     if base_ref:
-        base_tag = base_ref
-        base_sha = git_output(repo_dir, "rev-parse", base_ref).strip()
+        # Resolve to a name git can use in a fresh --branch clone (the bare
+        # branch may only exist as origin/<name>); reuse it as the range and
+        # contributor baseline so every base..head walk resolves identically.
+        base_tag = _resolve_base_ref(repo_dir, base_ref)
+        base_sha = git_output(repo_dir, "rev-parse", base_tag).strip()
     else:
         base_tag, base_sha = resolve_last_tag(repo_dir, head_ref, tag_glob=tag_glob)
     head_sha = git_output(repo_dir, "rev-parse", head_ref).strip()

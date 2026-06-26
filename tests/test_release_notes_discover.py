@@ -203,3 +203,37 @@ class TestDiscover:
         result = discover_mod.discover(gh_repo, repo_dir, "main", base_ref="base")
         assert result.base_tag == "base"
         assert {p.number for p in result.prs} == {2}  # only commits after base
+
+    def test_base_ref_resolves_via_remote_tracking_ref(self, tmp_path) -> None:
+        # Mirror the real cut: `git clone --branch <src>` leaves every OTHER
+        # branch reachable only as origin/<name>. A base_ref naming such a branch
+        # must resolve via the remote-tracking ref, and the resolved name must
+        # carry into the range so base..head still excludes the base commit.
+        (tmp_path / "upstream").mkdir()
+        upstream = _init_repo(tmp_path / "upstream")
+        _commit(upstream, "root (#1)")
+        run_git(upstream, "branch", "unstable")  # baseline lives on its own branch
+        run_git(upstream, "checkout", "-q", "main")
+        _commit(upstream, "feat (#2)")
+
+        clone_dir = str(tmp_path / "clone")
+        # Single-branch clone of main only -- 'unstable' is now origin/unstable.
+        run_git(None, "clone", "-q", "--branch", "main", upstream, clone_dir)
+        with pytest.raises(Exception):  # noqa: B017 - bare name does not resolve locally
+            git_output(clone_dir, "rev-parse", "--verify", "unstable")
+
+        gh_repo = MagicMock()
+
+        def _get_pull(n):
+            p = MagicMock()
+            p.title = f"PR {n}"
+            p.user.login = "dev"
+            p.html_url = f"https://x/{n}"
+            p.merge_commit_sha = ""
+            p.labels = []
+            return p
+
+        gh_repo.get_pull.side_effect = _get_pull
+        result = discover_mod.discover(gh_repo, clone_dir, "main", base_ref="unstable")
+        assert result.base_tag == "origin/unstable"  # fell back to remote-tracking ref
+        assert {p.number for p in result.prs} == {2}  # only commits after the baseline
