@@ -25,6 +25,7 @@ import logging
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -189,6 +190,18 @@ def main(argv: list[str] | None = None) -> int:
             security_fixes=args.security_fixes,
             dry_run=args.dry_run,
         )
+    except subprocess.CalledProcessError as exc:  # surface git's stderr, not just the exit code
+        # CalledProcessError.__str__ reports only the command and exit status;
+        # git's actual message (auth failure, protected ref, rejected push) is in
+        # stderr. Log it explicitly so an "exit 128" is diagnosable from CI logs.
+        stderr = (exc.stderr or "").strip()
+        logger.error(
+            "Release cut failed: %s exited %s%s",
+            " ".join(exc.cmd) if isinstance(exc.cmd, (list, tuple)) else exc.cmd,
+            exc.returncode,
+            f"\n{stderr}" if stderr else " (no stderr captured)",
+        )
+        return 1
     except Exception:  # noqa: BLE001 - never crash the workflow uncaught
         logger.exception("Release cut failed")
         return 1
