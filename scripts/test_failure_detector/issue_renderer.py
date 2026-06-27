@@ -79,13 +79,22 @@ class _FailureRenderer:
         # ``merge_environments`` on the update path. Empty on the create path
         # (no prior body to diff, and no comment is posted there anyway).
         self._newly_failing: list[str] = []
+        # The latest error trace when it differs (ignoring run-specific noise)
+        # from the one recorded on the issue, populated by ``merge_environments``
+        # on the update path. ``None`` when the trace is unchanged or absent, so
+        # :meth:`render` only calls it out when there is something new to show.
+        self._new_error: str | None = None
 
     def render(self, marker: str, occurrences: int) -> IssueContent:
         """The ``render`` callback: title/body/comment/labels for the issue."""
         return IssueContent(
             title=title_for(self._failure),
             body=_build_body(self._failure, marker, occurrences=occurrences),
-            comment=_build_comment(self._failure, newly_failing=self._newly_failing),
+            comment=_build_comment(
+                self._failure,
+                newly_failing=self._newly_failing,
+                new_error=self._new_error,
+            ),
             labels=(_LABEL_NAME,),
         )
 
@@ -94,7 +103,14 @@ class _FailureRenderer:
         into the existing issue body, preserving environments recorded by
         earlier runs and recording which ones are newly failing so
         :meth:`render` can call them out in the recurrence comment.
+
+        Also diffs the failure's error trace against the one recorded on the
+        issue and, when it has meaningfully changed, records it so
+        :meth:`render` can surface the new trace in the comment. The body's
+        original trace is left intact — the body is the first-seen record, the
+        comment timeline carries each subsequent change.
         """
+        self._new_error = self._detect_new_error(existing_body)
         existing_envs = _extract_environments_from_body(existing_body)
         self._newly_failing = [
             j.job for j in self._failure.jobs if j.job not in existing_envs
@@ -104,6 +120,23 @@ class _FailureRenderer:
         return _update_environments_in_body(
             existing_body, existing_envs + self._newly_failing,
         )
+
+    def _detect_new_error(self, existing_body: str) -> str | None:
+        """Return the failure's error trace when it differs from the one stored
+        on the issue, else ``None``.
+
+        The comparison is normalized (see :func:`_normalize_trace`) so that
+        run-specific noise — timestamps, ports/PIDs, hex addresses, temp paths —
+        does not flag an unchanged failure as new on every recurrence. An empty
+        new error is never called out.
+        """
+        new_error = self._failure.error
+        if not new_error.strip():
+            return None
+        stored = _extract_error_from_body(existing_body)
+        if _normalize_trace(stored) == _normalize_trace(new_error):
+            return None
+        return new_error
 
 
 def _build_title(failure: UniqueFailure) -> str:
@@ -145,12 +178,21 @@ def _build_body(failure: UniqueFailure, marker: str, *, occurrences: int) -> str
     ])
 
 
-def _build_comment(failure: UniqueFailure, *, newly_failing: list[str]) -> str:
+def _build_comment(
+    failure: UniqueFailure,
+    *,
+    newly_failing: list[str],
+    new_error: str | None = None,
+) -> str:
     """Build a comment for an existing issue that failed again.
 
     When ``newly_failing`` names environments not recorded on the issue before,
     the comment calls them out so a triager can spot a regression spreading to
     new platforms without diffing the body's Environments line.
+
+    When ``new_error`` is set, the failure recurred with a different error trace
+    than the one recorded on the issue; the comment shows the new trace so a
+    triager can notice the failure mode changed without diffing the body.
     """
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     ci_links = "\n".join(
@@ -160,6 +202,8 @@ def _build_comment(failure: UniqueFailure, *, newly_failing: list[str]) -> str:
     if newly_failing:
         new_envs = ", ".join(f"`{e}`" for e in newly_failing)
         lines.append(f"\n**Newly failing in:** {new_envs}")
+    if new_error:
+        lines.append(f"\n**New error stack trace**\n\n```\n{new_error}\n```")
     lines.append(f"\n**Failed in:**\n{ci_links}")
     return "\n".join(lines)
 
@@ -170,6 +214,59 @@ def _extract_environments_from_body(body: str) -> list[str]:
     if not env_match:
         return []
     return re.findall(r"`([^`]+)`", env_match.group(1))
+
+
+# The fenced code block holding the trace under the "Error stack trace" header
+# in a body built by :func:`_build_body`. Non-greedy so it stops at the closing
+# fence rather than swallowing later fenced blocks.
+_ERROR_BLOCK_RE = re.compile(
+    r"\*\*Error stack trace\*\*\s*```\n(.*?)\n```",
+    re.DOTALL,
+)
+
+
+def _extract_error_from_body(body: str) -> str:
+    """Extract the error trace recorded under the Error stack trace header.
+
+    Returns ``""`` when the body has no such section (e.g. issues created
+    before this section existed), which the caller treats as "unknown" rather
+    than "unchanged".
+    """
+    match = _ERROR_BLOCK_RE.search(body)
+    if not match:
+        return ""
+    return match.group(1).strip()
+
+
+# Run-specific tokens scrubbed before comparing two traces, so an unchanged
+# failure is not reported as new every recurrence. Order-independent; each is
+# replaced by a constant placeholder.
+_TRACE_NOISE_RES = (
+    # ISO-ish timestamps: 2026-06-27 12:34:56 / 2026-06-27T12:34:56
+    re.compile(r"\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?"),
+    # Bare clock times: 12:34:56
+    re.compile(r"\b\d{2}:\d{2}:\d{2}(?:\.\d+)?\b"),
+    # Hex addresses: 0x7fff1234
+    re.compile(r"0x[0-9a-fA-F]+"),
+    # Temp paths: /tmp/foo, /tmp/abc.123
+    re.compile(r"/tmp/[^\s:]+"),
+    # PID/port-style annotations: pid 12345, port=6379, port 6379
+    re.compile(r"\b(pid|port)[=\s]+\d+", re.IGNORECASE),
+)
+
+
+def _normalize_trace(text: str) -> str:
+    """Normalize a trace for comparison by scrubbing run-specific noise.
+
+    Two traces that differ only in timestamps, ports/PIDs, hex addresses, or
+    temp paths normalize to the same string, so a genuinely unchanged failure
+    is not flagged as a new error trace on every run.
+    """
+    for noise in _TRACE_NOISE_RES:
+        text = noise.sub("", text)
+    # Collapse all remaining whitespace so indentation/line-wrap changes alone
+    # do not count as a difference.
+    return " ".join(text.split())
 
 
 def _update_environments_in_body(body: str, all_envs: list[str]) -> str:

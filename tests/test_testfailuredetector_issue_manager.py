@@ -15,6 +15,7 @@ try:
         _build_body,
         _build_title,
         _extract_environments_from_body,
+        _extract_error_from_body,
         _update_environments_in_body,
         fingerprint_for,
         renderer_for,
@@ -271,3 +272,63 @@ class TestRecurrenceCommentNewlyFailing:
         # there) carries no newly-failing line rather than a spurious one.
         comment = renderer_for(_make_failure()).render("<!-- m -->", 1).comment
         assert "Newly failing in" not in comment
+
+
+class TestExtractErrorFromBody:
+    """Round-trips the Error stack trace section written by _build_body."""
+
+    def test_extracts_trace_written_by_build_body(self) -> None:
+        body = _build_body(
+            _make_failure(error="assertion failed at line 42"),
+            marker="<!-- m -->", occurrences=1,
+        )
+        assert _extract_error_from_body(body) == "assertion failed at line 42"
+
+    def test_returns_empty_when_no_error_section(self) -> None:
+        # Issues created before the Error stack trace section existed.
+        assert _extract_error_from_body("**Environments:** `job-a`") == ""
+
+
+class TestRecurrenceCommentNewError:
+    """The recurrence comment surfaces a changed error trace so a triager can
+    notice the failure mode shifted without diffing the issue body."""
+
+    def _body_with_error(self, error: str) -> str:
+        return _build_body(
+            _make_failure(error=error), marker="<!-- m -->", occurrences=1,
+        )
+
+    def test_calls_out_changed_trace(self) -> None:
+        # The issue recorded one trace; this run failed with a different one.
+        renderer = renderer_for(_make_failure(error="NEW: segfault in dictResize"))
+        renderer.merge_environments(self._body_with_error("OLD: timeout waiting for sync"))
+        comment = renderer.render("<!-- m -->", 2).comment
+        assert "**New error stack trace**" in comment
+        assert "NEW: segfault in dictResize" in comment
+
+    def test_stays_quiet_when_trace_unchanged(self) -> None:
+        renderer = renderer_for(_make_failure(error="same error every time"))
+        renderer.merge_environments(self._body_with_error("same error every time"))
+        comment = renderer.render("<!-- m -->", 2).comment
+        assert "New error stack trace" not in comment
+
+    def test_normalized_equal_trace_stays_quiet(self) -> None:
+        # Differs only in run-specific noise (port, timestamp, hex address);
+        # normalization treats these as the same trace.
+        old = "conn failed 2026-06-26 10:00:00 port=6379 at 0xdead"
+        new = "conn failed 2026-06-27 11:22:33 port=7000 at 0xbeef"
+        renderer = renderer_for(_make_failure(error=new))
+        renderer.merge_environments(self._body_with_error(old))
+        comment = renderer.render("<!-- m -->", 2).comment
+        assert "New error stack trace" not in comment
+
+    def test_empty_new_error_stays_quiet(self) -> None:
+        renderer = renderer_for(_make_failure(error=""))
+        renderer.merge_environments(self._body_with_error("OLD: some trace"))
+        comment = renderer.render("<!-- m -->", 2).comment
+        assert "New error stack trace" not in comment
+
+    def test_no_new_error_line_without_body_transform(self) -> None:
+        # Create path: body_transform never runs, so no spurious callout.
+        comment = renderer_for(_make_failure()).render("<!-- m -->", 1).comment
+        assert "New error stack trace" not in comment
