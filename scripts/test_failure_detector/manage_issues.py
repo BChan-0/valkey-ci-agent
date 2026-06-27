@@ -43,12 +43,15 @@ def process_failures(
     summary = {"created": 0, "updated": 0, "skipped": 0}
 
     for failure in failures:
+        # The render and body_transform hooks are coupled (they share the set
+        # of newly failing environments), so they come from one renderer.
+        renderer = issue_renderer.renderer_for(failure)
         action, url = publisher.upsert(
             repo_full_name,
             fingerprint=issue_renderer.fingerprint_for(failure),
-            render=issue_renderer.render_for(failure),
+            render=renderer.render,
             idempotency_key=idempotency_key,
-            body_transform=issue_renderer.merge_environments(failure),
+            body_transform=renderer.merge_environments,
             # The title is unchanged by the switch to hashed fingerprints, so
             # an exact title match adopts issues from the old raw-fingerprint
             # scheme and re-stamps them instead of creating duplicates.

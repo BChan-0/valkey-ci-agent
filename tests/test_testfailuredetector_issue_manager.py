@@ -17,8 +17,7 @@ try:
         _extract_environments_from_body,
         _update_environments_in_body,
         fingerprint_for,
-        merge_environments,
-        render_for,
+        renderer_for,
         title_for,
     )
     from scripts.test_failure_detector.manage_issues import process_failures
@@ -145,15 +144,15 @@ class TestMergeEnvironments:
     """The body_transform hook that carries the running env list forward."""
 
     def test_adds_new_environment(self) -> None:
-        transform = merge_environments(_make_failure(jobs=[("new-job", "suite", "url")]))
-        result = transform("**Environments:** `old-job`")
+        renderer = renderer_for(_make_failure(jobs=[("new-job", "suite", "url")]))
+        result = renderer.merge_environments("**Environments:** `old-job`")
         assert "`old-job`" in result
         assert "`new-job`" in result
 
     def test_no_change_when_env_already_present(self) -> None:
         body = "**Environments:** `test-ubuntu-latest`"
-        transform = merge_environments(_make_failure())  # job is test-ubuntu-latest
-        assert transform(body) == body
+        renderer = renderer_for(_make_failure())  # job is test-ubuntu-latest
+        assert renderer.merge_environments(body) == body
 
 
 # --- Integration tests with a mocked publisher ---
@@ -203,6 +202,33 @@ class TestProcessFailures:
         assert publisher.upsert.call_args.kwargs["idempotency_key"] is None
 
     def test_render_callable_produces_labelled_content(self) -> None:
-        content = render_for(_make_failure())("<!-- m -->", 1)
+        content = renderer_for(_make_failure()).render("<!-- m -->", 1)
         assert content.labels == ("test-failure",)
         assert content.title.startswith("[TEST-FAILURE]")
+
+
+class TestRecurrenceCommentNewlyFailing:
+    """The recurrence comment calls out environments failing for the first time
+    on this run (PR #24 review r3431750542)."""
+
+    def test_names_newly_failing_environments(self) -> None:
+        # New job 'test-arm64' is not in the prior body; the body_transform
+        # records it, then render names it in the recurrence comment.
+        renderer = renderer_for(_make_failure(jobs=[("test-arm64", "suite", "url")]))
+        renderer.merge_environments("**Environments:** `test-ubuntu-latest`")
+        comment = renderer.render("<!-- m -->", 2).comment
+        assert "**Newly failing in:** `test-arm64`" in comment
+        assert "Test failed again on" in comment
+
+    def test_omits_newly_failing_line_when_no_new_environment(self) -> None:
+        # The only job is already recorded, so there is nothing new to call out.
+        renderer = renderer_for(_make_failure())  # job is test-ubuntu-latest
+        renderer.merge_environments("**Environments:** `test-ubuntu-latest`")
+        comment = renderer.render("<!-- m -->", 2).comment
+        assert "Newly failing in" not in comment
+
+    def test_no_newly_failing_line_without_body_transform(self) -> None:
+        # On the create path body_transform never runs, so the comment (unused
+        # there) carries no newly-failing line rather than a spurious one.
+        comment = renderer_for(_make_failure()).render("<!-- m -->", 1).comment
+        assert "Newly failing in" not in comment
