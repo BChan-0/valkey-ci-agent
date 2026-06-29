@@ -2,8 +2,8 @@
 
 The release cut pushes its promoted commit to an agent-namespaced prep branch
 (see :mod:`release_cut`) and opens a PR from it into the release line. This
-module owns only the PR-side primitives -- finding an existing open PR for a
-branch and creating/updating it -- plus a small Markdown-table escape helper for
+module owns only the PR-side primitives (finding an existing open PR for a
+branch and creating/updating it) plus a small Markdown-table escape helper for
 the triage list embedded in the PR body. The branch push discipline lives in
 :mod:`release_cut`.
 """

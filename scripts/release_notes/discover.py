@@ -1,22 +1,21 @@
 """Discover the PRs a release line has accrued since its last tag.
 
-Selection is by **graph reachability**, never by date: we resolve the most
-recent tag reachable from the release-line tip and walk ``tag..head``. A
-backport cherry-picked onto the line is a distinct commit with its own date,
-so a date window would either miss it or double-count it; a graph range counts
-it exactly when it is part of this line's history.
+Selection is by graph reachability, never by date: we resolve the most recent
+tag reachable from the release-line tip and walk ``tag..head``. A backport
+cherry-picked onto the line is a distinct commit with its own date, so a date
+window would either miss it or double-count it; a graph range counts it exactly
+when it is part of this line's history.
 
-Each commit is resolved to its **originating PR number** so the set is
-deduplicated by change identity rather than by commit SHA. The squash-merge
-subject's trailing ``(#N)`` is the cheap offline path
+Each commit is resolved to its originating PR number so the set is deduplicated
+by change identity rather than by commit SHA. The squash-merge subject's
+trailing ``(#N)`` is the cheap offline path
 (:func:`scripts.backport.utils.pr_numbers_from_commit_subjects`); commits
 without one fall back to the GitHub "PRs associated with a commit" API.
 
-Cross-line dedup (the same change shipping as a different PR on ``unstable``)
-is intentionally out of scope: within a single release line, the PR that
-merged the change *onto this line* is the right identity. A change that should
-have been release-noted on another line surfaces as a triage signal, not an
-auto-merge.
+Cross-line dedup (the same change shipping as a different PR on ``unstable``) is
+intentionally out of scope: within a single release line, the PR that merged the
+change onto this line is the right identity. A change that should have been
+release-noted on another line surfaces as a triage signal, not an auto-merge.
 """
 
 from __future__ import annotations
@@ -43,7 +42,7 @@ def resolve_last_tag(repo_dir: str, head_ref: str, *, tag_glob: str | None = Non
     "Most recent" is by graph distance, not date: ``git describe --tags
     --abbrev=0`` reports the nearest tag that is an ancestor of *head_ref*.
     ``tag_glob`` (e.g. ``"9.1.*"``) restricts matching to one release line via
-    ``--match``. Raises :class:`ValueError` if no tag is reachable.
+    ``--match``. Raises :class:`ValueError` when no tag is reachable.
     """
     args = ["describe", "--tags", "--abbrev=0"]
     if tag_glob:
@@ -68,15 +67,15 @@ def list_range_commits(repo_dir: str, base: str, head_ref: str) -> list[tuple[st
     """Return ``[(sha, subject), ...]`` for commits in ``base..head_ref``, oldest first.
 
     ``base`` is the prior tag (or its SHA); the range excludes it and includes
-    everything reachable from *head_ref* that it does not reach -- exactly the
+    everything reachable from *head_ref* that it does not reach, exactly the
     line's new history.
     """
     out = git_output(
         repo_dir, "log", "--reverse", f"--format={_LOG_FORMAT}", f"{base}..{head_ref}"
     )
     commits: list[tuple[str, str]] = []
-    # Split on "\n" only -- NOT str.splitlines(), which also breaks on \v, \f,
-    # \x85, U+2028/2029 etc. A subject legitimately containing one of those
+    # Split on "\n" only, not str.splitlines(), which also breaks on \v, \f,
+    # \x85, U+2028/2029, etc. A subject legitimately containing one of those
     # would otherwise be torn into a bogus extra record.
     for line in out.split("\n"):
         if not line:
@@ -92,16 +91,16 @@ def resolve_commit_prs(repo: Any, commits: list[tuple[str, str]]) -> dict[int, s
 
     Two-tier resolution:
 
-    1. **Subject parse** (offline, free): the trailing ``(#N)`` of a squash-merge
+    1. Subject parse (offline, free): the trailing ``(#N)`` of a squash-merge
        subject is the PR that merged the commit onto this line. This catches the
        overwhelming majority and is what makes a cherry-picked change collapse
        onto one key when its subject preserves the source ``(#N)``.
-    2. **API fallback**: for a commit whose subject has no trailing ``(#N)``
-       (a hand-applied cherry-pick, a merge commit, very old history), ask
-       GitHub for the PRs associated with that SHA and take the first.
+    2. API fallback: for a commit whose subject has no trailing ``(#N)`` (a
+       hand-applied cherry-pick, a merge commit, very old history), ask GitHub
+       for the PRs associated with that SHA and take the first.
 
     The first commit seen per PR number wins; later occurrences collapse onto
-    it. Commits that resolve to no PR are dropped with a warning -- they are
+    it. Commits that resolve to no PR are dropped with a warning: they are
     invisible to dedup and carry no PR reference for a note.
     """
     pr_to_sha: dict[int, str] = {}
@@ -180,7 +179,7 @@ def _resolve_base_ref(repo_dir: str, base_ref: str) -> str:
     branch becomes a local ref; every other branch exists solely as its
     remote-tracking ref ``origin/<name>``. A ``--base-ref`` naming such a branch
     (e.g. a fork passing ``unstable``) therefore fails a bare ``rev-parse``. Try
-    the name as given first -- it covers tags, SHAs, and the source branch -- and
+    the name as given first, which covers tags, SHAs, and the source branch, and
     fall back to ``origin/<name>`` for any other branch. The returned name is
     used both to resolve the base SHA and as the range/contributor baseline, so
     every downstream ``base..head`` walk sees a name git can resolve.
@@ -203,11 +202,11 @@ def discover(
 
     ``repo`` is a PyGithub repository; ``repo_dir`` is a full-depth local clone
     of the same repo with tags fetched (a shallow clone breaks ``describe`` and
-    the range walk). Dispositions are unset -- :func:`classify.classify` fills
+    the range walk). Dispositions are unset; :func:`classify.classify` fills
     them.
 
     ``base_ref`` is an explicit baseline (a branch, tag, or SHA) that overrides
-    tag resolution -- the escape hatch for a line with no reachable tag (e.g. a
+    tag resolution, the escape hatch for a line with no reachable tag (e.g. a
     fork that carries no release tags). When set, the range is ``base_ref..head``
     directly; otherwise the most recent tag (optionally filtered by ``tag_glob``)
     is used.

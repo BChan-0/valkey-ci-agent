@@ -8,11 +8,11 @@ The pipeline is a chain of small, explicit handoffs:
     render   -> updated 00-RELEASENOTES text (code: canonical format, authoritative)
     publish  -> PR url              (code: branch + PR on valkey)
 
-AI populates only the judgment fields (``CategorizedBullet`` category and
-text); code populates every factual field (PR number, author, labels, the
-trailing ``(#N)``, the ``by @handle`` attribution). The split is deliberate:
-the model decides what to say and where it goes, never the dedup identity or
-the format the downstream release tooling parses.
+AI populates only the judgment fields (``CategorizedBullet`` category and text);
+code populates every factual field (PR number, author, labels, the trailing
+``(#N)``, the ``by @handle`` attribution). The split is deliberate: the model
+decides what to say and where it goes, never the dedup identity or the format
+the downstream release tooling parses.
 """
 
 from __future__ import annotations

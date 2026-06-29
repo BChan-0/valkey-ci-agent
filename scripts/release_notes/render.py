@@ -1,16 +1,16 @@
 """Render generated bullets into the canonical ``00-RELEASENOTES`` markdown.
 
-The format is **authoritative in the valkey repo**, not here: this module
-imports ``utils/releasetools/release_notes.py`` from the valkey clone at
-runtime (via importlib) and reuses its ``CATEGORIES``, the exact ``##
-Unreleased`` header, and the byte-for-byte contributor-guidance HTML comment.
-The agent never re-encodes the category names or that comment, so a change to
-the format in valkey flows through automatically.
+The format is authoritative in the valkey repo, not here: this module imports
+``utils/releasetools/release_notes.py`` from the valkey clone at runtime (via
+importlib) and reuses its ``CATEGORIES``, the exact ``## Unreleased`` header,
+and the byte-for-byte contributor-guidance HTML comment. The agent never
+re-encodes the category names or that comment, so a change to the format in
+valkey flows through automatically.
 
 What this module owns is purely mechanical: turning each
 :class:`CategorizedBullet` into the canonical bullet line
-``* <text> by @<handle> (#<N>)`` -- with the ``(#N)`` trailing and the
-``by @handle`` present, exactly as ``check_release_notes.py`` requires -- and
+``* <text> by @<handle> (#<N>)`` (with the ``(#N)`` trailing and the
+``by @handle`` present, exactly as ``check_release_notes.py`` requires) and
 splicing the filled block into the file in place of the existing one.
 """
 
@@ -26,20 +26,20 @@ from scripts.release_notes.models import CategorizedBullet
 logger = logging.getLogger(__name__)
 
 # A GitHub login is [A-Za-z0-9-]; the attribution regex check_release_notes uses
-# is ``by @([\w-]+)``. Anything outside that set (a space, '.', '@', parens from
-# a malformed author) would truncate or break the captured handle.
+# is ``by @([\w-]+)``. Anything outside that set (a space, '.', '@', or parens
+# from a malformed author) would truncate or break the captured handle.
 _HANDLE_SAFE_RE = re.compile(r"[^\w-]")
 
 
 def _one_line(text: str) -> str:
     """Collapse *text* to a single physical line.
 
-    A bullet and a category header are parsed line-by-line by the format
-    module, so an embedded line break would split the bullet, terminate the
-    whole block (a line starting ``"## "``), or inject a spurious category
-    (``"### ..."``). We split on exactly the boundaries ``str.splitlines()``
-    recognizes -- the same call ``parse_unreleased`` uses -- so our notion of
-    "one line" cannot disagree with the parser's, then join with single spaces.
+    A bullet and a category header are parsed line-by-line by the format module,
+    so an embedded line break would split the bullet, terminate the whole block
+    (a line starting ``"## "``), or inject a spurious category (``"### ..."``).
+    We split on exactly the boundaries ``str.splitlines()`` recognizes (the same
+    call ``parse_unreleased`` uses), so our notion of "one line" cannot disagree
+    with the parser's, then join with single spaces.
     """
     return " ".join(text.splitlines()).strip()
 
@@ -59,7 +59,7 @@ def format_bullet(bullet: CategorizedBullet) -> str:
     The trailing ``(#N)`` and the ``by @handle`` are appended in this fixed
     order so they satisfy ``check_release_notes``'s ``_TRAILING_PR_REF_RE`` and
     ``_AUTHOR_RE``. When the author is unknown (a ghost account), the ``by @``
-    segment is omitted -- the PR-number requirement still holds, and a missing
+    segment is omitted; the PR-number requirement still holds, and a missing
     attribution is a warning, not a hard failure, in the CI check.
 
     Both the text and the handle are sanitized: the text is collapsed to a
@@ -88,8 +88,8 @@ def group_bullets(
     order; any non-canonical category the model emitted follows, in first-seen
     order, so a miscategorized note is never dropped (mirrors the format
     module's own behavior). Bullets the model placed under the reserved
-    ``Security Fixes`` / ``Contributors`` sections are refused -- those are
-    generated at release-cut time -- and logged.
+    ``Security Fixes`` / ``Contributors`` sections are refused and logged; those
+    are generated at release-cut time.
     """
     reserved = set(getattr(fmt, "RESERVED_SECTIONS", ("Security Fixes", "Contributors")))
     canonical = set(fmt.CATEGORIES)
@@ -158,8 +158,8 @@ def apply_to_file(existing_text: str, grouped: "dict[str, list[str]]", fmt: Any)
     """Return *existing_text* with its ``## Unreleased`` block replaced.
 
     Everything before the block is preserved verbatim. We locate the block the
-    way the format module's ``reset_unreleased`` does -- by the header preceded
-    by a newline (``"\\n## Unreleased"``), NOT a bare ``find``. The intro prose
+    way the format module's ``reset_unreleased`` does: by the header preceded by
+    a newline (``"\\n## Unreleased"``), not a bare ``find``. The intro prose
     mentions ``"## Unreleased"`` in quotes, so a bare search would match that
     mention and splice the block into the middle of the paragraph.
     """
@@ -170,7 +170,7 @@ def apply_to_file(existing_text: str, grouped: "dict[str, list[str]]", fmt: Any)
     if idx == -1:
         if existing_text.startswith(header):
             return filled_block
-        # No block at all -- append a fresh, filled one.
+        # No block at all; append a fresh, filled one.
         return existing_text.rstrip() + "\n\n" + filled_block
     # Keep everything up to and including the newline before the header.
     return existing_text[: idx + 1] + filled_block

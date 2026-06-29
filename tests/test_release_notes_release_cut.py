@@ -181,7 +181,7 @@ class TestPromoteAndBump:
         # git but 404 the GitHub compare API, which silently drops to the
         # names-only git-shortlog fallback. promote_and_bump must dereference both
         # to SHAs (via _compare_ref) before calling list_contributors, so the API
-        # path -- and the "Full Name @handle" format -- is preserved.
+        # path, and thus the "Full Name @handle" format, is preserved.
         source = self._source_with_bullet(clone)
         version_text = open(os.path.join(clone, "src", "version.h"), encoding="utf-8").read()
         captured: dict = {}
@@ -290,8 +290,8 @@ class TestCutOrchestration:
             urgency="LOW", date="2026-06-25", tag_glob=None, base_ref=None, contrib_base_ref=None,
             security_fixes=None, token="t", git_env={}, dry_run=False,
         )
-        # The release line was created (it did not exist), and exactly ONE PR is
-        # opened: the prep branch INTO the release line. No companion reset PR --
+        # The release line was created (it did not exist), and exactly one PR is
+        # opened: the prep branch into the release line. No companion reset PR;
         # the source branch is never modified.
         pushed = [c for c in calls if c[:1] == ("push",)]
         assert any("refs/heads/pre-release-9.1.0" in " ".join(c) for c in pushed), pushed
@@ -365,10 +365,10 @@ class TestCutOrchestration:
         repo.create_pull.assert_not_called()
 
     def test_contrib_base_matches_notes_baseline(self, monkeypatch, clone):
-        # The credits must span the SAME range as the bullets: the contributor
+        # The credits must span the same range as the bullets: the contributor
         # base passed to promote_and_bump equals regen.base_tag (9.0.0 here),
-        # NOT whatever `git describe` would return from the source branch. _setup
-        # leaves the REAL _contrib_base in place here so the wiring is exercised;
+        # not whatever `git describe` would return from the source branch. _setup
+        # leaves the real _contrib_base in place here so the wiring is exercised;
         # promote_and_bump is captured to read what it received.
         from unittest.mock import MagicMock
         self._setup(monkeypatch, clone, line_exists={"pre-release-9.1.0": True},
@@ -433,3 +433,112 @@ class TestContribBase:
         monkeypatch.setattr(rc, "git_output", _git)
         assert rc._contrib_base("/d", explicit=None, notes_base_ref=None,
                                 plan=self._PLAN) == "rootsha"
+
+
+class TestDedupAgainstDestination:
+    """The tag-independent dedup: drop PRs the release line already credits.
+
+    Without an RC tag to bound the range (the agent never pushes tags; a fork has
+    none), discovery re-finds every PR on a continued cut, most visibly GA after
+    the final RC. These cover the dedup that keeps promotion idempotent anyway.
+    """
+
+    _GA_PLAN = BranchPlan("ga", "9.1", "pre-release-9.1.0", True, "pre-release-9.1.0")
+
+    def test_credited_reads_trailing_pr_refs(self) -> None:
+        text = (
+            "Valkey 9.1.0-rc1 - Released\n\n"
+            "### Bug Fixes\n"
+            "* fix a thing by @a (#44)\n"
+            "* and another by @b (#51)\n"
+        )
+        assert rc._credited_pr_numbers(text) == {44, 51}
+
+    def test_credited_ignores_non_bullet_and_inline_refs(self) -> None:
+        # A "(#N)" in prose or a heading is not a credit; only a trailing ref on
+        # a bullet line is. Mirrors the guidance comment that mentions "(#N)".
+        text = (
+            "See PR (#999) for context.\n"
+            "## Heading mentioning (#998)\n"
+            "* real credit by @a (#44)\n"
+            "* a bullet with a mid-line (#7) ref but no trailing one\n"
+        )
+        assert rc._credited_pr_numbers(text) == {44}
+
+    def test_drop_removes_only_overlapping_bullets(self) -> None:
+        source = (
+            "## Unreleased\n\n"
+            "### Performance and Efficiency Improvements\n"
+            "* already shipped by @a (#44)\n"
+            "### Bug Fixes\n"
+            "* genuinely new by @b (#60)\n"
+        )
+        filtered, dropped = rc._drop_already_credited(source, {44})
+        assert dropped == [44]
+        assert "(#44)" not in filtered
+        assert "(#60)" in filtered                 # new PR survives
+        assert "### Performance and Efficiency Improvements" in filtered  # empty header kept
+        assert "### Bug Fixes" in filtered
+
+    def test_drop_is_noop_without_overlap(self) -> None:
+        source = "### Bug Fixes\n* new by @a (#60)\n"
+        filtered, dropped = rc._drop_already_credited(source, set())
+        assert dropped == []
+        assert filtered == source
+
+    def test_ga_after_final_rc_drops_all_and_warns(self, clone, monkeypatch) -> None:
+        # End-to-end-ish: dest already credits #44; the source block re-found #44
+        # (no tag to bound the range). The cut must drop it, render an empty dated
+        # section, and warn in the PR body.
+        from scripts.release_notes import pipeline as pipeline_mod
+        from scripts.release_notes import render as render_mod
+        from scripts.release_notes.models import CategorizedBullet
+        from scripts.release_notes.pipeline import RegenResult
+
+        fmt = render_mod.load_format_module(clone)
+        existing = open(os.path.join(clone, "00-RELEASENOTES"), encoding="utf-8").read()
+        bl = [CategorizedBullet(pr_number=44, author="a", category="Bug Fixes", text="fix")]
+        updated = render_mod.apply_to_file(existing, render_mod.group_bullets(bl, fmt), fmt)
+        monkeypatch.setattr(
+            pipeline_mod, "regenerate_unreleased",
+            lambda *a, **k: RegenResult(
+                base_tag="unstable", existing_text=existing, updated_text=updated,
+                included=1, bullet_count=1, skipped=(), triage=(), had_prs=True,
+                wipes_existing=False,
+            ),
+        )
+        # Destination line already credits #44 (carried from rc1).
+        dest_notes = (
+            "Valkey 9.1 release notes\n========================\n\n"
+            "Valkey 9.1.0-rc1  -  Released 2026-06-01\n"
+            "---------------------------------------\n\n"
+            "Upgrade urgency LOW: ...\n\n### Bug Fixes\n* fix by @a (#44)\n"
+        )
+        captured = {}
+
+        # Drive cut() with git/GitHub/promote stubbed; assert the dedup + warning.
+        from scripts.release_notes import release_cut as rcmod
+        monkeypatch.setattr(rcmod, "resolve_branch_plan", lambda *a, **k: self._GA_PLAN)
+        monkeypatch.setattr(rcmod, "_remote_branch_exists", lambda d, b: True)
+        monkeypatch.setattr(rcmod, "run_git", lambda *a, **k: None)
+        monkeypatch.setattr(rcmod, "_read",
+                            lambda p: dest_notes if p.endswith("00-RELEASENOTES")
+                            else open(os.path.join(clone, "src", "version.h")).read())
+
+        def _capture_promote(*a, **k):
+            captured["source_notes"] = k["source_notes_text"]
+            return ("NEWNOTES", "NEWVERSION")
+        monkeypatch.setattr(rcmod, "promote_and_bump", _capture_promote)
+        monkeypatch.setattr(rcmod, "_print_dry_run",
+                            lambda *a, **k: captured.setdefault("already", a[5]))
+
+        rcmod.cut(
+            object(), repo_full_name="valkey-io/valkey", source_clone_dir=clone,
+            valkey_clone_dir=clone, source_ref="unstable", version="9.1.0",
+            stage="ga", urgency="LOW", date="2026-06-29", tag_glob=None,
+            base_ref=None, contrib_base_ref=None, security_fixes=None,
+            token="t", git_env={}, dry_run=True,
+        )
+        # #44 was dropped before promote saw the source block.
+        assert "(#44)" not in captured["source_notes"]
+        assert captured["already"] == [44]

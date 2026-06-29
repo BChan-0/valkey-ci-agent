@@ -181,7 +181,7 @@ class TestDiscover:
         assert {p.number for p in result.prs} == {2, 3}
 
     def test_explicit_base_ref_overrides_tag(self, tmp_path) -> None:
-        # A repo with NO tags (like a fork) -- tag resolution would raise, but an
+        # A repo with no tags (like a fork): tag resolution would raise, but an
         # explicit base_ref makes the range base_ref..head work directly.
         repo_dir = _init_repo(tmp_path)
         _commit(repo_dir, "root (#1)")
@@ -217,7 +217,7 @@ class TestDiscover:
         _commit(upstream, "feat (#2)")
 
         clone_dir = str(tmp_path / "clone")
-        # Single-branch clone of main only -- 'unstable' is now origin/unstable.
+        # Single-branch clone of main only; 'unstable' is now origin/unstable.
         run_git(None, "clone", "-q", "--branch", "main", upstream, clone_dir)
         with pytest.raises(Exception):  # noqa: B017 - bare name does not resolve locally
             git_output(clone_dir, "rev-parse", "--verify", "unstable")

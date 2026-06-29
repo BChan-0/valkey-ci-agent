@@ -1,33 +1,31 @@
-"""Cut a release: generate notes all at once, promote, bump the version, drain prior RCs.
+"""Cut a release: generate notes, promote them, bump the version, drain prior RCs.
 
-This is the sole entry path: there is no accumulated ``## Unreleased`` block on
-any branch. Each cut regenerates the notes from the labelled PRs in range and
-promotes them in one shot. It ports the orchestration of valkey's
-``utils/releasetools/prepare_release.py`` into the agent, but reuses that repo's
-**pure primitives** -- ``promote``, ``set_version``, ``version_num``,
-``list_contributors`` -- loaded from the clone at runtime (:mod:`clone_tools`),
-so the version macros, the dated-section format, and the contributor list stay
-byte-authoritative in valkey.
+Each cut regenerates the notes from the labelled PRs in range and promotes them 
+in one shot. The orchestration mirrors valkey's
+``utils/releasetools/prepare_release.py`` but reuses that repo's primitives
+(``promote``, ``set_version``, ``version_num``, ``list_contributors``), loaded
+from the clone at runtime (:mod:`clone_tools`). This keeps the version macros,
+the dated-section format, and the contributor list authoritative in valkey.
 
 The release-line branch model (one long-running branch per minor line):
 
     rc1 of M.m.p   -> create  pre-release-M.m.p  from the source branch
-    rcN (N>1)       -> continue pre-release-M.m.p (keeps its prior dated notes)
-    GA  of M.m.p    -> create  M.m carrying pre-release-M.m.p's history, then
-                       delete pre-release-M.m.p (a rename)
-    later patches   -> continue the existing M.m branch
+    rcN (N>1)      -> continue pre-release-M.m.p (keeps its prior dated notes)
+    GA  of M.m.p   -> create  M.m carrying pre-release-M.m.p's history, then
+                      delete pre-release-M.m.p (a rename)
+    later patches  -> continue the existing M.m branch
 
-The AI generates the bullets in a transient ``## Unreleased`` block (built in
-memory by the discover/generate/render pipeline, never written to a branch);
+The AI generates the bullets in a transient ``## Unreleased`` block, built in
+memory by the discover/generate/render pipeline and never written to a branch.
 ``promote`` then drains that block into a new dated section on the release line,
-prepends prior RCs' dated sections, appends the full running contributor list,
-and bumps ``src/version.h``.
+prepends prior RCs' dated sections, appends the running contributor list, and
+bumps ``src/version.h``.
 
-Successive RCs do not double-note: each cut discovers PRs by graph range from
+Successive RCs do not double-note. Each cut discovers PRs by graph range from
 HEAD back to the most recent reachable RC tag, so a PR captured by rc1's tag is
-outside rc2's range. The source branch is never modified (no block to empty).
-The promoted commit lands on an agent prep branch that opens a PR *into* the
-release line, so the cut is reviewed before the line advances.
+outside rc2's range. The source branch is never modified. The promoted commit
+lands on an agent prep branch that opens a PR into the release line, so the cut
+is reviewed before the line advances.
 """
 
 from __future__ import annotations
@@ -50,16 +48,23 @@ NOTES_FILE = "00-RELEASENOTES"
 VERSION_FILE = os.path.join("src", "version.h")
 
 # Branch namespace. The release line (pre-release-M.m.p / M.m) is long-running
-# and only advanced by merging a PR -- the agent never force-pushes it directly.
+# and only advanced by merging a PR; the agent never force-pushes it directly.
 # The cut's promoted commit lands on a throwaway agent prep branch that PRs into
 # the line. The source branch is never modified.
 PREP_BRANCH_PREFIX = "agent/release-cut"
 
 _VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 _RC_STAGE_RE = re.compile(r"^rc([1-9]\d*)$")
-# Reads "Valkey M.m.p-rcN" headings from a running pre-release changelog so we
-# can tell which rc numbers already shipped on it.
+# Matches "Valkey M.m.p-rcN" headings in a running pre-release changelog, to
+# tell which rc numbers already shipped on it.
 _DATED_RC_RE_TMPL = r"^Valkey {major}\.{minor}\.{patch}-rc(\d+)"
+
+# A rendered note bullet ends with "(#N)" naming the PR it credits. The
+# bullet-line guard keeps a "(#N)" in prose or a heading from being read as a
+# credit. Used to dedup a cut's notes against the PRs the destination release
+# line already lists (see _drop_already_credited).
+_BULLET_LINE_RE = re.compile(r"^\s*[*-]\s+\S")
+_TRAILING_PR_RE = re.compile(r"\(#(\d+)\)\s*$")
 
 
 @dataclass(frozen=True)
@@ -98,9 +103,9 @@ def resolve_branch_plan(repo_dir: str, *, version: str, stage: str, source_ref: 
 
     Mirrors valkey's prepare-release branch resolution: rc stages target the
     long-running ``pre-release-M.m.p``; ``ga`` targets ``M.m`` and, when only the
-    rc branch exists, renames it (carry its history, delete the rc branch). A
-    line that already exists is *continued* (its prior dated sections are
-    drained); otherwise it starts from ``source_ref``.
+    rc branch exists, renames it (carry its history, delete the rc branch). An
+    existing line is continued (its prior dated sections are drained); otherwise
+    it starts from ``source_ref``.
     """
     stage_lc = _normalize_stage(stage)
     major, minor, patch = _split_version(version)
@@ -127,7 +132,7 @@ def _warn_rc_sequence(repo_dir: str, pre_branch: str, stage_lc: str, major: int,
 
     A continued rc should be exactly one past the highest rc already recorded on
     the running branch; a repeat (re-cut) or a gap is probably a mis-dispatched
-    stage. We only warn -- the caller still cuts what was asked.
+    stage. This only warns; the caller still cuts what was asked.
     """
     m = _RC_STAGE_RE.match(stage_lc)
     if not m:
@@ -144,7 +149,7 @@ def _warn_rc_sequence(repo_dir: str, pre_branch: str, stage_lc: str, major: int,
     expected = highest + 1
     if requested != expected:
         logger.warning(
-            "Dispatched %s but %s records up to rc%d (expected rc%d). Cutting anyway -- "
+            "Dispatched %s but %s records up to rc%d (expected rc%d). Cutting anyway: "
             "a repeat re-cuts an existing rc; a gap skips one.",
             stage_lc, pre_branch, highest, expected,
         )
@@ -179,12 +184,12 @@ def promote_and_bump(
 ) -> tuple[str, str]:
     """Drain *source_notes_text*'s block onto the destination changelog and bump the version.
 
-    Returns ``(new_dest_notes, new_version_h)``. All formatting decisions are the
-    valkey primitives': ``promote`` in drain mode (``prior_text`` = the
+    Returns ``(new_dest_notes, new_version_h)``. The valkey primitives make all
+    formatting decisions: ``promote`` in drain mode (``prior_text`` is the
     destination's running changelog) produces a frozen dated changelog with no
-    ``## Unreleased`` block; ``set_version`` rewrites the three version macros.
-    The contributor list is generated over ``contrib_base..HEAD`` and merged into
-    the cumulative footer by ``promote``.
+    ``## Unreleased`` block, and ``set_version`` rewrites the three version
+    macros. The contributor list is generated over ``contrib_base..HEAD`` and
+    merged into the cumulative footer by ``promote``.
     """
     rn = load_releasetools_module(valkey_clone_dir, "release_notes")
     bv = load_releasetools_module(valkey_clone_dir, "bump_version")
@@ -192,10 +197,10 @@ def promote_and_bump(
     contributors: list[str] = []
     if contrib_base:
         gc = load_releasetools_module(valkey_clone_dir, "gen_contributors")
-        # Resolve both ends to SHAs the GitHub compare API accepts: contrib_base
+        # Resolve both ends to SHAs the GitHub compare API accepts. contrib_base
         # is typically a remote-tracking ref (origin/unstable) and the head is the
-        # literal "HEAD" -- both 404 the API and silently fall back to git
-        # shortlog (names only, no @handle, bots not filtered). See _compare_ref.
+        # literal "HEAD"; both 404 the API and silently fall back to git shortlog
+        # (names only, no @handle, bots not filtered). See _compare_ref.
         base_sha = _compare_ref(valkey_clone_dir, contrib_base)
         head_sha = _compare_ref(valkey_clone_dir, "HEAD")
         contributors = gc.list_contributors(
@@ -228,13 +233,13 @@ def _contrib_base(
 ) -> Optional[str]:
     """Pick the contributor-range start.
 
-    Order: explicit ``--contrib-base-ref`` -> the notes baseline -> last tag ->
-    root commit. The contributor list MUST span the same range as the bullets,
-    or the credits diverge from the notes. So whenever the notes baseline was
-    pinned (``notes_base_ref`` -- an explicit ``--base-ref`` or rc1's derived
-    previous release), it is used here *before* ``git describe``: from a branch
-    that follows valkey's fork-at-freeze model, ``describe`` returns a far older
-    nearest tag (e.g. 8.0.8 from unstable) than the real baseline (9.0.0),
+    Order: explicit ``--contrib-base-ref``, then the notes baseline, then last
+    tag, then root commit. The contributor list must span the same range as the
+    bullets, or the credits diverge from the notes. So whenever the notes
+    baseline was pinned (``notes_base_ref``, an explicit ``--base-ref`` or rc1's
+    derived previous release), it is used here before ``git describe``: on a
+    branch following valkey's fork-at-freeze model, ``describe`` returns a far
+    older nearest tag (e.g. 8.0.8 from unstable) than the real baseline (9.0.0),
     crediting a whole extra minor of history. The describe/root fallbacks remain
     for the tag-resolved path (rc2+/ga), where the notes baseline is a tag and
     ``notes_base_ref`` is None. Matches prepare_release's chain so the
@@ -261,24 +266,69 @@ def _contrib_base(
 
 
 def _compare_ref(repo_dir: str, ref: str) -> str:
-    """Resolve *ref* to a commit SHA the GitHub *compare* API can use.
+    """Resolve *ref* to a commit SHA the GitHub compare API can use.
 
     ``gen_contributors.list_contributors`` hits ``GET /compare/{base}...{head}``,
     which only accepts refs the server knows: a branch/tag name or a full commit
-    SHA. The contributor base and head we have locally are neither -- the base is
-    a remote-tracking ref (``origin/unstable``, because the clone is
+    SHA. The contributor base and head we have locally are neither. The base is a
+    remote-tracking ref (``origin/unstable``, because the clone is
     ``--branch <source>`` so other branches exist only as ``origin/<name>``) and
     the head is the literal ``HEAD``. Both resolve fine for git but 404 the
-    compare API, which silently drops it to the ``git shortlog`` fallback:
-    names-only, no ``@handle``, and no ``[bot]`` filtering. Dereferencing each to
-    its SHA here keeps the API path -- and thus the ``Full Name @handle`` format
-    -- working. Falls back to the ref as given if it cannot be resolved (e.g. no
+    compare API, which silently drops to the ``git shortlog`` fallback:
+    names-only, no ``@handle``, no ``[bot]`` filtering. Dereferencing each to its
+    SHA here keeps the API path, and thus the ``Full Name @handle`` format,
+    working. Falls back to the ref as given if it cannot be resolved (e.g. no
     local clone), so the contributor step degrades rather than crashing.
     """
     try:
         return git_output(repo_dir, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}").strip() or ref
     except subprocess.CalledProcessError:
         return ref
+
+
+def _credited_pr_numbers(notes_text: str) -> set[int]:
+    """Return the PR numbers a release-line changelog already credits.
+
+    Reads every bullet line's trailing ``(#N)`` from *notes_text* (a destination
+    changelog: the dated sections of pre-release-M.m.p or M.m). This is the dedup
+    key for promotion. Upstream, discovery excludes prior-RC PRs via the RC tag
+    it walks back to, but the agent never pushes those tags and a fork carries
+    none, so on GA (or any continued cut) discovery re-walks the whole source
+    branch and re-finds PRs the line already shipped. Deduping the cut's bullets
+    against this set makes promotion idempotent regardless of tags: a PR the line
+    already lists is dropped instead of double-noted.
+    """
+    credited: set[int] = set()
+    for line in notes_text.splitlines():
+        if not _BULLET_LINE_RE.match(line):
+            continue
+        m = _TRAILING_PR_RE.search(line)
+        if m:
+            credited.add(int(m.group(1)))
+    return credited
+
+
+def _drop_already_credited(source_notes_text: str, credited: set[int]) -> tuple[str, list[int]]:
+    """Drop bullets whose trailing ``(#N)`` is in *credited* from the source block.
+
+    Returns ``(filtered_text, dropped_numbers)``. Only bullet lines are touched;
+    headers, prose, and blank lines pass through unchanged, so the block still
+    renders through the canonical format. A category left with no bullets stays
+    as an empty ``### Header``; promote() and the format module already omit
+    empty categories from the dated section, so no extra cleanup is needed here.
+    """
+    if not credited:
+        return source_notes_text, []
+    kept: list[str] = []
+    dropped: list[int] = []
+    for line in source_notes_text.split("\n"):
+        if _BULLET_LINE_RE.match(line):
+            m = _TRAILING_PR_RE.search(line)
+            if m and int(m.group(1)) in credited:
+                dropped.append(int(m.group(1)))
+                continue
+        kept.append(line)
+    return "\n".join(kept), dropped
 
 
 def _read(path: str) -> str:
@@ -312,10 +362,10 @@ def cut(
 ) -> int:
     """Cut a release: regenerate source notes with AI, drain onto the release line, open PRs.
 
-    ``source_clone_dir`` is a clone of the *source* branch (where the
-    ``## Unreleased`` block accumulates); it doubles as ``valkey_clone_dir`` for
-    loading the release primitives. The destination release branch is
-    materialized in a worktree under it. Returns 0 on success, 1 on failure.
+    ``source_clone_dir`` is a clone of the source branch; it doubles as
+    ``valkey_clone_dir`` for loading the release primitives. The destination
+    release branch is materialized in a worktree under it. Returns 0 on success,
+    1 on failure.
     """
     plan = resolve_branch_plan(
         source_clone_dir, version=version, stage=stage, source_ref=source_ref
@@ -337,9 +387,9 @@ def cut(
         return 1
     source_notes = regen.updated_text  # source block now carries the fresh bullets
 
-    # 2. Materialize a throwaway worktree at the release line's base. We do NOT
-    #    check out (or force-push) the real release branch: instead we build the
-    #    promoted commit on an agent-namespaced prep branch and PR it INTO the
+    # 2. Materialize a throwaway worktree at the release line's base. We never
+    #    check out (or force-push) the real release branch; instead we build the
+    #    promoted commit on an agent-namespaced prep branch and PR it into the
     #    release line, so the line only advances when a human merges. The prep
     #    branch starts from origin/<base_ref> so the PR diff is exactly the cut.
     run_git(source_clone_dir, "fetch", "origin", plan.base_ref, env=git_env)
@@ -353,7 +403,27 @@ def cut(
         dest_notes_text = _read(dest_notes_path) if plan.continuing else ""
         dest_version_text = _read(os.path.join(dest_dir, VERSION_FILE))
 
-        # Anchor contributors to the SAME baseline the bullets used (regen.base_tag
+        # Drop bullets the destination changelog already credits. The tag-based
+        # dedup in discovery cannot engage without RC tags (the agent never
+        # pushes them; a fork has none), so a continued cut (most visibly GA
+        # after the final RC) otherwise re-notes every PR the line already
+        # shipped. With nothing new, the dated section renders empty (heading +
+        # version bump only) and the PR body says so. This is a no-op upstream,
+        # where discovery already returns only new PRs.
+        already_credited = sorted(
+            _credited_pr_numbers(dest_notes_text)
+            & _credited_pr_numbers(source_notes)
+        )
+        if already_credited:
+            source_notes, _dropped = _drop_already_credited(
+                source_notes, set(already_credited)
+            )
+            logger.info(
+                "Dropped %d PR(s) already credited on %s: %s",
+                len(already_credited), plan.target, already_credited,
+            )
+
+        # Anchor contributors to the same baseline the bullets used (regen.base_tag
         # is the resolved tag for rc2+/ga, or the pinned base_ref / rc1 default),
         # so the credits never span a different range than the notes.
         contrib_base = _contrib_base(
@@ -373,7 +443,7 @@ def cut(
         )
 
         if dry_run:
-            _print_dry_run(plan, version, new_dest_notes, new_version, regen)
+            _print_dry_run(plan, version, new_dest_notes, new_version, regen, already_credited)
             return 0
 
         # 4. Ensure the release line exists to PR into. When starting a new line
@@ -386,14 +456,15 @@ def cut(
 
         # 5. Commit the promoted notes + bumped version on the prep branch, push
         #    it (agent-namespaced, force-with-lease), and PR it into the line. The
-        #    source branch is never modified -- there is no ## Unreleased block to
-        #    empty, so no companion PR; each cut rediscovers PRs from the last RC
+        #    source branch is never modified: there is no ## Unreleased block to
+        #    empty, so no companion PR. Each cut rediscovers PRs from the last RC
         #    tag, so prior RCs' PRs are excluded by the graph range, not by reset.
         _write(dest_notes_path, new_dest_notes)
         _write(os.path.join(dest_dir, VERSION_FILE), new_version)
         release_url = _commit_push_release_pr(
             repo, dest_dir, repo_full_name=repo_full_name, plan=plan,
-            version=version, prep_branch=prep_branch, triage=regen.triage, git_env=git_env,
+            version=version, prep_branch=prep_branch, triage=regen.triage,
+            already_credited=already_credited, git_env=git_env,
         )
         # 6. GA rename: delete the old pre-release branch (best-effort). The M.m
         #    line was created from it above, so its history is already carried.
@@ -406,11 +477,13 @@ def cut(
         run_git(source_clone_dir, "worktree", "remove", "--force", dest_dir)
 
 
-def _print_dry_run(plan, version, dest_notes, version_h, regen) -> None:
+def _print_dry_run(plan, version, dest_notes, version_h, regen, already_credited) -> None:
     print(f"\n===== release plan ({version} {plan.stage}) =====")
     print(f"target branch: {plan.target}  base: {plan.base_ref}  continuing: {plan.continuing}")
     if plan.rename_from:
         print(f"GA rename: would delete {plan.rename_from}")
+    if already_credited:
+        print(f"already credited on {plan.target} (dropped): {already_credited}")
     if regen.triage:
         print(f"triage PRs (untagged): {[p.number for p in regen.triage]}")
     print(f"\n===== {NOTES_FILE} (release branch, dry run) =====\n{dest_notes}")
@@ -419,16 +492,18 @@ def _print_dry_run(plan, version, dest_notes, version_h, regen) -> None:
 
 def _commit_push_release_pr(
     repo: Any, dest_dir: str, *, repo_full_name: str, plan: BranchPlan, version: str,
-    prep_branch: str, triage: Sequence[Any], git_env: dict[str, str],
+    prep_branch: str, triage: Sequence[Any], already_credited: Sequence[int],
+    git_env: dict[str, str],
 ) -> str:
     """Commit the cut on the prep branch, push it, and open/update a PR into the line.
 
-    The PR is ``head=prep_branch`` -> ``base=plan.target`` (the release line), so
-    it shows exactly the promoted diff and merges *into* the line -- never the
-    self-referential / merge-back-into-source shape the release line must avoid.
+    The PR is ``head=prep_branch`` into ``base=plan.target`` (the release line),
+    so it shows exactly the promoted diff and merges into the line, never the
+    self-referential merge-back-into-source shape the release line must avoid.
     The prep branch is agent-namespaced, so force-with-lease on it is safe.
     *triage* (untagged / double-labelled PRs in range) is listed in the PR body
-    for a maintainer to label.
+    for a maintainer to label. *already_credited* (PRs the line already lists,
+    dropped from this cut) is surfaced so an empty dated section is explained.
     """
     run_git(dest_dir, "config", "user.name", BOT_NAME)
     run_git(dest_dir, "config", "user.email", BOT_EMAIL)
@@ -446,6 +521,7 @@ def _commit_push_release_pr(
         f"`src/version.h`, and refreshes the running contributor list.\n"
         + (f"- GA: carries `{plan.rename_from}`'s history; that branch is deleted by this run.\n"
            if plan.rename_from else "")
+        + _no_new_prs_section(already_credited, plan)
         + _triage_section(triage)
         + "\n*Generated by valkey-ci-agent. Review before merging into the release line.*"
     )
@@ -455,6 +531,27 @@ def _commit_push_release_pr(
     return publish_mod.open_or_update_pr(
         repo, base_repo=repo_full_name, push_repo=None, branch=prep_branch,
         base_branch=plan.target, title=title, body=body, existing=existing,
+    )
+
+
+def _no_new_prs_section(already_credited: Sequence[int], plan: BranchPlan) -> str:
+    """Warn in the PR body when every PR in range was already credited on the line.
+
+    Returns an empty string unless some PR was dropped as a duplicate. When the
+    drop leaves the dated section with no bullets (the common GA-after-final-RC
+    case), the cut is version-bump-only, and the reader needs to know the empty
+    notes are intentional rather than a generation miss.
+    """
+    if not already_credited:
+        return ""
+    refs = ", ".join(f"#{n}" for n in already_credited)
+    return (
+        "\n### No new release notes\n\n"
+        f"Every release-noted PR in range is already credited on `{plan.target}` "
+        f"(carried from an earlier cut): {refs}. They were dropped to avoid "
+        "duplicate entries, so this cut only adds the dated heading and the "
+        "`src/version.h` bump. If you expected new notes here, confirm the new "
+        "PRs merged into the source branch and carry the `release-notes` label.\n"
     )
 
 

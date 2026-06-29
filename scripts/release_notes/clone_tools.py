@@ -1,7 +1,7 @@
 """Load valkey's ``utils/releasetools`` modules from a clone at runtime.
 
 The release-notes format and the release-cut primitives (promotion, version
-bump, contributor list) are **authoritative in the valkey repo**. Rather than
+bump, contributor list) are authoritative in the valkey repo. Rather than
 duplicate them, the agent imports them from the clone by file path so a change
 upstream flows through automatically and the agent can never disagree with the
 format the release tooling parses.

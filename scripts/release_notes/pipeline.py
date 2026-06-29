@@ -1,10 +1,9 @@
 """Shared AI-notes pipeline: discover -> classify -> generate -> render.
 
-Both the per-PR accumulation flow (:mod:`main`) and the release cut
-(:mod:`release_cut`) need the same step: take a release line's clone, find the
-labelled PRs merged since its last tag, and produce the updated
-``00-RELEASENOTES`` text with a freshly AI-written ``## Unreleased`` block.
-This module owns that step so the two entry points cannot drift.
+The release cut (:mod:`release_cut`) needs one step: take a release line's
+clone, find the labelled PRs merged since its last tag, and produce the updated
+``00-RELEASENOTES`` text with a freshly AI-written ``## Unreleased`` block. This
+module owns that step.
 """
 
 from __future__ import annotations
@@ -47,7 +46,7 @@ def regenerate_unreleased(
     """Discover the range, generate bullets, and render the updated notes text.
 
     Reads (does not write) ``clone_dir``'s ``00-RELEASENOTES``. Returns a
-    :class:`RegenResult`; the cut caller promotes ``updated_text`` regardless of
+    :class:`RegenResult`. The cut caller promotes ``updated_text`` regardless of
     whether the range was empty (an RC->GA with no intervening PRs is a valid
     cut), but consults ``bullet_count``/``wipes_existing`` as a safety net and
     ``triage`` for the PR body.
@@ -80,7 +79,7 @@ def regenerate_unreleased(
     updated = render_mod.apply_to_file(existing, grouped, fmt)
 
     # Would writing this blank an already-populated block? True only when there
-    # are no bullets AND resetting the block changes the file (i.e. it had content).
+    # are no bullets and resetting the block changes the file (i.e. it had content).
     wipes = not grouped and render_mod.apply_to_file(existing, {}, fmt) != existing
 
     return RegenResult(

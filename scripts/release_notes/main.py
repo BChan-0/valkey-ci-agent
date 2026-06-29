@@ -1,14 +1,14 @@
 """Entry point for the AI release-notes cut.
 
 Driven by ``workflow_dispatch``: a maintainer supplies the source branch
-(``--head-ref``), the target ``--version``/``--stage``/``--urgency``, and the
+(``--head-ref``) and the target ``--version``/``--stage``/``--urgency``, and the
 agent cuts the release in one shot. There is no accumulated ``## Unreleased``
-block -- the notes for a release are generated all at once from the labelled
-PRs in range, promoted into a dated section, and the version is bumped.
+block; the notes for a release are generated all at once from the labelled PRs
+in range, promoted into a dated section, and the version is bumped.
 
-Pipeline: clone valkey (full depth + tags) -> :mod:`discover` the range (the
+Pipeline: clone valkey (full depth + tags), :mod:`discover` the range (the
 ``release-notes``-labelled PRs from HEAD back to the most recent reachable RC
-tag) -> :mod:`generate` bullets via Claude/Bedrock -> :mod:`release_cut`
+tag), :mod:`generate` bullets via Claude/Bedrock, then :mod:`release_cut`
 promotes them onto the release line (dated section + ``src/version.h`` bump +
 running contributor list, draining prior RCs) and opens the PR.
 
@@ -46,7 +46,7 @@ logger = logging.getLogger(__name__)
 # RELEASE_NOTES_ prefix mirrors the CI_FIX_/FUZZER_ convention.
 # EDIT BEFORE PR: change the default repo back to valkey-io/valkey. Pointed at
 # the BChan-0 fork for fork testing (the workflow also passes RELEASE_NOTES_REPO
-# explicitly, so this default only matters for a bare CLI invocation).
+# explicitly, so this default only matters for a bare CLI run).
 _REPO = os.environ.get("RELEASE_NOTES_REPO", "BChan-0/valkey")
 _HEAD_REF = os.environ.get("RELEASE_NOTES_HEAD_REF", "")
 _TAG_GLOB = os.environ.get("RELEASE_NOTES_TAG_GLOB", "")
@@ -66,13 +66,13 @@ def _default_tag_glob(version: str, stage: str) -> str | None:
     """Derive the baseline-tag match glob for this cut, or None.
 
     ``git describe`` returns the tag with the shortest graph distance to HEAD
-    *regardless of release line*, so a glob is needed to pin the baseline to the
+    regardless of release line, so a glob is needed to pin the baseline to the
     intended boundary. The boundary depends on the stage:
 
-    * **rc2+** -- the prior RC of *this* version: ``<version>-rc*`` (so a cut of
+    * rc2+: the prior RC of this version, ``<version>-rc*`` (so a cut of
       9.1.0-rc3 walks back only to 9.1.0-rc2).
-    * **rc1 / ga / anything else** -- ``None``. rc1 has no prior same-version RC
-      to anchor to (there is no rc0), and its true baseline is the *previous*
+    * rc1 / ga / anything else: ``None``. rc1 has no prior same-version RC to
+      anchor to (there is no rc0), and its true baseline is the previous
       release, which is not reachable from the source branch in valkey's
       fork-at-freeze model. So rc1 cannot resolve a tag automatically and must
       use ``--base-ref`` (see :func:`_default_base_ref_for_rc1`); ga continues an
@@ -93,8 +93,8 @@ def _default_base_ref_for_rc1(version: str) -> str | None:
     """Best-effort previous-release baseline for an rc1 cut, e.g. 9.1.0 -> 9.0.0.
 
     rc1 of ``M.m.p`` covers everything since the previous minor's GA. We can only
-    *guess* that tag's name (``M.(m-1).0``); whether it is actually reachable as
-    a range base is checked at clone time. Returns None when the version is not
+    guess that tag's name (``M.(m-1).0``); whether it is actually reachable as a
+    range base is checked at clone time. Returns None when the version is not
     ``M.m.p`` or there is no previous minor (``M.0.*``), in which case the user
     must supply ``--base-ref`` explicitly.
     """
@@ -113,7 +113,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repo", default=_REPO, help="Target repo, owner/name")
     parser.add_argument("--head-ref", default=_HEAD_REF,
                         help="Source branch whose merged PRs are cut, e.g. unstable "
-                             "(a short branch/tag name -- it is passed to `git clone --branch`)")
+                             "(a short branch/tag name, passed to `git clone --branch`)")
     parser.add_argument("--version", default=os.environ.get("RELEASE_NOTES_VERSION", ""),
                         help="Target version MAJOR.MINOR.PATCH, e.g. 9.1.0")
     parser.add_argument("--stage", default=os.environ.get("RELEASE_NOTES_STAGE", ""),
@@ -147,7 +147,7 @@ def main(argv: list[str] | None = None) -> int:
     base_ref = args.base_ref or None
 
     # rc1 has no prior same-version RC tag and, in valkey's fork-at-freeze model,
-    # no reachable release tag from the source branch -- so tag resolution can't
+    # no reachable release tag from the source branch, so tag resolution can't
     # find its baseline. rc1's true baseline is the previous release. If the user
     # did not pass --base-ref, warn loudly and default to the derived previous
     # release (M.(m-1).0); the cut still fails clearly at clone time if that ref

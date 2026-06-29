@@ -3,8 +3,8 @@
 The model does exactly one judgment job: for each included PR, write a concise,
 user-facing description and assign it to one of the canonical categories. It
 never emits the final markdown, the ``(#N)`` reference, or the ``by @handle``
-attribution -- :mod:`render` appends those in code so the format the release
-tooling parses stays authoritative here, not in model output.
+attribution; :mod:`render` appends those in code, so the format the release
+tooling parses stays authoritative there, not in model output.
 
 The call runs through the low-level :func:`run_claude_code` wrapper with
 read-only tools (``Read,Grep,Glob``; Bash/Write denied) and ``cwd`` set to the
@@ -84,9 +84,9 @@ def _parse_batch(
     """Parse one Claude response into ``(bullets, skipped, parsed_ok)``.
 
     A bullet whose ``pr`` is not in *valid_numbers* is dropped (the model must
-    not invent PRs). A bullet whose ``category`` is unknown is kept verbatim --
-    render places it after the canonical categories, matching the format
-    module's ``unrecognized_categories`` handling -- but is logged.
+    not invent PRs). A bullet whose ``category`` is unknown is kept verbatim and
+    logged; render places it after the canonical categories, matching the format
+    module's ``unrecognized_categories`` handling.
     """
     obj = extract_json_object(stdout, required_key="bullets")
     if obj is None:
@@ -133,9 +133,9 @@ def generate(
 
     ``run_fn`` is injectable for tests. A nonzero exit code from the wrapper is
     not treated as failure on its own (turn-budget exhaustion can still yield a
-    valid object); a batch is only "failed" when its output has no parseable
-    object, in which case every PR in that batch is reported as skipped so the
-    caller can see what was lost.
+    valid object); a batch fails only when its output has no parseable object,
+    in which case every PR in that batch is reported as skipped so the caller
+    can see what was lost.
     """
     if not prs:
         return GenerationResult()

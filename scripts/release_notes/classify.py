@@ -20,10 +20,10 @@ NO_RELEASE_LABEL = "no-release-notes"
 def disposition_for(labels: tuple[str, ...]) -> PRDisposition:
     """Map a PR's labels to a :class:`PRDisposition`.
 
-    ``no-release-notes`` always suppresses inclusion, so a PR carrying *both*
-    labels is a contradiction the CI check would reject -- it goes to TRIAGE,
-    never silently INCLUDE. A PR carrying neither also goes to TRIAGE so an
-    untagged change surfaces to a human rather than vanishing.
+    ``no-release-notes`` always suppresses inclusion, so a PR carrying both
+    labels is a contradiction the CI check would reject: it goes to TRIAGE, never
+    silently INCLUDE. A PR carrying neither also goes to TRIAGE so an untagged
+    change surfaces to a human rather than vanishing.
     """
     has_release = RELEASE_LABEL in labels
     has_no_release = NO_RELEASE_LABEL in labels
