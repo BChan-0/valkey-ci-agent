@@ -175,6 +175,61 @@ class TestPromoteAndBump:
         assert "### Contributors" in new_notes
         assert "Jane Doe @jane" in new_notes
 
+    def test_contributor_refs_resolved_for_compare_api(self, clone, monkeypatch) -> None:
+        # Regression: the contributor base is a remote-tracking ref
+        # (origin/unstable) and the head is the literal "HEAD". Both resolve for
+        # git but 404 the GitHub compare API, which silently drops to the
+        # names-only git-shortlog fallback. promote_and_bump must dereference both
+        # to SHAs (via _compare_ref) before calling list_contributors, so the API
+        # path -- and the "Full Name @handle" format -- is preserved.
+        source = self._source_with_bullet(clone)
+        version_text = open(os.path.join(clone, "src", "version.h"), encoding="utf-8").read()
+        captured: dict = {}
+
+        import scripts.release_notes.clone_tools as ct
+        real_load = ct.load_releasetools_module
+
+        def _fake_load(d, name):
+            mod = real_load(d, name)
+            if name == "gen_contributors":
+                def _list(repo, base, head, token, *, repo_dir=None):
+                    captured["base"] = base
+                    captured["head"] = head
+                    return ["Jane Doe @jane"]
+                mod.list_contributors = _list
+            return mod
+
+        monkeypatch.setattr(rc, "load_releasetools_module", _fake_load)
+        # Stub ref resolution so no real git repo is needed: prove the values
+        # passed to list_contributors are what _compare_ref returned, not the
+        # raw origin/unstable / HEAD refs.
+        monkeypatch.setattr(rc, "_compare_ref",
+                            lambda repo_dir, ref: {"origin/unstable": "base_sha", "HEAD": "head_sha"}[ref])
+        promote_and_bump(
+            clone, source_notes_text=source, dest_notes_text="",
+            dest_version_text=version_text, version="9.1.0", stage_lc="rc1",
+            urgency="LOW", date="2026-06-25", repo_full_name="valkey-io/valkey",
+            contrib_base="origin/unstable", token="t", security_fixes=None,
+        )
+        assert captured["base"] == "base_sha"
+        assert captured["head"] == "head_sha"  # never the literal "HEAD"
+
+    def test_compare_ref_dereferences_to_sha(self, tmp_path) -> None:
+        # _compare_ref turns a branch name into the commit SHA the compare API
+        # wants; an unresolvable ref falls back to the ref as given.
+        from scripts.common.proc import git_output, run_git
+        repo = str(tmp_path / "r")
+        os.makedirs(repo)
+        run_git(repo, "init", "-q")
+        run_git(repo, "config", "user.email", "t@e")
+        run_git(repo, "config", "user.name", "t")
+        (tmp_path / "r" / "f").write_text("x")
+        run_git(repo, "add", "f")
+        run_git(repo, "commit", "-q", "-m", "c")
+        sha = git_output(repo, "rev-parse", "HEAD").strip()
+        assert rc._compare_ref(repo, "HEAD") == sha
+        assert rc._compare_ref(repo, "no-such-ref") == "no-such-ref"  # graceful fallback
+
 
 class TestCutOrchestration:
     """End-to-end cut() with git + GitHub + pipeline mocked, real fixture worktree."""

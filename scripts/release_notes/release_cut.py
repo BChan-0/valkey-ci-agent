@@ -35,6 +35,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import subprocess
 from dataclasses import dataclass
 from typing import Any, Optional, Sequence
 
@@ -191,8 +192,14 @@ def promote_and_bump(
     contributors: list[str] = []
     if contrib_base:
         gc = load_releasetools_module(valkey_clone_dir, "gen_contributors")
+        # Resolve both ends to SHAs the GitHub compare API accepts: contrib_base
+        # is typically a remote-tracking ref (origin/unstable) and the head is the
+        # literal "HEAD" -- both 404 the API and silently fall back to git
+        # shortlog (names only, no @handle, bots not filtered). See _compare_ref.
+        base_sha = _compare_ref(valkey_clone_dir, contrib_base)
+        head_sha = _compare_ref(valkey_clone_dir, "HEAD")
         contributors = gc.list_contributors(
-            repo_full_name, contrib_base, "HEAD", token, repo_dir=valkey_clone_dir
+            repo_full_name, base_sha, head_sha, token, repo_dir=valkey_clone_dir
         )
         logger.info("Collected %d contributor(s) over %s..HEAD", len(contributors), contrib_base)
     else:
@@ -251,6 +258,27 @@ def _contrib_base(
     except Exception:  # noqa: BLE001
         pass
     return None
+
+
+def _compare_ref(repo_dir: str, ref: str) -> str:
+    """Resolve *ref* to a commit SHA the GitHub *compare* API can use.
+
+    ``gen_contributors.list_contributors`` hits ``GET /compare/{base}...{head}``,
+    which only accepts refs the server knows: a branch/tag name or a full commit
+    SHA. The contributor base and head we have locally are neither -- the base is
+    a remote-tracking ref (``origin/unstable``, because the clone is
+    ``--branch <source>`` so other branches exist only as ``origin/<name>``) and
+    the head is the literal ``HEAD``. Both resolve fine for git but 404 the
+    compare API, which silently drops it to the ``git shortlog`` fallback:
+    names-only, no ``@handle``, and no ``[bot]`` filtering. Dereferencing each to
+    its SHA here keeps the API path -- and thus the ``Full Name @handle`` format
+    -- working. Falls back to the ref as given if it cannot be resolved (e.g. no
+    local clone), so the contributor step degrades rather than crashing.
+    """
+    try:
+        return git_output(repo_dir, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}").strip() or ref
+    except subprocess.CalledProcessError:
+        return ref
 
 
 def _read(path: str) -> str:
