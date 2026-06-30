@@ -46,14 +46,23 @@ def get_latest_daily_run(
         logger.warning("Workflow %r not found in %s", workflow_name, repo_full_name)
         return None
 
+    # Restrict to scheduled runs. The Valkey Daily workflow also runs on 
+    # pull_request (and fork PRs sit at action_required with no artifacts), 
+    # so we'd sometimes silently analyze the wrong run.
     runs = retry_github_call(
-        lambda: daily_workflow.get_runs(branch=branch, status="completed"),
+        lambda: daily_workflow.get_runs(
+            branch=branch, status="completed", event="schedule",
+        ),
         retries=3,
         description=f"list runs for {workflow_name}",
     )
 
     for run in runs:
-        if run.conclusion in ("cancelled", "skipped", None):
+        # Skip runs that never actually executed: cancelled/skipped, runs
+        # awaiting approval (action_required, e.g. fork PRs) or expired
+        # (stale), and runs with no conclusion yet. These produce no test
+        # artifacts and would be mistaken for a clean pass.
+        if run.conclusion in ("cancelled", "skipped", "action_required", "stale", None):
             logger.debug(
                 "Skipping run #%d (conclusion=%s)", run.run_number, run.conclusion,
             )
