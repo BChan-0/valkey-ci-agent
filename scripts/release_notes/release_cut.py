@@ -149,7 +149,7 @@ def _warn_rc_sequence(
     requested = int(m.group(1))
     try:
         run_git(repo_dir, "fetch", "--quiet", "origin", pre_branch)
-        notes = git_output(repo_dir, "show", "FETCH_HEAD:00-RELEASENOTES")
+        notes = git_output(repo_dir, "show", f"FETCH_HEAD:{NOTES_FILE}")
     except Exception:  # noqa: BLE001 - best-effort; absence just means "no prior rc"
         return None
     pattern = re.compile(_DATED_RC_RE_TMPL.format(major=major, minor=minor, patch=patch), re.MULTILINE)
@@ -272,7 +272,7 @@ def promote_and_bump(
 
 
 def _contrib_base(
-    repo_dir: str, *, explicit: Optional[str], notes_base_ref: Optional[str], plan: BranchPlan
+    repo_dir: str, *, explicit: Optional[str], notes_base_ref: Optional[str]
 ) -> Optional[str]:
     """Pick the contributor-range start.
 
@@ -471,7 +471,7 @@ def cut(
         # so the credits never span a different range than the notes.
         contrib_base = _contrib_base(
             source_clone_dir, explicit=contrib_base_ref,
-            notes_base_ref=regen.base_tag, plan=plan,
+            notes_base_ref=regen.base_tag,
         )
 
         # 3. Drain source bullets -> dated section on dest; bump version.h.

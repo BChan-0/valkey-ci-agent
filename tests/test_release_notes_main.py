@@ -113,6 +113,13 @@ class TestDefaultTagGlob:
     def test_non_version_is_none(self) -> None:
         assert main_mod._default_tag_glob("9.1", "rc2") is None
 
+    def test_case_insensitive(self) -> None:
+        # A maintainer dispatching "RC2" must still get the rc glob; "RC1" still
+        # has no glob (rc1 has no rc0 to anchor to, regardless of case).
+        assert main_mod._default_tag_glob("9.1.0", "RC2") == "9.1.0-rc*"
+        assert main_mod._default_tag_glob("9.1.0", "Rc10") == "9.1.0-rc*"
+        assert main_mod._default_tag_glob("9.1.0", "RC1") is None
+
 
 class TestDefaultBaseRefForRc1:
     def test_previous_minor_ga(self) -> None:
@@ -147,6 +154,18 @@ def test_rc1_without_base_ref_warns_and_defaults(patched, caplog):
     assert captured["base_ref"] == "9.0.0"
     assert captured["tag_glob"] is None
     assert any("rc1" in r.message and "9.0.0" in r.message for r in caplog.records)
+
+
+def test_rc1_uppercase_stage_still_defaults_base_ref(patched, caplog):
+    # The rc1 base-ref default keys on a lowercased stage, so "RC1" must trigger
+    # the previous-release default and suppress the doomed glob just like "rc1".
+    captured = _capture_cut(patched)
+    import logging
+    with caplog.at_level(logging.WARNING):
+        main(["--token", "t", "--head-ref", "unstable",
+              "--version", "9.1.0", "--stage", "RC1", "--urgency", "LOW"])
+    assert captured["base_ref"] == "9.0.0"
+    assert captured["tag_glob"] is None
 
 
 def test_rc1_with_explicit_base_ref_no_override(patched, caplog):

@@ -30,6 +30,32 @@ def clone(tmp_path):
     return str(dest)
 
 
+class TestNormalizeStage:
+    """Stage is case-insensitive: RC1/GA/Rc2 normalize to rc1/ga/rc2.
+
+    _normalize_stage is the single normalization choke point feeding plan.stage;
+    commit_title/stage_release_name/branch names all consume that normalized
+    value (they do not lowercase their own argument), so this guards the whole
+    cut against a maintainer dispatching an uppercase stage.
+    """
+
+    def test_uppercase_rc_lowercased(self) -> None:
+        assert rc._normalize_stage("RC1") == "rc1"
+        assert rc._normalize_stage("Rc2") == "rc2"
+        assert rc._normalize_stage("RC10") == "rc10"
+
+    def test_uppercase_ga_lowercased(self) -> None:
+        assert rc._normalize_stage("GA") == "ga"
+        assert rc._normalize_stage("Ga") == "ga"
+
+    def test_surrounding_whitespace_stripped(self) -> None:
+        assert rc._normalize_stage("  RC1  ") == "rc1"
+
+    def test_invalid_mixed_case_still_rejected(self) -> None:
+        with pytest.raises(ValueError):
+            rc._normalize_stage("Beta")
+
+
 class TestStageHelpers:
     def test_release_name_rc(self) -> None:
         assert stage_release_name("9.1.0", "rc2") == "9.1.0-rc2"
@@ -53,6 +79,22 @@ class TestResolveBranchPlan:
         self._exists(monkeypatch, set())
         plan = resolve_branch_plan("/d", version="9.1.0", stage="rc1", source_ref="unstable")
         assert plan == BranchPlan("rc1", "pre-release-9.1.0", "unstable", False, None)
+
+    def test_uppercase_rc1_normalizes_and_routes_to_pre_release(self, monkeypatch) -> None:
+        # A maintainer dispatching "RC1" must resolve exactly like "rc1": the
+        # plan's stage is the lowercased value, so every downstream name is too.
+        self._exists(monkeypatch, set())
+        plan = resolve_branch_plan("/d", version="9.1.0", stage="RC1", source_ref="unstable")
+        assert plan == BranchPlan("rc1", "pre-release-9.1.0", "unstable", False, None)
+
+    def test_uppercase_ga_normalizes_and_fires_rename(self, monkeypatch) -> None:
+        # "GA" must route to the M.m line and fire the pre-release rename, not be
+        # compared raw (which would skip the ga branch and cut onto the rc line).
+        self._exists(monkeypatch, {"pre-release-9.1.0"})
+        plan = resolve_branch_plan("/d", version="9.1.0", stage="GA", source_ref="unstable")
+        assert plan.stage == "ga"
+        assert plan.target == "9.1"
+        assert plan.rename_from == "pre-release-9.1.0"
 
     def test_rcN_continues_pre_release(self, monkeypatch) -> None:
         self._exists(monkeypatch, {"pre-release-9.1.0"})
@@ -383,6 +425,36 @@ class TestCutOrchestration:
         assert not any("HEAD:unstable" in " ".join(c) or ":refs/heads/unstable" in " ".join(c)
                        for c in pushed)
 
+    def test_uppercase_ga_cuts_minor_line_with_lowercased_names(self, monkeypatch, clone):
+        # End-to-end: a dispatch of "GA" must route to the M.m line and emit the
+        # GA-titled commit, with the prep branch lowercased. commit_title and
+        # stage_release_name do not normalize their own argument, so this proves
+        # resolve_branch_plan's normalization holds across the whole cut() path.
+        from unittest.mock import MagicMock
+        calls = self._setup(monkeypatch, clone, line_exists={"pre-release-9.1.0": True})
+        repo = MagicMock()
+        repo.get_pulls.return_value = []
+        created = []
+
+        def _create_pull(**kw):
+            created.append(kw)
+            return MagicMock(number=1, html_url="https://x/1")
+
+        repo.create_pull.side_effect = _create_pull
+        monkeypatch.setattr(rc.publish_mod, "retry_github_call", lambda op, **k: op())
+
+        rc.cut(
+            repo, repo_full_name="valkey-io/valkey", source_clone_dir=clone,
+            valkey_clone_dir=clone, source_ref="unstable", version="9.1.0", stage="GA",
+            urgency="LOW", date="2026-06-25", tag_glob=None, base_ref=None, contrib_base_ref=None,
+            security_fixes=None, token="t", git_env={}, dry_run=False,
+        )
+        assert created[0]["base"] == "9.1"                          # M.m line, not pre-release
+        assert created[0]["head"] == "agent/release-cut/9.1.0-ga"   # prep branch lowercased
+        assert created[0]["title"] == "Add release notes entry for Valkey 9.1.0 GA"
+        # No raw "-GA" leaks into the prep-branch push refspec.
+        assert not any("9.1.0-GA" in " ".join(c) for c in calls if c[:1] == ("push",))
+
     def test_triage_listed_in_release_pr_body(self, monkeypatch, clone):
         from unittest.mock import MagicMock
 
@@ -586,12 +658,9 @@ class TestCutOrchestration:
 
 
 class TestContribBase:
-    _PLAN = BranchPlan("rc1", "pre-release-9.1.0", "unstable", False, None)
-
     def test_explicit_wins(self, monkeypatch) -> None:
         # Explicit --contrib-base-ref beats even the notes baseline.
-        assert rc._contrib_base("/d", explicit="9.0.0", notes_base_ref="9.0.1",
-                                plan=self._PLAN) == "9.0.0"
+        assert rc._contrib_base("/d", explicit="9.0.0", notes_base_ref="9.0.1") == "9.0.0"
 
     def test_notes_base_ref_used_before_describe(self, monkeypatch) -> None:
         # The fix: the notes baseline anchors contributors, ahead of git describe.
@@ -599,16 +668,14 @@ class TestContribBase:
         def _git(d, *a):
             raise AssertionError(f"git should not run when notes_base_ref is set: {a}")
         monkeypatch.setattr(rc, "git_output", _git)
-        assert rc._contrib_base("/d", explicit=None, notes_base_ref="9.0.0",
-                                plan=self._PLAN) == "9.0.0"
+        assert rc._contrib_base("/d", explicit=None, notes_base_ref="9.0.0") == "9.0.0"
 
     def test_falls_back_to_last_tag_when_no_baseline(self, monkeypatch) -> None:
         # rc2+/ga path: notes baseline is a tag passed through, but if None we
         # still resolve via describe.
         monkeypatch.setattr(rc, "git_output",
                             lambda d, *a: "9.0.5\n" if a[0] == "describe" else "")
-        assert rc._contrib_base("/d", explicit=None, notes_base_ref=None,
-                                plan=self._PLAN) == "9.0.5"
+        assert rc._contrib_base("/d", explicit=None, notes_base_ref=None) == "9.0.5"
 
     def test_falls_back_to_root_commit(self, monkeypatch) -> None:
         def _git(d, *a):
@@ -618,8 +685,7 @@ class TestContribBase:
                 return "rootsha\n"
             return ""
         monkeypatch.setattr(rc, "git_output", _git)
-        assert rc._contrib_base("/d", explicit=None, notes_base_ref=None,
-                                plan=self._PLAN) == "rootsha"
+        assert rc._contrib_base("/d", explicit=None, notes_base_ref=None) == "rootsha"
 
 
 class TestDedupAgainstDestination:

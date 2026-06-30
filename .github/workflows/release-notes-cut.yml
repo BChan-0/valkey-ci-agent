@@ -84,6 +84,11 @@ jobs:
       id-token: write
     concurrency:
       # One cut per version+stage; a re-run replaces the release branch tip.
+      # NOTE: stage is interpolated raw here (GitHub expressions have no lower()),
+      # so a dispatch of "RC1" and one of "rc1" land in different groups. They
+      # still cut the same line — the prep-branch push is force-with-lease and the
+      # PR is reused — so the only effect is that two same-version dispatches
+      # differing solely in stage case won't serialize against each other.
       group: release-cut-${{ inputs.version }}-${{ inputs.stage }}
       cancel-in-progress: false
     env:
@@ -129,8 +134,9 @@ jobs:
       #     private-key: ${{ secrets.VALKEYRIE_BOT_PRIVATE_KEY }}
       #     owner: valkey-io
       #     repositories: valkey
-      #     # contents:write to push the release + reset branches; pull-requests:write
-      #     # to open both PRs; metadata:read is always required.
+      #     # contents:write to push the prep branch and create/delete release
+      #     # lines; pull-requests:write to open the release PR; metadata:read is
+      #     # always required.
       #     permission-contents: write
       #     permission-pull-requests: write
       #     permission-metadata: read
@@ -167,10 +173,16 @@ jobs:
             echo "Invalid version (want MAJOR.MINOR.PATCH): ${RELEASE_NOTES_VERSION}" >&2
             exit 1
           fi
-          if [[ ! "${RELEASE_NOTES_STAGE}" =~ ^(ga|rc[1-9][0-9]*)$ ]]; then
+          # Stage is case-insensitive: lowercase it (RC1/GA/Rc2 -> rc1/ga/rc2)
+          # before the gate, and re-export so Python reads one canonical form.
+          # The Python layer also lowercases, but normalizing here keeps the gate
+          # and every downstream value (version.h, branch names, titles) aligned.
+          stage_lc="${RELEASE_NOTES_STAGE,,}"
+          if [[ ! "${stage_lc}" =~ ^(ga|rc[1-9][0-9]*)$ ]]; then
             echo "Invalid stage (want ga or rcN): ${RELEASE_NOTES_STAGE}" >&2
             exit 1
           fi
+          export RELEASE_NOTES_STAGE="${stage_lc}"
           args=(-m scripts.release_notes.main)
           if [[ "${{ inputs.dry_run }}" == "true" ]]; then
             args+=(--dry-run)
