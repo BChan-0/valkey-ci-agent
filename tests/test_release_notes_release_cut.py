@@ -351,6 +351,63 @@ class TestCutOrchestration:
                        if c[:1] == ("push",) and "refs/heads/pre-release-9.1.0" in " ".join(c)]
         assert line_create == []
 
+    def test_recut_fetches_prep_branch_before_force_with_lease(self, monkeypatch, clone):
+        # A re-cut of the same stage finds the agent-namespaced prep branch already
+        # on the remote. The fresh clone never fetched it, so --force-with-lease has
+        # no basis and would reject with "stale info". Assert the prep branch is
+        # fetched (populating the tracking ref) immediately before the lease push.
+        from unittest.mock import MagicMock
+        prep = "agent/release-cut/9.1.0-rc2"
+        calls = self._setup(
+            monkeypatch, clone,
+            line_exists={"pre-release-9.1.0": True, prep: True},
+        )
+        monkeypatch.setattr(rc, "_warn_rc_sequence", lambda *a, **k: None)
+        repo = MagicMock()
+        repo.get_pulls.return_value = []
+        repo.create_pull.return_value = MagicMock(number=2, html_url="https://x/2")
+        monkeypatch.setattr(rc.publish_mod, "retry_github_call", lambda op, **k: op())
+
+        rc.cut(
+            repo, repo_full_name="valkey-io/valkey", source_clone_dir=clone,
+            valkey_clone_dir=clone, source_ref="unstable", version="9.1.0", stage="rc2",
+            urgency="LOW", date="2026-06-25", tag_glob=None, base_ref=None, contrib_base_ref=None,
+            security_fixes=None, token="t", git_env={}, dry_run=False,
+        )
+        refspec = f"+refs/heads/{prep}:refs/remotes/origin/{prep}"
+        fetch_idx = next(
+            (i for i, c in enumerate(calls)
+             if c[:2] == ("fetch", "origin") and refspec in c),
+            None,
+        )
+        assert fetch_idx is not None, calls
+        lease_idx = next(
+            i for i, c in enumerate(calls)
+            if c[:2] == ("push", "--force-with-lease") and f"HEAD:{prep}" in c
+        )
+        # The fetch must precede the lease push so the tracking ref is current.
+        assert fetch_idx < lease_idx, (fetch_idx, lease_idx)
+
+    def test_first_cut_skips_prep_fetch(self, monkeypatch, clone):
+        # On a first cut the prep branch is absent, so there is no tracking ref to
+        # refresh; the push creates it. No prep-branch fetch should be issued.
+        from unittest.mock import MagicMock
+        calls = self._setup(monkeypatch, clone, line_exists={})
+        repo = MagicMock()
+        repo.get_pulls.return_value = []
+        repo.create_pull.return_value = MagicMock(number=1, html_url="https://x/1")
+        monkeypatch.setattr(rc.publish_mod, "retry_github_call", lambda op, **k: op())
+
+        rc.cut(
+            repo, repo_full_name="valkey-io/valkey", source_clone_dir=clone,
+            valkey_clone_dir=clone, source_ref="unstable", version="9.1.0", stage="rc1",
+            urgency="LOW", date="2026-06-25", tag_glob=None, base_ref=None, contrib_base_ref=None,
+            security_fixes=None, token="t", git_env={}, dry_run=False,
+        )
+        prep_fetch = [c for c in calls
+                      if c[:2] == ("fetch", "origin") and "refs/remotes/origin/agent/release-cut" in " ".join(c)]
+        assert prep_fetch == [], prep_fetch
+
     def test_dry_run_pushes_nothing(self, monkeypatch, clone):
         from unittest.mock import MagicMock
         calls = self._setup(monkeypatch, clone, line_exists={})

@@ -511,6 +511,16 @@ def _commit_push_release_pr(
     run_git(dest_dir, "commit", "-s", "-m", commit_title(version, plan.stage))
     if not prep_branch.startswith(f"{PREP_BRANCH_PREFIX}/"):
         raise RuntimeError(f"Refusing to push to non-namespaced prep branch: {prep_branch!r}")
+    # Give --force-with-lease a valid basis. The fresh `git clone --branch <source_ref>`
+    # never fetched this agent-namespaced prep branch, so its remote-tracking ref is
+    # absent and the implicit lease expects "branch absent". A prep branch left by an
+    # earlier cut of the same stage is present on the remote, so that mismatch rejects
+    # the push with "stale info". Fetch it (explicit refspec updates the tracking ref,
+    # not just FETCH_HEAD) so the lease matches the real remote tip and the overwrite
+    # is accepted; on a first cut the branch is absent and the push creates it.
+    if _remote_branch_exists(dest_dir, prep_branch):
+        run_git(dest_dir, "fetch", "origin",
+                f"+refs/heads/{prep_branch}:refs/remotes/origin/{prep_branch}", env=git_env)
     run_git(dest_dir, "push", "--force-with-lease", "origin", f"HEAD:{prep_branch}", env=git_env)
 
     title = commit_title(version, plan.stage)
