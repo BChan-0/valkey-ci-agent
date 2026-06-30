@@ -1,6 +1,6 @@
 """Cut a release: generate notes, promote them, bump the version, drain prior RCs.
 
-Each cut regenerates the notes from the labelled PRs in range and promotes them 
+Each cut regenerates the notes from the labelled PRs in range and promotes them
 in one shot. The orchestration mirrors valkey's
 ``utils/releasetools/prepare_release.py`` but reuses that repo's primitives
 (``promote``, ``set_version``, ``version_num``, ``list_contributors``), loaded
@@ -76,6 +76,7 @@ class BranchPlan:
     base_ref: str              # ref the target is (re)based on
     continuing: bool           # True if the target line already exists (drain prior notes)
     rename_from: Optional[str]  # pre-release branch to delete after a GA rename, else None
+    rc_warning: Optional[str] = None  # set when the requested rc is out of sequence (surfaced in the PR body)
 
 
 def _split_version(version: str) -> tuple[int, int, int]:
@@ -122,37 +123,79 @@ def resolve_branch_plan(repo_dir: str, *, version: str, stage: str, source_ref: 
 
     # rc stages
     if _remote_branch_exists(repo_dir, pre_branch):
-        _warn_rc_sequence(repo_dir, pre_branch, stage_lc, major, minor, patch)
-        return BranchPlan(stage_lc, pre_branch, pre_branch, True, None)
-    return BranchPlan(stage_lc, pre_branch, source_ref, False, None)
+        warning = _warn_rc_sequence(repo_dir, pre_branch, stage_lc, major, minor, patch)
+        return BranchPlan(stage_lc, pre_branch, pre_branch, True, None, warning)
+    # No pre-release line yet, so this is the first cut of it: only rc1 belongs
+    # here. rc2+ means an earlier rc was never cut (or its line was lost), which
+    # is almost certainly a mis-dispatched stage.
+    warning = _warn_rc_first_cut(stage_lc, pre_branch)
+    return BranchPlan(stage_lc, pre_branch, source_ref, False, None, warning)
 
 
-def _warn_rc_sequence(repo_dir: str, pre_branch: str, stage_lc: str, major: int, minor: int, patch: int) -> None:
-    """Log (non-blocking) if a continued rc number is out of sequence.
+def _warn_rc_sequence(
+    repo_dir: str, pre_branch: str, stage_lc: str, major: int, minor: int, patch: int
+) -> Optional[str]:
+    """Return a warning (and log it) if a continued rc number is out of sequence.
 
     A continued rc should be exactly one past the highest rc already recorded on
     the running branch; a repeat (re-cut) or a gap is probably a mis-dispatched
-    stage. This only warns; the caller still cuts what was asked.
+    stage. This only warns; the caller still cuts what was asked. The returned
+    message is surfaced in the release PR body so a reviewer sees it too; ``None``
+    means the sequence checks out (or could not be read).
     """
     m = _RC_STAGE_RE.match(stage_lc)
     if not m:
-        return
+        return None
     requested = int(m.group(1))
     try:
         run_git(repo_dir, "fetch", "--quiet", "origin", pre_branch)
         notes = git_output(repo_dir, "show", "FETCH_HEAD:00-RELEASENOTES")
     except Exception:  # noqa: BLE001 - best-effort; absence just means "no prior rc"
-        return
+        return None
     pattern = re.compile(_DATED_RC_RE_TMPL.format(major=major, minor=minor, patch=patch), re.MULTILINE)
-    seen = [int(x) for x in pattern.findall(notes)]
+    seen = sorted({int(x) for x in pattern.findall(notes)})
     highest = max(seen) if seen else 0
     expected = highest + 1
-    if requested != expected:
-        logger.warning(
-            "Dispatched %s but %s records up to rc%d (expected rc%d). Cutting anyway: "
-            "a repeat re-cuts an existing rc; a gap skips one.",
-            stage_lc, pre_branch, highest, expected,
+    if requested == expected:
+        return None
+    if requested <= highest:
+        detail = (
+            f"`{stage_lc}` re-cuts an rc the line already records "
+            f"(it lists up to rc{highest}); the next rc should be rc{expected}."
         )
+    else:
+        detail = (
+            f"`{stage_lc}` skips ahead — `{pre_branch}` records up to rc{highest}, "
+            f"so the next rc should be rc{expected}."
+        )
+    logger.warning(
+        "Dispatched %s but %s records up to rc%d (expected rc%d). Cutting anyway: "
+        "a repeat re-cuts an existing rc; a gap skips one.",
+        stage_lc, pre_branch, highest, expected,
+    )
+    return detail
+
+
+def _warn_rc_first_cut(stage_lc: str, pre_branch: str) -> Optional[str]:
+    """Return a warning (and log it) if rc2+ is dispatched with no pre-release line yet.
+
+    The first cut of a line creates ``pre-release-M.m.p`` and should be rc1.
+    rc2+ here means rc1 was never cut (or its branch was lost), almost certainly
+    a mis-dispatched stage. Non-blocking: the caller still cuts what was asked.
+    """
+    m = _RC_STAGE_RE.match(stage_lc)
+    if not m or int(m.group(1)) == 1:
+        return None
+    logger.warning(
+        "Dispatched %s but %s does not exist yet (no prior rc on this line). Cutting "
+        "anyway as the first cut; expected rc1.",
+        stage_lc, pre_branch,
+    )
+    return (
+        f"`{stage_lc}` is the first cut of `{pre_branch}`, but that branch does not "
+        f"exist yet — rc1 was never cut (or its line was lost). The first cut of a "
+        f"line should be rc1."
+    )
 
 
 def stage_release_name(version: str, stage_lc: str) -> str:
@@ -480,6 +523,8 @@ def cut(
 def _print_dry_run(plan, version, dest_notes, version_h, regen, already_credited) -> None:
     print(f"\n===== release plan ({version} {plan.stage}) =====")
     print(f"target branch: {plan.target}  base: {plan.base_ref}  continuing: {plan.continuing}")
+    if plan.rc_warning:
+        print(f"⚠️  rc out of sequence: {plan.rc_warning}")
     if plan.rename_from:
         print(f"GA rename: would delete {plan.rename_from}")
     if already_credited:
@@ -531,6 +576,7 @@ def _commit_push_release_pr(
         f"`src/version.h`, and refreshes the running contributor list.\n"
         + (f"- GA: carries `{plan.rename_from}`'s history; that branch is deleted by this run.\n"
            if plan.rename_from else "")
+        + _rc_warning_section(plan)
         + _no_new_prs_section(already_credited, plan)
         + _triage_section(triage)
         + "\n*Generated by valkey-ci-agent. Review before merging into the release line.*"
@@ -541,6 +587,24 @@ def _commit_push_release_pr(
     return publish_mod.open_or_update_pr(
         repo, base_repo=repo_full_name, push_repo=None, branch=prep_branch,
         base_branch=plan.target, title=title, body=body, existing=existing,
+    )
+
+
+def _rc_warning_section(plan: BranchPlan) -> str:
+    """Render the out-of-sequence rc warning into the PR body, if any.
+
+    Returns an empty string when the requested rc is in sequence. When set, the
+    warning flags a likely mis-dispatched stage (a re-cut rc, a skipped rc, or
+    rc2+ before rc1 exists) so a reviewer can confirm the cut was intended before
+    merging it into the release line.
+    """
+    if not plan.rc_warning:
+        return ""
+    return (
+        "\n### ⚠️ Release candidate out of sequence\n\n"
+        f"{plan.rc_warning}\n\n"
+        "Cutting anyway as requested. Confirm the dispatched stage is correct "
+        "before merging; if not, close this PR and re-dispatch the intended rc.\n"
     )
 
 

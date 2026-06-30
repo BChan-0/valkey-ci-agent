@@ -85,6 +85,27 @@ class TestResolveBranchPlan:
         assert plan.base_ref == "unstable"
         assert plan.continuing is False
 
+    def test_rc1_first_cut_has_no_warning(self, monkeypatch) -> None:
+        self._exists(monkeypatch, set())
+        plan = resolve_branch_plan("/d", version="9.1.0", stage="rc1", source_ref="unstable")
+        assert plan.rc_warning is None
+
+    def test_rcN_first_cut_warns_no_prior_line(self, monkeypatch) -> None:
+        # rc2 dispatched but pre-release-9.1.0 does not exist yet: rc1 was skipped.
+        self._exists(monkeypatch, set())
+        plan = resolve_branch_plan("/d", version="9.1.0", stage="rc2", source_ref="unstable")
+        assert plan.target == "pre-release-9.1.0"
+        assert plan.continuing is False
+        assert plan.rc_warning is not None
+        assert "rc1" in plan.rc_warning
+        assert "does not exist" in plan.rc_warning
+
+    def test_rcN_continuation_carries_sequence_warning(self, monkeypatch) -> None:
+        self._exists(monkeypatch, {"pre-release-9.1.0"})
+        monkeypatch.setattr(rc, "_warn_rc_sequence", lambda *a, **k: "out-of-seq detail")
+        plan = resolve_branch_plan("/d", version="9.1.0", stage="rc3", source_ref="unstable")
+        assert plan.rc_warning == "out-of-seq detail"
+
     def test_bad_stage_raises(self, monkeypatch) -> None:
         self._exists(monkeypatch, set())
         with pytest.raises(ValueError):
@@ -94,6 +115,66 @@ class TestResolveBranchPlan:
         self._exists(monkeypatch, set())
         with pytest.raises(ValueError):
             resolve_branch_plan("/d", version="9.1", stage="rc1", source_ref="unstable")
+
+
+class TestRcSequenceWarning:
+    """The out-of-sequence rc detection feeding BranchPlan.rc_warning."""
+
+    def _stub_notes(self, monkeypatch, notes):
+        # _warn_rc_sequence fetches the branch then reads 00-RELEASENOTES from it.
+        monkeypatch.setattr(rc, "run_git", lambda *a, **k: None)
+        monkeypatch.setattr(rc, "git_output", lambda *a, **k: notes)
+
+    def _warn(self, monkeypatch, stage_lc, notes):
+        self._stub_notes(monkeypatch, notes)
+        return rc._warn_rc_sequence("/d", "pre-release-9.1.0", stage_lc, 9, 1, 0)
+
+    def test_in_sequence_returns_none(self, monkeypatch) -> None:
+        # Line records up to rc1; rc2 is exactly next.
+        assert self._warn(monkeypatch, "rc2", "Valkey 9.1.0-rc1 (2026-06-01)\n") is None
+
+    def test_first_rc_on_empty_line_in_sequence(self, monkeypatch) -> None:
+        # No dated rc heading yet; rc1 is expected.
+        assert self._warn(monkeypatch, "rc1", "no dated headings here") is None
+
+    def test_repeat_rc_warns(self, monkeypatch) -> None:
+        # Line already records rc1 and rc2; re-cutting rc2 is a repeat.
+        msg = self._warn(monkeypatch, "rc2",
+                         "Valkey 9.1.0-rc2 (2026-06-08)\nValkey 9.1.0-rc1 (2026-06-01)\n")
+        assert msg is not None
+        assert "re-cuts" in msg
+        assert "rc3" in msg  # next expected
+
+    def test_gap_rc_warns(self, monkeypatch) -> None:
+        # Line records up to rc1; jumping to rc4 skips rc2/rc3.
+        msg = self._warn(monkeypatch, "rc4", "Valkey 9.1.0-rc1 (2026-06-01)\n")
+        assert msg is not None
+        assert "skips ahead" in msg
+        assert "rc2" in msg  # next expected
+
+    def test_only_matches_this_versions_headings(self, monkeypatch) -> None:
+        # A different patch line's rc headings must not be counted.
+        msg = self._warn(monkeypatch, "rc1", "Valkey 9.1.1-rc5 (2026-06-01)\n")
+        assert msg is None  # 9.1.0 has no rc yet, so rc1 is in sequence
+
+    def test_unreadable_notes_returns_none(self, monkeypatch) -> None:
+        def _boom(*a, **k):
+            raise RuntimeError("no such branch")
+        monkeypatch.setattr(rc, "run_git", _boom)
+        assert rc._warn_rc_sequence("/d", "pre-release-9.1.0", "rc2", 9, 1, 0) is None
+
+    def test_first_cut_rc1_no_warning(self) -> None:
+        assert rc._warn_rc_first_cut("rc1", "pre-release-9.1.0") is None
+
+    def test_first_cut_rcN_warns(self) -> None:
+        msg = rc._warn_rc_first_cut("rc2", "pre-release-9.1.0")
+        assert msg is not None
+        assert "rc1" in msg
+        assert "pre-release-9.1.0" in msg
+
+    def test_first_cut_ga_no_warning(self) -> None:
+        # Non-rc stages never go through this helper's warning.
+        assert rc._warn_rc_first_cut("ga", "pre-release-9.1.0") is None
 
 
 class TestPromoteAndBump:
@@ -330,6 +411,55 @@ class TestCutOrchestration:
         assert "Needs triage" in body
         assert "[#7](https://x/7)" in body
         assert "Untagged \\| thing" in body  # pipe escaped for the table
+
+    def test_rc_out_of_sequence_warned_in_pr_body(self, monkeypatch, clone):
+        # rc2 dispatched with no pre-release line yet: the first-cut warning must
+        # surface in the release PR body for the reviewer.
+        from unittest.mock import MagicMock
+        calls = self._setup(monkeypatch, clone, line_exists={})
+        repo = MagicMock()
+        repo.get_pulls.return_value = []
+        created = []
+
+        def _create_pull(**kw):
+            created.append(kw)
+            return MagicMock(number=1, html_url="https://x/1")
+
+        repo.create_pull.side_effect = _create_pull
+        monkeypatch.setattr(rc.publish_mod, "retry_github_call", lambda op, **k: op())
+
+        rc.cut(
+            repo, repo_full_name="valkey-io/valkey", source_clone_dir=clone,
+            valkey_clone_dir=clone, source_ref="unstable", version="9.1.0", stage="rc2",
+            urgency="LOW", date="2026-06-25", tag_glob=None, base_ref=None, contrib_base_ref=None,
+            security_fixes=None, token="t", git_env={}, dry_run=False,
+        )
+        body = created[0]["body"]
+        assert "Release candidate out of sequence" in body
+        assert "rc1" in body
+
+    def test_in_sequence_rc_has_no_warning_in_pr_body(self, monkeypatch, clone):
+        # rc1 first cut is in sequence: no warning section in the body.
+        from unittest.mock import MagicMock
+        calls = self._setup(monkeypatch, clone, line_exists={})
+        repo = MagicMock()
+        repo.get_pulls.return_value = []
+        created = []
+
+        def _create_pull(**kw):
+            created.append(kw)
+            return MagicMock(number=1, html_url="https://x/1")
+
+        repo.create_pull.side_effect = _create_pull
+        monkeypatch.setattr(rc.publish_mod, "retry_github_call", lambda op, **k: op())
+
+        rc.cut(
+            repo, repo_full_name="valkey-io/valkey", source_clone_dir=clone,
+            valkey_clone_dir=clone, source_ref="unstable", version="9.1.0", stage="rc1",
+            urgency="LOW", date="2026-06-25", tag_glob=None, base_ref=None, contrib_base_ref=None,
+            security_fixes=None, token="t", git_env={}, dry_run=False,
+        )
+        assert "out of sequence" not in created[0]["body"]
 
     def test_existing_line_not_recreated(self, monkeypatch, clone):
         from unittest.mock import MagicMock
