@@ -328,6 +328,16 @@ class TestRecurrenceCommentNewError:
         comment = renderer.render("<!-- m -->", 2).comment
         assert "New error stack trace" not in comment
 
+    def test_legacy_issue_without_recorded_trace_stays_quiet(self) -> None:
+        # A legacy issue with no Error stack trace section has no baseline, so
+        # the trace must not be called out. Otherwise it would diff against ""
+        # and re-post the same "new" trace on every recurrence.
+        legacy_body = "**Environments:** `test-ubuntu-latest`"
+        renderer = renderer_for(_make_failure(error="some real trace"))
+        renderer.merge_environments(legacy_body)
+        comment = renderer.render("<!-- m -->", 2).comment
+        assert "New error stack trace" not in comment
+
     def test_no_new_error_line_without_body_transform(self) -> None:
         # Create path: body_transform never runs, so no spurious callout.
         comment = renderer_for(_make_failure()).render("<!-- m -->", 1).comment

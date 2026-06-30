@@ -129,11 +129,19 @@ class _FailureRenderer:
         run-specific noise — timestamps, ports/PIDs, hex addresses, temp paths —
         does not flag an unchanged failure as new on every recurrence. An empty
         new error is never called out.
+
+        Legacy issues predating the Error stack trace section have no stored
+        trace (``_extract_error_from_body`` returns ``""``); with no baseline to
+        diff against, the trace is not called out. Otherwise the body never
+        backfilled with the section would diff against "" and re-post the same
+        "new" trace on every recurrence.
         """
         new_error = self._failure.error
         if not new_error.strip():
             return None
         stored = _extract_error_from_body(existing_body)
+        if not stored.strip():
+            return None
         if _normalize_trace(stored) == _normalize_trace(new_error):
             return None
         return new_error
@@ -239,8 +247,8 @@ def _extract_error_from_body(body: str) -> str:
 
 
 # Run-specific tokens scrubbed before comparing two traces, so an unchanged
-# failure is not reported as new every recurrence. Order-independent; each is
-# replaced by a constant placeholder.
+# failure is not reported as new every recurrence. Each match is stripped out,
+# then whitespace is collapsed (see _normalize_trace).
 _TRACE_NOISE_RES = (
     # ISO-ish timestamps: 2026-06-27 12:34:56 / 2026-06-27T12:34:56
     re.compile(r"\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?"),
