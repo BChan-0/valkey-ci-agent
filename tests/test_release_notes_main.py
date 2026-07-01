@@ -64,6 +64,106 @@ def test_missing_version_stage_urgency_is_usage_error():
     assert exc.value.code == 2
 
 
+@pytest.mark.parametrize("bad_version", ["9.1", "v9.1.0", "9.1.0-rc1", "9.256.0", "nope"])
+def test_malformed_version_is_usage_error(bad_version):
+    # Fail fast (exit 2) at argparse, before any clone, rather than deep in promote().
+    with pytest.raises(SystemExit) as exc:
+        main(["--token", "t", "--head-ref", "unstable",
+              "--version", bad_version, "--stage", "rc1", "--urgency", "LOW"])
+    assert exc.value.code == 2
+
+
+def test_version_canonicalized_before_cut(patched):
+    # Leading zeros / trailing space must not leak past the boundary: the cut sees
+    # the canonical M.m.p so version.h, headings, and branch names all agree.
+    captured = _capture_cut(patched)
+    main(["--token", "t", "--head-ref", "unstable",
+          "--version", "09.1.0 ", "--stage", "rc2", "--urgency", "LOW"])
+    assert captured["version"] == "9.1.0"
+
+
+@pytest.mark.parametrize("bad_stage", ["beta", "rc0", "rc01", "ga1", ""])
+def test_malformed_stage_is_usage_error(bad_stage):
+    with pytest.raises(SystemExit) as exc:
+        main(["--token", "t", "--head-ref", "unstable",
+              "--version", "9.1.0", "--stage", bad_stage, "--urgency", "LOW"])
+    assert exc.value.code == 2
+
+
+def test_stage_normalized_before_cut(patched):
+    captured = _capture_cut(patched)
+    main(["--token", "t", "--head-ref", "unstable",
+          "--version", "9.1.0", "--stage", "RC2", "--urgency", "LOW"])
+    assert captured["stage"] == "rc2"
+
+
+@pytest.mark.parametrize("bad_urgency", ["URGENT", "medium-ish", "none"])
+def test_bogus_urgency_is_usage_error(bad_urgency):
+    with pytest.raises(SystemExit) as exc:
+        main(["--token", "t", "--head-ref", "unstable",
+              "--version", "9.1.0", "--stage", "rc1", "--urgency", bad_urgency])
+    assert exc.value.code == 2
+
+
+def test_urgency_uppercased_before_cut(patched):
+    captured = _capture_cut(patched)
+    main(["--token", "t", "--head-ref", "unstable",
+          "--version", "9.1.0", "--stage", "rc2", "--urgency", "high"])
+    assert captured["urgency"] == "HIGH"
+
+
+@pytest.mark.parametrize("bad_date", ["06/30/2026", "2026-13-45", "Jun 30 2026"])
+def test_malformed_date_is_usage_error(bad_date):
+    with pytest.raises(SystemExit) as exc:
+        main(["--token", "t", "--head-ref", "unstable", "--version", "9.1.0",
+              "--stage", "rc2", "--urgency", "LOW", "--date", bad_date])
+    assert exc.value.code == 2
+
+
+def test_valid_iso_date_accepted(patched):
+    captured = _capture_cut(patched)
+    rc = main(["--token", "t", "--head-ref", "unstable", "--version", "9.1.0",
+               "--stage", "rc2", "--urgency", "LOW", "--date", "2026-06-30"])
+    assert rc == 0
+
+
+def test_rc1_first_minor_marks_baseline_unanchored(patched, caplog):
+    # rc1 of M.0.0 with no derivable previous minor: the flag reaches cut() so the
+    # PR body can warn the baseline is unanchored.
+    captured = _capture_cut(patched)
+    import logging
+    with caplog.at_level(logging.WARNING):
+        main(["--token", "t", "--head-ref", "unstable",
+              "--version", "9.0.0", "--stage", "rc1", "--urgency", "LOW"])
+    assert captured["baseline_unanchored"] is True
+
+
+def test_baseline_anchored_when_base_ref_derived(patched):
+    captured = _capture_cut(patched)
+    main(["--token", "t", "--head-ref", "unstable",
+          "--version", "9.1.0", "--stage", "rc1", "--urgency", "LOW"])
+    assert captured["baseline_unanchored"] is False
+
+
+def test_missing_base_ref_aborts_before_cut(patched):
+    # An explicit base_ref that resolves to nothing must abort with a clear error
+    # before cut() runs (not deep in discovery). run_git is stubbed to a generic
+    # MagicMock in `patched`, so make rev-parse fail to simulate an absent ref.
+    import subprocess
+    captured = _capture_cut(patched)
+
+    def _run_git(repo_dir, *args, **kwargs):
+        if args[:1] == ("rev-parse",):
+            raise subprocess.CalledProcessError(1, ["git", *args])
+        return MagicMock()
+
+    patched.setattr(main_mod, "run_git", _run_git)
+    rc = main(["--token", "t", "--head-ref", "unstable", "--version", "9.1.0",
+               "--stage", "rc2", "--urgency", "LOW", "--base-ref", "no-such-ref"])
+    assert rc == 1
+    assert captured == {}  # cut() never reached
+
+
 # --- dispatch + arg threading ---
 
 def test_dispatches_to_cut_with_parsed_args(patched):

@@ -76,3 +76,30 @@ def test_wipes_existing_detected(monkeypatch, clone):
     r = pipeline_mod.regenerate_unreleased(object(), clone, head_ref="9.1", tag_glob=None)
     assert r.bullet_count == 0
     assert r.wipes_existing is True
+
+
+def test_duplicate_pr_bullets_deduped_and_recorded(monkeypatch, clone):
+    # The model emits two bullets for the same PR; only the first survives and the
+    # PR number is recorded so the caller can flag it in the body.
+    prs = (MergedPR(number=40, title="t", author="a", url="u", labels=("release-notes",)),)
+    _patch(monkeypatch, prs=prs, bullets=(
+        CategorizedBullet(pr_number=40, author="a", category="Bug Fixes", text="first"),
+        CategorizedBullet(pr_number=40, author="a", category="New Features", text="second"),
+    ))
+    r = pipeline_mod.regenerate_unreleased(object(), clone, head_ref="9.1", tag_glob=None)
+    assert r.bullet_count == 1            # second dropped
+    assert r.duplicate_prs == (40,)
+    assert "first" in r.updated_text
+    assert "second" not in r.updated_text
+
+
+def test_dedup_bullets_by_pr_keeps_first_preserves_order(monkeypatch):
+    bl = [
+        CategorizedBullet(pr_number=1, author="a", category="Bug Fixes", text="one"),
+        CategorizedBullet(pr_number=2, author="b", category="Bug Fixes", text="two"),
+        CategorizedBullet(pr_number=1, author="a", category="New Features", text="dup"),
+    ]
+    kept, dups = pipeline_mod._dedup_bullets_by_pr(bl)
+    assert [b.pr_number for b in kept] == [1, 2]
+    assert [b.text for b in kept] == ["one", "two"]
+    assert dups == (1,)

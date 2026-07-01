@@ -148,6 +148,35 @@ class TestResolveBranchPlan:
         plan = resolve_branch_plan("/d", version="9.1.0", stage="rc3", source_ref="unstable")
         assert plan.rc_warning == "out-of-seq detail"
 
+    def test_ga_both_branches_raises(self, monkeypatch) -> None:
+        # pre-release-9.1.0 AND 9.1 both present is an inconsistent state: refuse
+        # rather than orphan the pre-release line / drop its rc history.
+        self._exists(monkeypatch, {"pre-release-9.1.0", "9.1"})
+        with pytest.raises(ValueError, match="inconsistent state"):
+            resolve_branch_plan("/d", version="9.1.0", stage="ga", source_ref="unstable")
+
+    def test_ga_continuation_carries_branch_warning(self, monkeypatch) -> None:
+        # GA continues an existing 9.1; the continuation warning (dup heading /
+        # lingering pre-release) is plumbed onto branch_warning.
+        self._exists(monkeypatch, {"9.1"})
+        monkeypatch.setattr(rc, "_warn_ga_continuation", lambda *a, **k: "dup heading detail")
+        plan = resolve_branch_plan("/d", version="9.1.1", stage="ga", source_ref="unstable")
+        assert plan.target == "9.1"
+        assert plan.rename_from is None
+        assert plan.branch_warning == "dup heading detail"
+
+    def test_rc_after_ga_warns_and_suppresses_first_cut(self, monkeypatch) -> None:
+        # 9.1 exists (already went GA) but pre-release-9.1.0 was deleted by the
+        # rename. A further rc recreates it; warn on branch_warning, and the rc1
+        # first-cut wording must not also fire.
+        self._exists(monkeypatch, {"9.1"})
+        plan = resolve_branch_plan("/d", version="9.1.0", stage="rc1", source_ref="unstable")
+        assert plan.target == "pre-release-9.1.0"
+        assert plan.continuing is False
+        assert plan.branch_warning is not None
+        assert "9.1" in plan.branch_warning
+        assert plan.rc_warning is None
+
     def test_bad_stage_raises(self, monkeypatch) -> None:
         self._exists(monkeypatch, set())
         with pytest.raises(ValueError):
@@ -217,6 +246,104 @@ class TestRcSequenceWarning:
     def test_first_cut_ga_no_warning(self) -> None:
         # Non-rc stages never go through this helper's warning.
         assert rc._warn_rc_first_cut("ga", "pre-release-9.1.0") is None
+
+
+class TestCanonicalVersion:
+    """The single version-normalization choke point."""
+
+    def test_strips_trailing_space(self) -> None:
+        assert rc.canonical_version("9.1.0 ") == "9.1.0"
+
+    def test_drops_leading_zeros(self) -> None:
+        # version.h / headings / branch names must all agree on the canonical form.
+        assert rc.canonical_version("09.1.0") == "9.1.0"
+        assert rc.canonical_version("9.01.00") == "9.1.0"
+
+    def test_already_canonical_unchanged(self) -> None:
+        assert rc.canonical_version("9.1.0") == "9.1.0"
+
+    @pytest.mark.parametrize("bad", ["9.1", "v9.1.0", "9.1.0-rc1", "nope", ""])
+    def test_malformed_raises(self, bad) -> None:
+        with pytest.raises(ValueError):
+            rc.canonical_version(bad)
+
+    @pytest.mark.parametrize("bad", ["9.256.0", "256.0.0", "9.1.256"])
+    def test_component_over_255_raises(self, bad) -> None:
+        with pytest.raises(ValueError, match="out of range 0-255"):
+            rc.canonical_version(bad)
+
+
+class TestGaAndRcAfterGaWarnings:
+    """Branch-model warnings for GA continuation and rc-after-GA."""
+
+    def _stub(self, monkeypatch, *, pre_exists, ga_notes):
+        monkeypatch.setattr(rc, "_remote_branch_exists",
+                            lambda repo_dir, branch: pre_exists if branch.startswith("pre-release") else True)
+        monkeypatch.setattr(rc, "run_git", lambda *a, **k: None)
+        monkeypatch.setattr(rc, "git_output", lambda *a, **k: ga_notes)
+
+    def test_ga_continuation_warns_on_lingering_pre_release(self, monkeypatch) -> None:
+        self._stub(monkeypatch, pre_exists=True, ga_notes="")
+        msg = rc._warn_ga_continuation("/d", "9.1", "pre-release-9.1.1", "9.1.1")
+        assert msg is not None
+        assert "pre-release-9.1.1" in msg
+        assert "NOT be carried" in msg
+
+    def test_ga_continuation_warns_on_duplicate_heading(self, monkeypatch) -> None:
+        notes = "Valkey 9.1 release notes\n====\n\nValkey 9.1.0 GA  -  Released 2026-06-30\n----\n"
+        self._stub(monkeypatch, pre_exists=False, ga_notes=notes)
+        msg = rc._warn_ga_continuation("/d", "9.1", "pre-release-9.1.0", "9.1.0")
+        assert msg is not None
+        assert "SECOND dated heading" in msg
+
+    def test_ga_continuation_clean_returns_none(self, monkeypatch) -> None:
+        # No lingering pre-release, no prior same-version GA heading: normal patch.
+        notes = "Valkey 9.1 release notes\n====\n\nValkey 9.1.0 GA  -  Released 2026-06-30\n----\n"
+        self._stub(monkeypatch, pre_exists=False, ga_notes=notes)
+        assert rc._warn_ga_continuation("/d", "9.1", "pre-release-9.1.1", "9.1.1") is None
+
+    def test_rc_after_ga_warns_when_ga_exists(self, monkeypatch) -> None:
+        monkeypatch.setattr(rc, "_remote_branch_exists", lambda repo_dir, branch: branch == "9.1")
+        msg = rc._warn_rc_after_ga("/d", "9.1", "pre-release-9.1.0", "9.1.0")
+        assert msg is not None
+        assert "9.1" in msg and "recreates" in msg
+
+    def test_rc_after_ga_none_when_no_ga(self, monkeypatch) -> None:
+        monkeypatch.setattr(rc, "_remote_branch_exists", lambda repo_dir, branch: False)
+        assert rc._warn_rc_after_ga("/d", "9.1", "pre-release-9.1.0", "9.1.0") is None
+
+
+class TestSecurityHelpers:
+    """--security-fix sanitization and duplicate-listing detection."""
+
+    def test_sanitize_drops_empty_and_collapses_newlines(self) -> None:
+        out = rc._sanitize_security_fixes(["  ", "fix\nmulti (#7)", ""])
+        assert out == ["fix multi (#7)"]
+
+    def test_sanitize_all_empty_returns_none(self) -> None:
+        assert rc._sanitize_security_fixes(["", "   "]) is None
+        assert rc._sanitize_security_fixes(None) is None
+
+    def test_dup_prs_intersects_noted(self) -> None:
+        dup = rc._security_dup_prs(["CVE fix (#7)", "other (#9)"], {7, 8})
+        assert dup == [7]
+
+    def test_dup_prs_empty_without_overlap(self) -> None:
+        assert rc._security_dup_prs(["CVE fix (#7)"], {8, 9}) == []
+        assert rc._security_dup_prs(None, {7}) == []
+
+
+class TestTrailingPrRegex:
+    """The dedup regex must tolerate hand-edited trailing punctuation."""
+
+    @pytest.mark.parametrize("line,expected", [
+        ("* x by @a (#44)", {44}),
+        ("* x by @a (#44).", {44}),
+        ("* x by @a (#44):", {44}),
+        ("* x by @a (#44) ", {44}),
+    ])
+    def test_credited_tolerates_trailing_punctuation(self, line, expected) -> None:
+        assert rc._credited_pr_numbers(line) == expected
 
 
 class TestPromoteAndBump:
@@ -358,7 +485,7 @@ class TestCutOrchestration:
     """End-to-end cut() with git + GitHub + pipeline mocked, real fixture worktree."""
 
     def _setup(self, monkeypatch, clone, *, line_exists, bullets=True, triage=(),
-               stub_contrib_base=True):
+               had_prs=True, duplicate_prs=(), stub_contrib_base=True):
         from scripts.release_notes import pipeline as pipeline_mod
         from scripts.release_notes import render as render_mod
         from scripts.release_notes.models import CategorizedBullet
@@ -374,7 +501,8 @@ class TestCutOrchestration:
             lambda *a, **k: RegenResult(
                 base_tag="9.0.0", existing_text=existing, updated_text=updated,
                 included=1 if bullets else 0, bullet_count=len(bl), skipped=(),
-                triage=tuple(triage), had_prs=True, wipes_existing=False),
+                triage=tuple(triage), had_prs=had_prs, wipes_existing=False,
+                duplicate_prs=tuple(duplicate_prs)),
         )
         # Record git commands; emulate worktree by copying the clone tree.
         calls = []
@@ -532,6 +660,82 @@ class TestCutOrchestration:
             security_fixes=None, token="t", git_env={}, dry_run=False,
         )
         assert "out of sequence" not in created[0]["body"]
+
+    def _cut_body(self, monkeypatch, clone, *, line_exists, cut_kwargs,
+                  bullets=True, triage=(), had_prs=True, duplicate_prs=()):
+        """Run cut() with GitHub mocked and return the created PR's body."""
+        from unittest.mock import MagicMock
+        self._setup(monkeypatch, clone, line_exists=line_exists, bullets=bullets,
+                    triage=triage, had_prs=had_prs, duplicate_prs=duplicate_prs)
+        repo = MagicMock()
+        repo.get_pulls.return_value = []
+        created = []
+        repo.create_pull.side_effect = lambda **kw: created.append(kw) or MagicMock(
+            number=1, html_url="https://x/1")
+        monkeypatch.setattr(rc.publish_mod, "retry_github_call", lambda op, **k: op())
+        base = dict(
+            repo_full_name="valkey-io/valkey", source_clone_dir=clone,
+            valkey_clone_dir=clone, source_ref="unstable", version="9.1.0", stage="rc1",
+            urgency="LOW", date="2026-06-25", tag_glob=None, base_ref=None,
+            contrib_base_ref=None, security_fixes=None, token="t", git_env={}, dry_run=False,
+        )
+        base.update(cut_kwargs)
+        rc.cut(repo, **base)
+        return created[0]["body"] if created else None
+
+    def test_body_always_shows_resolved_range(self, monkeypatch, clone):
+        body = self._cut_body(monkeypatch, clone, line_exists={}, cut_kwargs={})
+        assert "computed over `9.0.0..HEAD`" in body
+
+    def test_rc_after_ga_warned_in_body(self, monkeypatch, clone):
+        # 9.1 exists; rc1 of 9.1.0 recreates a deleted pre-release line.
+        body = self._cut_body(monkeypatch, clone, line_exists={"9.1": True}, cut_kwargs={})
+        assert "Release line state looks off" in body
+        assert "already exists as a GA line" in body
+
+    def test_baseline_unanchored_warned_in_body(self, monkeypatch, clone):
+        body = self._cut_body(monkeypatch, clone, line_exists={},
+                              cut_kwargs={"version": "9.0.0", "baseline_unanchored": True})
+        assert "baseline is unanchored" in body
+
+    def test_empty_range_explained_in_body(self, monkeypatch, clone):
+        body = self._cut_body(monkeypatch, clone, line_exists={},
+                              cut_kwargs={}, bullets=False, had_prs=False)
+        assert "Empty release notes" in body
+        assert "No merged PRs were found" in body
+
+    def test_all_triage_empty_notes_explained_in_body(self, monkeypatch, clone):
+        from scripts.release_notes.models import MergedPR
+        triage = (MergedPR(number=7, title="thing", author="bob", url="https://x/7"),)
+        body = self._cut_body(monkeypatch, clone, line_exists={}, cut_kwargs={},
+                              bullets=False, had_prs=True, triage=triage)
+        assert "Empty release notes" in body
+        assert "unlabelled or double-labelled" in body
+        assert "Needs triage" in body  # the table is still rendered
+
+    def test_duplicate_pr_warned_in_body(self, monkeypatch, clone):
+        body = self._cut_body(monkeypatch, clone, line_exists={}, cut_kwargs={},
+                              duplicate_prs=(40,))
+        assert "noted more than once" in body
+        assert "#40" in body
+
+    def test_security_dup_warned_in_body(self, monkeypatch, clone):
+        # The fixture bullet credits #40; a --security-fix naming #40 lists it twice.
+        body = self._cut_body(monkeypatch, clone, line_exists={},
+                              cut_kwargs={"security_fixes": ["Fix CVE (#40)"]})
+        assert "Security fixes need a look" in body
+        assert "#40" in body
+
+    def test_security_urgency_without_fixes_warned_in_body(self, monkeypatch, clone):
+        body = self._cut_body(monkeypatch, clone, line_exists={},
+                              cut_kwargs={"urgency": "SECURITY", "security_fixes": None})
+        assert "Security fixes need a look" in body
+        assert "no security content" in body
+
+    def test_clean_cut_has_no_warning_sections(self, monkeypatch, clone):
+        body = self._cut_body(monkeypatch, clone, line_exists={}, cut_kwargs={})
+        assert "⚠️" not in body
+        assert "Empty release notes" not in body
 
     def test_existing_line_not_recreated(self, monkeypatch, clone):
         from unittest.mock import MagicMock
@@ -783,7 +987,7 @@ class TestDedupAgainstDestination:
             return ("NEWNOTES", "NEWVERSION")
         monkeypatch.setattr(rcmod, "promote_and_bump", _capture_promote)
         monkeypatch.setattr(rcmod, "_print_dry_run",
-                            lambda *a, **k: captured.setdefault("already", a[5]))
+                            lambda *a, **k: captured.setdefault("already", list(a[4].already_credited)))
 
         rcmod.cut(
             object(), repo_full_name="valkey-io/valkey", source_clone_dir=clone,

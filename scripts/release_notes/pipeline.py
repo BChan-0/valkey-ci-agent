@@ -32,11 +32,12 @@ class RegenResult:
     existing_text: str          # the file before regeneration
     updated_text: str           # the file with the new ## Unreleased block
     included: int               # PRs included (labelled release-notes)
-    bullet_count: int           # bullets the model actually produced
+    bullet_count: int           # bullets the model actually produced (after dup-PR dedup)
     skipped: tuple[int, ...]    # PR numbers the model declined
     triage: tuple[MergedPR, ...]  # untagged / double-labelled PRs
     had_prs: bool               # whether the range contained any PR at all
     wipes_existing: bool        # True if writing updated_text would blank a populated block
+    duplicate_prs: tuple[int, ...] = ()  # PR numbers the model emitted more than once (extra bullets dropped)
 
 
 def regenerate_unreleased(
@@ -75,7 +76,12 @@ def regenerate_unreleased(
 
     fmt = render_mod.load_format_module(clone_dir)
     gen = generate_mod.generate(include, repo_dir=clone_dir, categories=fmt.CATEGORIES)
-    grouped = render_mod.group_bullets(gen.bullets, fmt)
+    # The prompt asks for at most one bullet per PR, but nothing enforces it and
+    # neither group_bullets nor valkey's promote() dedups by PR number, so a model
+    # that emits two bullets for the same PR would credit it twice (possibly under
+    # different categories). Keep the first bullet per PR and surface the rest.
+    bullets, duplicate_prs = _dedup_bullets_by_pr(gen.bullets)
+    grouped = render_mod.group_bullets(bullets, fmt)
     updated = render_mod.apply_to_file(existing, grouped, fmt)
 
     # Would writing this blank an already-populated block? True only when there
@@ -84,6 +90,28 @@ def regenerate_unreleased(
 
     return RegenResult(
         base_tag=discovery.base_tag, existing_text=existing, updated_text=updated,
-        included=len(include), bullet_count=len(gen.bullets), skipped=tuple(gen.skipped),
+        included=len(include), bullet_count=len(bullets), skipped=tuple(gen.skipped),
         triage=tuple(triage), had_prs=True, wipes_existing=wipes,
+        duplicate_prs=duplicate_prs,
     )
+
+
+def _dedup_bullets_by_pr(bullets):
+    """Keep the first bullet per PR number; return ``(kept, duplicate_pr_numbers)``.
+
+    ``duplicate_pr_numbers`` lists each PR that appeared more than once, in
+    first-seen order, so the caller can flag it in the PR body. Order of *kept* is
+    preserved (group_bullets re-keys into canonical category order afterward).
+    """
+    seen: set[int] = set()
+    kept = []
+    dups: list[int] = []
+    for b in bullets:
+        if b.pr_number in seen:
+            if b.pr_number not in dups:
+                dups.append(b.pr_number)
+                logger.warning("PR #%s has more than one bullet; keeping the first", b.pr_number)
+            continue
+        seen.add(b.pr_number)
+        kept.append(b)
+    return tuple(kept), tuple(dups)

@@ -42,6 +42,12 @@ from scripts.release_notes import release_cut as cut_mod
 
 logger = logging.getLogger(__name__)
 
+# Upgrade-urgency values valkey's promote() accepts, mirrored here so a bogus
+# value fails at argparse (exit 2) rather than deep in promote() after a wasted
+# clone + AI run. Kept in sync with the workflow's `urgency` choice list and the
+# valkey format module's VALID_URGENCIES.
+_VALID_URGENCIES = ("LOW", "MODERATE", "HIGH", "CRITICAL", "SECURITY")
+
 # Config via env so the workflow can pass GitHub Actions context directly; the
 # RELEASE_NOTES_ prefix mirrors the CI_FIX_/FUZZER_ convention.
 # EDIT BEFORE PR: change the default repo back to valkey-io/valkey. Pointed at
@@ -94,7 +100,8 @@ def _default_base_ref_for_rc1(version: str) -> str | None:
 
     rc1 of ``M.m.p`` covers everything since the previous minor's GA. We can only
     guess that tag's name (``M.(m-1).0``); whether it is actually reachable as a
-    range base is checked at clone time. Returns None when the version is not
+    range base is checked after the clone (see :func:`_validate_base_ref`), where
+    a missing ref aborts with a clear error. Returns None when the version is not
     ``M.m.p`` or there is no previous minor (``M.0.*``), in which case the user
     must supply ``--base-ref`` explicitly.
     """
@@ -144,6 +151,25 @@ def main(argv: list[str] | None = None) -> int:
     if not (args.version and args.stage and args.urgency):
         parser.error("--version, --stage, and --urgency are required")
 
+    # Fail fast on malformed inputs, before the expensive clone + AI run. Each of
+    # these is otherwise first rejected deep in the pipeline (or never), surfacing
+    # as an opaque exit-1 traceback after work was wasted, or silently corrupting
+    # output (a non-canonical version leaks into version.h while the branch name is
+    # normalized). Validate (and canonicalize the version) here for a clear exit-2.
+    try:
+        version = cut_mod.canonical_version(args.version)
+    except ValueError as exc:
+        parser.error(str(exc))
+    try:
+        stage = cut_mod._normalize_stage(args.stage)
+    except ValueError as exc:
+        parser.error(str(exc))
+    urgency = args.urgency.strip().upper()
+    if urgency not in _VALID_URGENCIES:
+        parser.error(f"--urgency must be one of {', '.join(_VALID_URGENCIES)}, got {args.urgency!r}")
+    if args.date and not _is_iso_date(args.date):
+        parser.error(f"--date must be ISO YYYY-MM-DD (e.g. 2026-06-30), got {args.date!r}")
+
     base_ref = args.base_ref or None
 
     # rc1 has no prior same-version RC tag and, in valkey's fork-at-freeze model,
@@ -152,43 +178,50 @@ def main(argv: list[str] | None = None) -> int:
     # did not pass --base-ref, warn loudly and default to the derived previous
     # release (M.(m-1).0); the cut still fails clearly at clone time if that ref
     # is absent, but most cuts get a sensible default instead of a hard error.
-    if args.stage.strip().lower() == "rc1" and base_ref is None:
-        derived = _default_base_ref_for_rc1(args.version)
+    # When no previous minor exists (M.0.0), there is nothing to derive: the cut
+    # falls back to the nearest reachable tag, which may be over-broad, so flag it
+    # in the PR body too (baseline_unanchored).
+    baseline_unanchored = False
+    if stage == "rc1" and base_ref is None:
+        derived = _default_base_ref_for_rc1(version)
         if derived:
             logger.warning(
                 "rc1 of %s has no reachable baseline tag (there is no rc0, and release "
                 "tags are not reachable from %r). Defaulting --base-ref to the previous "
                 "release %r. Pass --base-ref explicitly to override (e.g. the previous "
                 "release tag or its branch).",
-                args.version, args.head_ref, derived,
+                version, args.head_ref, derived,
             )
             base_ref = derived
         else:
+            baseline_unanchored = True
             logger.warning(
                 "rc1 of %s has no reachable baseline tag and no previous-minor release "
-                "could be derived. Pass --base-ref explicitly (the previous release tag "
-                "or branch); the cut will otherwise fail to resolve a baseline.",
-                args.version,
+                "could be derived. The cut will fall back to the nearest reachable tag, "
+                "which may span a whole extra minor of history. Pass --base-ref explicitly "
+                "(the previous release tag or branch) to anchor it.",
+                version,
             )
 
     # An explicit (or rc1-defaulted) base_ref overrides tag resolution, so don't
     # also derive a glob.
-    tag_glob = None if base_ref else (args.tag_glob or _default_tag_glob(args.version, args.stage))
+    tag_glob = None if base_ref else (args.tag_glob or _default_tag_glob(version, stage))
 
     try:
         return _run_cut(
             token=args.token,
             repo_full_name=args.repo,
             source_ref=args.head_ref,
-            version=args.version,
-            stage=args.stage,
-            urgency=args.urgency,
+            version=version,
+            stage=stage,
+            urgency=urgency,
             date=args.date or None,
             tag_glob=tag_glob,
             base_ref=base_ref,
             contrib_base_ref=args.contrib_base_ref or None,
             security_fixes=args.security_fixes,
             dry_run=args.dry_run,
+            baseline_unanchored=baseline_unanchored,
         )
     except subprocess.CalledProcessError as exc:  # surface git's stderr, not just the exit code
         # CalledProcessError.__str__ reports only the command and exit status;
@@ -207,6 +240,43 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
 
+def _validate_base_ref(clone_dir: str, base_ref: str) -> None:
+    """Raise a clear error if *base_ref* resolves to nothing in the fresh clone.
+
+    The clone is ``git clone --branch <source_ref>`` + fetch tags, so a non-source
+    branch exists only as ``origin/<name>``; mirror discover's resolution (the ref
+    as given, then ``origin/<name>``) so a real branch/tag/SHA passes. Without this,
+    a typo'd ``--base-ref`` (or the derived rc1 default ``M.(m-1).0`` when that tag
+    is absent) is first hit deep in discovery and surfaces as an opaque exit-1
+    naming the ``origin/<name>`` form, not what the maintainer typed.
+    """
+    for candidate in (base_ref, f"origin/{base_ref}"):
+        try:
+            run_git(clone_dir, "rev-parse", "--verify", "--quiet", f"{candidate}^{{commit}}")
+            return
+        except subprocess.CalledProcessError:
+            continue
+    raise ValueError(
+        f"--base-ref {base_ref!r} not found in the clone (tried {base_ref!r} and "
+        f"'origin/{base_ref}'). Pass an existing branch, tag, or commit SHA."
+    )
+
+
+def _is_iso_date(value: str) -> bool:
+    """True if *value* is a valid ISO ``YYYY-MM-DD`` date.
+
+    A malformed ``--date`` otherwise passes verbatim through valkey's
+    ``_format_date`` into the dated heading (it returns unparseable input
+    unchanged), so a typo like ``06/30/2026`` ships as the release date. Validate
+    at the boundary; an empty value (defaulted to today) is handled before this.
+    """
+    try:
+        datetime.date.fromisoformat(value.strip())
+    except ValueError:
+        return False
+    return True
+
+
 def _run_cut(
     *,
     token: str,
@@ -221,6 +291,7 @@ def _run_cut(
     contrib_base_ref: str | None,
     security_fixes: list[str] | None,
     dry_run: bool,
+    baseline_unanchored: bool = False,
 ) -> int:
     gh = Github(auth=Auth.Token(token))
     repo = retry_github_call(
@@ -234,6 +305,11 @@ def _run_cut(
             run_git(None, "clone", "--branch", source_ref, github_https_url(repo_full_name),
                     clone_dir, env=git_env)
             run_git(clone_dir, "fetch", "--tags", "origin", env=git_env)
+            # Validate an explicit/derived baseline now, while the error can still
+            # name what the maintainer typed (discovery would later only see the
+            # origin/<name> form). A missing ref aborts before the AI run.
+            if base_ref:
+                _validate_base_ref(clone_dir, base_ref)
             return cut_mod.cut(
                 repo,
                 repo_full_name=repo_full_name,
@@ -243,6 +319,7 @@ def _run_cut(
                 version=version, stage=stage, urgency=urgency, date=resolved_date,
                 tag_glob=tag_glob, base_ref=base_ref, contrib_base_ref=contrib_base_ref,
                 security_fixes=security_fixes, token=token, git_env=git_env, dry_run=dry_run,
+                baseline_unanchored=baseline_unanchored,
             )
         finally:
             shutil.rmtree(clone_dir, ignore_errors=True)
