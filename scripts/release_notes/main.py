@@ -50,10 +50,7 @@ _VALID_URGENCIES = ("LOW", "MODERATE", "HIGH", "CRITICAL", "SECURITY")
 
 # Config via env so the workflow can pass GitHub Actions context directly; the
 # RELEASE_NOTES_ prefix mirrors the CI_FIX_/FUZZER_ convention.
-# EDIT BEFORE PR: change the default repo back to valkey-io/valkey. Pointed at
-# the BChan-0 fork for fork testing (the workflow also passes RELEASE_NOTES_REPO
-# explicitly, so this default only matters for a bare CLI run).
-_REPO = os.environ.get("RELEASE_NOTES_REPO", "BChan-0/valkey")
+_REPO = os.environ.get("RELEASE_NOTES_REPO", "valkey-io/valkey")
 _HEAD_REF = os.environ.get("RELEASE_NOTES_HEAD_REF", "")
 _TAG_GLOB = os.environ.get("RELEASE_NOTES_TAG_GLOB", "")
 _BASE_REF = os.environ.get("RELEASE_NOTES_BASE_REF", "")

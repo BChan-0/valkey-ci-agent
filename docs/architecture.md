@@ -281,6 +281,49 @@ main.py (daily cron or manual dispatch)
 - `scripts/test_failure_detector/manage_issues.py` - orchestration over the shared dedup publisher to create/update issues
 - `scripts/test_failure_detector/issue_renderer.py` - test-failure-specific title/body/comment rendering and label assignment
 
+## Release Notes Flow
+
+```text
+main.py (manual dispatch: source_ref, version, stage, urgency)
+  -> validate + canonicalize inputs (fail fast, exit 2 on malformed)
+  -> clone valkey (full depth + tags), validate --base-ref
+  -> release_cut.cut()
+       -> resolve_branch_plan()      maps (version, stage) onto the branch model
+       -> pipeline.regenerate_unreleased()
+            -> discover()  labelled PRs over base..HEAD, deduped by PR number
+            -> classify()  include / exclude / triage from labels
+            -> generate()  AI: one categorized bullet per included PR
+            -> render()    canonical markdown, dedup bullets by PR number
+       -> promote_and_bump()  valkey primitives: dated section + version.h bump
+       -> _commit_push_release_pr()  prep branch (force-with-lease) + PR into the line
+       -> GA rename: delete the old pre-release branch
+```
+
+The branch model is one long-running branch per minor line: rc1 creates
+`pre-release-M.m.p`, rcN continues it, ga creates/renames to `M.m`. The cut lands
+on an agent-namespaced `agent/release-cut/...` prep branch and opens a PR into the
+release line, so the line only advances when a human merges. The notes/version
+format stays authoritative in valkey - `promote`, `set_version`, and
+`list_contributors` are loaded from `utils/releasetools` in the clone at runtime.
+
+Non-blocking anomalies (out-of-sequence rc, GA duplicate/orphan, rc-after-GA,
+unanchored baseline, empty/duplicate notes, security correlations) are surfaced as
+warnings in the PR body rather than blocking the cut; malformed inputs and
+inconsistent branch state (GA with both `pre-release-M.m.p` and `M.m`) are hard
+errors.
+
+### Entry Points
+
+- `scripts/release_notes/main.py` - CLI entry point, input validation, clone
+- `scripts/release_notes/release_cut.py` - branch-plan resolution, promotion, PR body + warnings
+- `scripts/release_notes/pipeline.py` - discover -> classify -> generate -> render orchestration
+- `scripts/release_notes/discover.py` - range resolution and PR discovery by graph reachability
+- `scripts/release_notes/classify.py` - label-based include / exclude / triage partition
+- `scripts/release_notes/generate.py` - Claude bullet generation (read-only tools)
+- `scripts/release_notes/render.py` - canonical `00-RELEASENOTES` rendering
+- `scripts/release_notes/publish.py` - find/open/update the release PR
+- `scripts/release_notes/clone_tools.py` - loads valkey's releasetools primitives at runtime
+
 ## Planned Workflows
 
 Future sibling modules and extensions:
