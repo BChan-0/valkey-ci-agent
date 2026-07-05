@@ -18,8 +18,10 @@ The branch is never merged. The push re-triggers the PR's normal CI.
 from __future__ import annotations
 
 import logging
+import re
 import subprocess
 import tempfile
+import textwrap
 from pathlib import Path
 
 from scripts.ci_fix.models import FixProposal
@@ -249,9 +251,86 @@ def _is_valid_branch_name(branch: str) -> bool:
 
 
 def _commit_message(proposal: FixProposal) -> str:
-    """A focused commit message: a subject naming the test, then the cause.
+    """A focused commit message with a maintainer-readable subject.
 
-    Mirrors the maintainer-authored style of the reference fixes.
+    ``failing_check`` often comes from logs and can be a raw build command
+    ("make SERVER_CFLAGS=...") rather than a useful commit subject. Prefer a
+    source file named in the compiler diagnostic for build failures, and keep
+    the detailed root cause in a wrapped body.
     """
-    subject = f"Fix CI test failure: {proposal.failing_check}"[:72]
-    return f"{subject}\n\n{proposal.root_cause}\n"
+    subject = _commit_subject(proposal)
+    body = _format_commit_body(proposal.root_cause)
+    return f"{subject}\n\n{body}\n"
+
+
+def _format_commit_body(body: str) -> str:
+    return "\n\n".join(
+        textwrap.fill(
+            paragraph.strip(),
+            width=72,
+            break_long_words=False,
+            break_on_hyphens=False,
+        )
+        for paragraph in body.strip().split("\n\n")
+        if paragraph.strip()
+    )
+
+
+_SOURCE_LOCATION_RE = re.compile(
+    r"`?([A-Za-z0-9_./-]+\.(?:c|h|cc|cpp|cxx|m|mm|py|tcl|sh|rs|go|java|js|ts)):\d+"
+)
+
+
+def _commit_subject(proposal: FixProposal) -> str:
+    source = _source_file_from_root_cause(proposal.root_cause)
+    if source and _looks_like_build_failure(proposal):
+        return _fit_subject(f"Fix {source} build failure")
+
+    check = _clean_failing_check(proposal.failing_check)
+    if not check:
+        return "Fix CI failure"
+    return _fit_subject(f"Fix {check}")
+
+
+def _source_file_from_root_cause(root_cause: str) -> str:
+    match = _SOURCE_LOCATION_RE.search(root_cause)
+    if not match:
+        return ""
+    return Path(match.group(1)).name
+
+
+def _looks_like_build_failure(proposal: FixProposal) -> bool:
+    check = proposal.failing_check.strip().lower()
+    if check.startswith(("make ", "cmake ", "ninja ", "clang ", "gcc ", "cc ")):
+        return True
+    text = f"{check} {proposal.root_cause}".lower()
+    return any(
+        marker in text
+        for marker in (
+            "compile",
+            "compiler",
+            "clang",
+            "gcc",
+            "-werror",
+        )
+    )
+
+
+def _clean_failing_check(failing_check: str) -> str:
+    check = " ".join(failing_check.strip().split())
+    check = check.strip(" .")
+    lowered = check.lower()
+    if lowered.startswith(("make ", "cmake ", "ninja ", "clang ", "gcc ", "cc ")):
+        return "build failure"
+    return check
+
+
+def _fit_subject(subject: str) -> str:
+    """Trim to Git's conventional 72-char subject length at a word boundary."""
+    subject = " ".join(subject.split())
+    if len(subject) <= 72:
+        return subject
+    clipped = subject[:72].rstrip()
+    if " " in clipped:
+        clipped = clipped.rsplit(" ", 1)[0]
+    return clipped.rstrip(" .")

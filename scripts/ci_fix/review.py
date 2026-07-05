@@ -337,7 +337,19 @@ def run_fix_loop(
 def combined_command(proposal: FixProposal) -> str:
     """Chain build + test into one recipe for the runner."""
     parts = [p for p in (proposal.build_command, proposal.verify_command) if p.strip()]
+    if len(parts) > 1 and any(_needs_shell_grouping(p) for p in parts):
+        return " && ".join(_shell_group(p) for p in parts)
     return " && ".join(parts)
+
+
+def _needs_shell_grouping(command: str) -> bool:
+    """True when a command has list separators that would bind looser than &&."""
+    return ";" in command or "\n" in command
+
+
+def _shell_group(command: str) -> str:
+    """Group a shell command so its whole exit status participates in ``&&``."""
+    return "{\n" + command.strip() + "\n}"
 
 
 # Trivial shell builtins that carry no build or test signal on their own.

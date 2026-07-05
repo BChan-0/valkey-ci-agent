@@ -78,6 +78,28 @@ jobs:
           persist-credentials: false
           path: target
 
+      - name: Install Homebrew LLVM when requested
+        # The verifier currently runs on GitHub's arm64 macOS image, where
+        # Homebrew LLVM is installed under /opt/homebrew/opt/llvm.
+        if: >-
+          ${{
+            contains(inputs.verify_command, '/opt/homebrew/opt/llvm/bin/') ||
+            contains(inputs.verify_command, 'llvm-ar') ||
+            contains(inputs.verify_command, 'llvm-ranlib')
+          }}
+        run: |
+          set -euo pipefail
+          if ! brew list --formula llvm >/dev/null 2>&1; then
+            brew install llvm
+          fi
+          llvm_prefix="$(brew --prefix llvm)"
+          if [[ "${llvm_prefix}" != "/opt/homebrew/opt/llvm" ]]; then
+            echo "Homebrew llvm installed at ${llvm_prefix}, but the verification command expects /opt/homebrew/opt/llvm" >&2
+            exit 1
+          fi
+          test -x /opt/homebrew/opt/llvm/bin/llvm-ar
+          test -x /opt/homebrew/opt/llvm/bin/llvm-ranlib
+
       - name: Apply candidate patch
         working-directory: target
         env:

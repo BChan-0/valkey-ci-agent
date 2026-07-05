@@ -10,11 +10,12 @@ reset on every non-success exit.
 from __future__ import annotations
 
 import json
+import subprocess
 from unittest.mock import MagicMock, patch
 
 from scripts.ci_fix import review as review_mod
 from scripts.ci_fix.models import FixPath, FixProposal, ReviewVerdict, RunResult
-from scripts.ci_fix.review import review_fix, run_fix_loop
+from scripts.ci_fix.review import combined_command, review_fix, run_fix_loop
 
 
 def patch_build_approved(func):
@@ -285,6 +286,37 @@ def test_is_noop_command_catches_short_circuit_and_trailing():
     assert _is_noop_command("make && ./runtest --single x") is False
     assert _is_noop_command("./runtest --single x") is False
     assert _is_noop_command("cc -o x x.c && ./x") is False
+
+
+def test_combined_command_groups_semicolon_build_before_verify():
+    proposal = FixProposal(
+        path=FixPath.AUTHOR, failing_check="t", root_cause="rc", reasoning="why",
+        confidence=0.9,
+        build_command="export AR=/tmp/missing-ar; false",
+        verify_command="echo should-not-run",
+    )
+    command = combined_command(proposal)
+    assert command == "{\nexport AR=/tmp/missing-ar; false\n} && {\necho should-not-run\n}"
+
+    result = subprocess.run(
+        ["/bin/sh", "-c", command],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert "should-not-run" not in result.stdout
+
+
+def test_combined_command_leaves_plain_command_ungrouped():
+    proposal = FixProposal(
+        path=FixPath.AUTHOR, failing_check="t", root_cause="rc", reasoning="why",
+        confidence=0.9,
+        build_command="make",
+        verify_command="./runtest --single x",
+    )
+
+    assert combined_command(proposal) == "make && ./runtest --single x"
 
 
 def test_oversized_patch_refuses():
