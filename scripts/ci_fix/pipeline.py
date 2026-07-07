@@ -35,10 +35,12 @@ from scripts.ci_fix.models import (
 from scripts.ci_fix.port_discovery import PortCandidate, discover_port_candidates
 from scripts.ci_fix.push import PushRefused, commit_and_push_fix, commit_and_push_port
 from scripts.ci_fix.review import (
+    DEFAULT_VERIFY_RUNS,
     LoopResult,
     build_and_review_patch,
     combined_command,
     precheck_command,
+    reset_worktree,
     run_fix_loop,
 )
 from scripts.ci_fix.verify.base import (
@@ -60,6 +62,8 @@ RunLoop = Callable[..., LoopResult]
 Push = Callable[..., str]
 PortPush = Callable[..., str]
 
+_MACOS_FIX_MAX_ATTEMPTS = 5
+
 
 def run_ci_fix(
     gh: Any,
@@ -72,6 +76,7 @@ def run_ci_fix(
     artifact_client: ArtifactClient,
     org: str = "valkey-io",
     auth_team: str = "contributors",
+    verify_runs: int = DEFAULT_VERIFY_RUNS,
     diagnose_func: Diagnose = diagnose_failure,
     run_loop_func: RunLoop = run_fix_loop,
     push_func: Push = commit_and_push_fix,
@@ -94,6 +99,7 @@ def run_ci_fix(
             artifact_client=artifact_client, git_env=git_env,
             diagnose_func=diagnose_func, run_loop_func=run_loop_func, push_func=push_func,
             port_push_func=port_push_func, macos_verifier=macos_verifier,
+            verify_runs=verify_runs,
         )
     run_url = f"https://github.com/{request.repo_full_name}/actions/runs/{request.run_id}"
     return replace(outcome, failing_run_url=run_url)
@@ -111,6 +117,7 @@ def _run_in_workspace(
     push_func: Push,
     port_push_func: PortPush,
     macos_verifier: VerifyBackend | None,
+    verify_runs: int,
 ) -> FixOutcome:
     logs = artifact_client.download_run_logs(request.repo_full_name, request.run_id)
     if not logs:
@@ -153,6 +160,7 @@ def _run_in_workspace(
     return _loop_and_push(
         repo_dir, request, proposal, plan,
         run_loop_func=run_loop_func, git_env=git_env, push_func=push_func,
+        verify_runs=verify_runs,
     )
 
 
@@ -192,9 +200,12 @@ def _plan_verification(
 def _loop_and_push(
     repo_dir: Path, request: FixRequest, proposal: FixProposal, plan: VerificationPlan,
     *, run_loop_func: RunLoop, git_env: dict[str, str], push_func: Push,
+    verify_runs: int,
 ) -> FixOutcome:
     """Local/Docker: apply, verify in-loop (retry on fail), review, push on green."""
-    loop = run_loop_func(str(repo_dir), proposal, container_image=plan.image)
+    loop = run_loop_func(
+        str(repo_dir), proposal, container_image=plan.image, verify_runs=verify_runs,
+    )
     if loop.handoff:
         return FixOutcome(
             kind=OutcomeKind.HANDOFF, summary=loop.detail, proposal=proposal,
@@ -283,7 +294,7 @@ def _verify_once_and_push(
     repo_dir: Path, request: FixRequest, proposal: FixProposal, plan: VerificationPlan,
     *, verifier: VerifyBackend | None, git_env: dict[str, str], push_func: Push,
 ) -> FixOutcome:
-    """macOS: no local build loop. Apply once, review the patch, verify remotely, push on green.
+    """macOS: apply, review, and remotely verify with bounded feedback retries.
 
     Any unexpected error becomes a FAILED outcome so the invocation always
     produces a PR comment.
@@ -295,30 +306,21 @@ def _verify_once_and_push(
         if precheck:
             return _refuse(proposal, precheck)
 
-        applied, changed = apply_fix(str(repo_dir), proposal)
-        if not applied:
-            return _refuse(proposal, "fix not applied (agent declined or made no edits)")
-
-        reviewed = build_and_review_patch(str(repo_dir), changed, proposal)
-        if not reviewed.ok:
-            return FixOutcome(
-                kind=OutcomeKind.REFUSED, summary=reviewed.detail,
-                proposal=proposal, review=reviewed.review,
-                other_failing_checks=proposal.other_failing_checks,
+        # The push path extracts an approved patch and applies it in a separate
+        # clean clone, so resetting this worktree on the way out is safe
+        # for every outcome, including a successful push.
+        try:
+            return _macos_fix_loop(
+                repo_dir, request, proposal, plan,
+                verifier=verifier, git_env=git_env, push_func=push_func,
             )
-
-        result: VerificationResult = verifier.verify(str(repo_dir), plan, reviewed.patch)
-        if not result.verified:
-            return FixOutcome(
-                kind=OutcomeKind.REFUSED, summary=result.detail,
-                proposal=proposal, review=reviewed.review, macos_run_url=result.run_url,
-                other_failing_checks=proposal.other_failing_checks,
-            )
-        return _push(
-            repo_dir, request, proposal, changed,
-            review=reviewed.review, verify_backend=backend_label(VerifyEnv.MACOS),
-            macos_run_url=result.run_url, git_env=git_env, push_func=push_func,
-        )
+        finally:
+            try:
+                reset_worktree(str(repo_dir))
+            except Exception:  # noqa: BLE001 - cleanup failure must not mask the real outcome
+                logger.warning(
+                    "failed to reset worktree after macOS verification", exc_info=True,
+                )
     except Exception:  # noqa: BLE001 - every outcome must become a comment
         logger.exception("macOS verification raised unexpectedly")
         return FixOutcome(
@@ -329,6 +331,83 @@ def _verify_once_and_push(
             ),
             proposal=proposal, other_failing_checks=proposal.other_failing_checks,
         )
+
+
+def _macos_fix_loop(
+    repo_dir: Path, request: FixRequest, proposal: FixProposal, plan: VerificationPlan,
+    *, verifier: VerifyBackend, git_env: dict[str, str], push_func: Push,
+) -> FixOutcome:
+    """Apply, review, and remotely verify the fix up to N times with feedback.
+
+    Each attempt starts from a clean tree and feeds the previous rejection or
+    failed run's log tail back to the agent. The caller resets the worktree on
+    exit, so this loop never has to.
+    """
+    feedback = ""
+    last_review: Any = None
+    last_summary = "no macOS verification attempt made"
+    last_run_url = ""
+
+    for _attempt in range(1, _MACOS_FIX_MAX_ATTEMPTS + 1):
+        reset_worktree(str(repo_dir))
+
+        applied, changed = apply_fix(str(repo_dir), proposal, feedback=feedback)
+        if not applied:
+            return _refuse(proposal, "fix not applied (agent declined or made no edits)")
+
+        reviewed = build_and_review_patch(str(repo_dir), changed, proposal)
+        last_review = reviewed.review
+        if not reviewed.ok:
+            if reviewed.review is None:
+                return FixOutcome(
+                    kind=OutcomeKind.REFUSED, summary=reviewed.detail,
+                    proposal=proposal, review=reviewed.review,
+                    other_failing_checks=proposal.other_failing_checks,
+                )
+            feedback = (
+                f"A reviewer rejected your previous fix: {reviewed.review.reasoning}\n\n"
+                f"Your previous diff was:\n{reviewed.patch}\n\n"
+                "Address the rejection; do not reproduce the same change."
+            )
+            last_summary = reviewed.detail
+            continue
+
+        result = verifier.verify(str(repo_dir), plan, reviewed.patch)
+        last_run_url = result.run_url
+        if result.verified:
+            return _push(
+                repo_dir, request, proposal, changed,
+                review=reviewed.review, verify_backend=backend_label(VerifyEnv.MACOS),
+                macos_run_url=result.run_url, git_env=git_env, push_func=push_func,
+            )
+        if not result.ran:
+            return FixOutcome(
+                kind=OutcomeKind.REFUSED, summary=result.detail,
+                proposal=proposal, review=reviewed.review, macos_run_url=result.run_url,
+                other_failing_checks=proposal.other_failing_checks,
+            )
+        feedback = _macos_retry_feedback(result)
+        last_summary = result.detail
+
+    return FixOutcome(
+        kind=OutcomeKind.REFUSED, summary=last_summary,
+        proposal=proposal, review=last_review, macos_run_url=last_run_url,
+        other_failing_checks=proposal.other_failing_checks,
+    )
+
+
+def _macos_retry_feedback(result: VerificationResult) -> str:
+    lines = [
+        f"The previous macOS verification run failed: {result.detail}",
+    ]
+    if result.run_url:
+        lines.append(f"Run URL: {result.run_url}")
+    if result.output_tail:
+        lines.append("Output tail:")
+        lines.append(result.output_tail)
+    else:
+        lines.append("No macOS log tail was available; inspect the run URL if needed.")
+    return "\n".join(lines)
 
 
 def _push(

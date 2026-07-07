@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import base64
 import logging
+import re
+import shlex
 import time
 import uuid
 from typing import Any
@@ -20,6 +22,7 @@ from typing import Any
 from scripts.ci_fix.review import MAX_REVIEWABLE_PATCH_CHARS
 from scripts.ci_fix.verify.base import VerificationPlan, VerificationResult
 from scripts.common.github_client import retry_github_call
+from scripts.common.workflow_artifacts import ArtifactClient
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +36,64 @@ VERIFY_MACOS_WORKFLOW = "ci-fix-verify-macos.yml"
 _MAX_PATCH_BYTES = (MAX_REVIEWABLE_PATCH_CHARS * 4) // 3 + 1024
 _POLL_INTERVAL_S = 20
 _DEFAULT_TIMEOUT_S = 60 * 60
+_MAX_LOG_TAIL_CHARS = 4000
+# The verify-macos step that runs the candidate command; its log is the part a
+# retry needs. Matches the GitHub log member name, which embeds the step name.
+_VERIFY_STEP_MARKER = "Run targeted verification"
+_MAKE_COMMAND_RE = re.compile(
+    r"(?P<prefix>(?:^|(?<=[;&|{}])\s*))"
+    r"(?P<command>make(?:\s+(?:\"[^\"]*\"|'[^']*'|[^\s;&|{}]+))*)"
+)
+_ROOT_SRC_OBJECT_RE = re.compile(r"^src/(?P<target>.+\.o)$")
+
+
+def normalize_macos_verify_command(command: str) -> str:
+    """Rewrite unsafe root-level Valkey object builds for macOS verification.
+
+    A command such as ``make src/unit/test_networking.o`` from the repo root
+    does not use Valkey's ``src/Makefile``; GNU make falls back to an implicit
+    compile rule and misses the project's include paths and generated
+    prerequisites. Run that targeted object build through ``make -C src``
+    instead, while leaving other commands unchanged.
+    """
+    return _MAKE_COMMAND_RE.sub(_rewrite_make_command, command)
+
+
+def _rewrite_make_command(match: re.Match[str]) -> str:
+    prefix = match.group("prefix")
+    make_command = match.group("command")
+    try:
+        tokens = shlex.split(make_command)
+    except ValueError:
+        return match.group(0)
+    if len(tokens) < 2 or tokens[0] != "make" or _has_make_directory(tokens):
+        return match.group(0)
+
+    rewritten = False
+    args: list[str] = []
+    for token in tokens[1:]:
+        target = _ROOT_SRC_OBJECT_RE.match(token)
+        if target:
+            args.append(target.group("target"))
+            rewritten = True
+        else:
+            args.append(token)
+    if not rewritten:
+        return match.group(0)
+    return f"{prefix}{shlex.join(['make', '-C', 'src', *args])}"
+
+
+def _has_make_directory(tokens: list[str]) -> bool:
+    for index, token in enumerate(tokens[1:], start=1):
+        if token == "-C" and index + 1 < len(tokens):
+            return True
+        if token.startswith("-C") and token != "-C":
+            return True
+        if token == "--directory" and index + 1 < len(tokens):
+            return True
+        if token.startswith("--directory="):
+            return True
+    return False
 
 
 class MacosVerifier:
@@ -45,11 +106,13 @@ class MacosVerifier:
         agent_repo_full_name: str,
         ref: str = "main",
         timeout: int = _DEFAULT_TIMEOUT_S,
+        artifact_client: ArtifactClient | None = None,
     ) -> None:
         self._gh = github_client
         self._agent_repo = agent_repo_full_name
         self._ref = ref
         self._timeout = timeout
+        self._artifact_client = artifact_client
 
     def verify(self, repo_dir: str, plan: VerificationPlan, patch: str) -> VerificationResult:
         """Verify ``patch`` against ``plan.head_sha`` on a macOS runner."""
@@ -83,17 +146,44 @@ class MacosVerifier:
             return VerificationResult(
                 verified=True, ran=True, detail="targeted macOS verification passed", run_url=url,
             )
+        output_tail = self._run_log_tail(run)
         return VerificationResult(
             verified=False, ran=True,
             detail=f"targeted macOS verification did not pass ({conclusion})", run_url=url,
+            output_tail=output_tail,
         )
 
+    def _run_log_tail(self, run: Any) -> str:
+        """Best-effort tail of a failed run's logs for retry feedback.
+
+        Uses ``ArtifactClient.download_run_logs``, which follows GitHub's 302 to
+        blob storage without leaking the token and caps the uncompressed size.
+        Returns an empty string when no client is configured or the logs are
+        unavailable; log feedback is helpful, not required.
+        """
+        if self._artifact_client is None:
+            return ""
+        run_id = getattr(run, "id", None)
+        if not isinstance(run_id, int):
+            return ""
+        try:
+            logs = self._artifact_client.download_run_logs(self._agent_repo, run_id)
+        except Exception as exc:  # noqa: BLE001 - log feedback is helpful, not required
+            logger.warning("downloading verify-macos logs failed: %s", exc)
+            return ""
+        return _tail_log_map(logs)
+
     def _dispatch(self, plan: VerificationPlan, encoded_patch: str, token: str) -> bool:
+        command = plan.command
+        if not plan.workdir.strip():
+            command = normalize_macos_verify_command(plan.command)
+        if command != plan.command:
+            logger.info("Normalized macOS verification command: %s", command)
         inputs = {
             "target_repo": plan.target_repo,
             "head_sha": plan.head_sha,
             "patch_b64": encoded_patch,
-            "verify_command": plan.command,
+            "verify_command": command,
             "workdir": plan.workdir,
             "correlation": token,
         }
@@ -189,3 +279,31 @@ def _run_created_after(run: Any, since: float) -> bool:
         return created.timestamp() >= since - _CREATED_AT_TOLERANCE_S
     except (AttributeError, TypeError, ValueError):
         return False
+
+
+def _tail_log_map(logs: dict[str, bytes]) -> str:
+    """Return a bounded tail of the verify step's log for retry feedback.
+
+    The step that runs the candidate command is what a retry needs, so its log
+    is tailed directly; joining other (possibly large) members first would push
+    the actual failure out of the ``_MAX_LOG_TAIL_CHARS`` window. Only when that
+    step is absent do we fall back to the remaining members as context.
+    """
+    if not logs:
+        return ""
+
+    step = next((name for name in sorted(logs) if _VERIFY_STEP_MARKER in name), None)
+    if step is not None:
+        return _tail_text(logs[step].decode("utf-8", errors="replace"))
+
+    combined = "\n".join(
+        f"===== {name} =====\n{logs[name].decode('utf-8', errors='replace')}"
+        for name in sorted(logs)
+    )
+    return _tail_text(combined)
+
+
+def _tail_text(text: str) -> str:
+    if len(text) <= _MAX_LOG_TAIL_CHARS:
+        return text
+    return "[truncated]\n" + text[-_MAX_LOG_TAIL_CHARS:]

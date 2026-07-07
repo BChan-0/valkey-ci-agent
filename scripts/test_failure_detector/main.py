@@ -40,6 +40,7 @@ def _build_job_summary(
         f"| Issues created | {result.get('created', 0)} |",
         f"| Issues skipped (duplicate run) | {result.get('skipped', 0)} |",
         f"| Issues updated | {result.get('updated', 0)} |",
+        f"| MISC Errors | {result.get('errors', 0)} |",
         "",
     ]
     return "\n".join(lines)
@@ -97,7 +98,38 @@ def run(
         emit_job_summary(_build_job_summary(run_id, repo_full_name, 0, {}))
         return 0
 
-    all_failures = json.loads(artifact_content)
+    try:
+        all_failures = json.loads(artifact_content)
+    except json.JSONDecodeError as exc:
+        # A malformed or truncated artifact must not crash the run before we
+        # report; surface it in the job summary and exit non-zero instead.
+        logger.error(
+            "Could not parse all-test-failures artifact from run %d: %s", run_id, exc,
+        )
+        emit_job_summary(
+            f"### ⚠️ Test Failure Detector\n\n"
+            f"Could not parse the `all-test-failures` artifact from "
+            f"[run #{run_id}](https://github.com/{repo_full_name}/actions/runs/{run_id}) "
+            f"— the artifact is malformed or truncated."
+        )
+        return 1
+
+    # The artifact is {job_name: {suite_name: [...]}}. Valid JSON of the wrong
+    # shape still gets here: a bare scalar would crash on len() below, and a
+    # top-level list would parse as "no failures". Require a dict.
+    if not isinstance(all_failures, dict):
+        logger.error(
+            "Unexpected all-test-failures artifact from run %d: expected a JSON "
+            "object, got %s",
+            run_id, type(all_failures).__name__,
+        )
+        emit_job_summary(
+            f"### ⚠️ Test Failure Detector\n\n"
+            f"The `all-test-failures` artifact from "
+            f"[run #{run_id}](https://github.com/{repo_full_name}/actions/runs/{run_id}) "
+            f"has an unexpected format — expected a JSON object."
+        )
+        return 1
     logger.info("Loaded failures from %d job(s)", len(all_failures))
 
     # Step 3: Get job URLs for CI links
@@ -128,6 +160,16 @@ def run(
     result = process_failures(gh, repo_full_name, unique_failures, run_id=run_id)
 
     emit_job_summary(_build_job_summary(run_id, repo_full_name, len(unique_failures), result))
+
+    # process_failures isolates per-failure errors so one bad failure can't
+    # abort the batch, but those failures got no issue created or updated. Exit
+    # non-zero so a GitHub outage that skips issue updates doesn't leave CI green.
+    if result.get("errors", 0) > 0:
+        logger.error(
+            "%d failure(s) could not be processed; exiting non-zero.",
+            result["errors"],
+        )
+        return 1
     return 0
 
 def main() -> None:
