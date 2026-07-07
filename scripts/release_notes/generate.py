@@ -128,8 +128,9 @@ def _parse_batch(
     A bullet whose ``pr`` is not an exact ``int`` in *valid_numbers* is dropped
     (the model must not invent PRs, and a coerced float/bool must not alias a
     real one; see :func:`_as_pr_number`). A bullet whose ``category`` is unknown
-    is kept verbatim and logged; render places it after the canonical categories,
-    matching the format module's ``unrecognized_categories`` handling.
+    is kept and logged; render then coerces it into the catch-all
+    (``CATCH_ALL_CATEGORY``, "Other Changes") rather than emitting an invented
+    header (see :func:`render.group_bullets`).
     """
     obj = extract_json_object(stdout, required_key="bullets")
     if obj is None:

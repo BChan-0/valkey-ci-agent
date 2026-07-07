@@ -126,9 +126,11 @@ def group_bullets(
     # the catch-all and shipped alongside the real auto-generated section.
     reserved = _reserved_sections(fmt)
     canonical = set(fmt.CATEGORIES)
-    # The catch-all must be a canonical category; fall back to the last canonical
-    # name if the format module does not name one, so an off-list bullet always
-    # has a valid home rather than resurrecting an invented header.
+    # The catch-all must be a canonical category; if the resolved name is not
+    # canonical (a format module that names a non-canonical catch-all, or the
+    # "Other Changes" default when that is somehow off-list), fall back to the
+    # last canonical name so an off-list bullet always has a valid home rather
+    # than resurrecting an invented header.
     catch_all = getattr(fmt, "CATCH_ALL_CATEGORY", "Other Changes")
     if catch_all not in canonical:
         catch_all = fmt.CATEGORIES[-1]

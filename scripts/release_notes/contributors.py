@@ -1,7 +1,8 @@
 """Generate the deduplicated, alpha-sorted contributor list for a release.
 
 Collects the GitHub authors of every commit in a ``base..head`` range and
-renders them as ``* Full Name @handle`` bullets, sorted by display name. The
+returns them as ``Full Name @handle`` strings, sorted by display name (the
+``* `` bullet prefix is added downstream by ``render_contributors_footer``). The
 commit range and author logins come from the GitHub compare API; each unique
 login is then resolved to a display name via the users API. When the API is
 unavailable (no token / offline), it falls back to ``git shortlog`` over the

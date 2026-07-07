@@ -69,8 +69,9 @@ _VERSION_TOKEN_RE = re.compile(r"(?<![\d.])(\d+\.\d+\.\d+)(?![\d.])")
 # legitimately holds a range, and the PR-body disclaimer asks a maintainer to add
 # anything missed, so the residual gaps are harmless.
 _RANGE_BOUND_RE = re.compile(r"(?:[<>]=?|\s[-~^])\s*$")
-# CVE identifier, used both to pick the display id and to dedup a manual
-# --security-fix that names the same CVE (manual wins).
+# CVE identifier. Scrapes CVE ids out of a manual --security-fix entry so it can
+# dedup against an advisory bearing the same CVE (manual wins). The advisory's own
+# display id comes from its structured fields via _cve_id(), not this regex.
 _CVE_ID_RE = re.compile(r"CVE-\d{4}-\d{4,}", re.IGNORECASE)
 # GHSA identifier (GitHub's own advisory id: "GHSA-" + three 4-char groups). An
 # advisory without a CVE yet is rendered as "(GHSA-...) ...", so a manual

@@ -20,7 +20,8 @@ The AI generates the bullets for the range as an in-memory ``{category:
 [line, ...]}`` map (the discover/generate/render pipeline); nothing is ever
 written to a branch as an "unreleased" block. ``render_release_notes`` renders
 that map into a new dated section on the release line, prepends prior RCs' dated
-sections, appends the running contributor list, and bumps ``src/version.h``.
+sections, and appends the running contributor list; ``set_version`` separately
+bumps ``src/version.h``.
 
 Successive RCs do not double-note. Each cut discovers PRs by graph range from
 HEAD back to the most recent reachable RC tag, so a PR captured by rc1's tag is
@@ -519,8 +520,10 @@ def _credited_pr_numbers(notes_text: str) -> set[int]:
         if stripped.startswith("### "):
             in_security = stripped[len("### "):].strip() == security_header
             continue
-        # Any level-2 header (a new dated section) leaves whatever ### category
-        # we were in.
+        # Defensive: a "## " ATX header would leave whatever ### category we were
+        # in. render_release_notes emits dated sections setext-style (heading +
+        # "-" underline), not as "## " headers, so this does not fire on our own
+        # output; it guards a hand-edited or differently-formatted changelog.
         if stripped.startswith("## "):
             in_security = False
             continue

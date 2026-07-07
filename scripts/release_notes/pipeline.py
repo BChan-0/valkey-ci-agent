@@ -35,7 +35,7 @@ class RegenResult:
     grouped: dict[str, list[str]]  # {category: [rendered bullet line, ...]} for this cut
     included: int               # PRs included (labelled release-notes)
     bullet_count: int           # bullets actually rendered (post group_bullets: after dup-PR dedup and reserved-category drops)
-    skipped: tuple[int, ...]    # PR numbers the model declined
+    skipped: tuple[int, ...]    # PR numbers with no rendered note: model-declined, parse-failure batches, or reserved-category drops (see regenerate_unreleased)
     triage: tuple[MergedPR, ...]  # untagged / double-labelled PRs
     had_prs: bool               # whether the range contained any PR at all
     duplicate_prs: tuple[int, ...] = ()  # PR numbers the model emitted more than once (extra bullets dropped)

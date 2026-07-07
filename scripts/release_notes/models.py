@@ -40,8 +40,10 @@ class MergedPR:
     :func:`discover._clean_pr_body`); it is the model's richest signal for what a
     change means to a user, and is ``""`` when the PR has no description. It is
     untrusted text, so the generate prompt marks it as data, never instructions.
-    ``merge_commit_sha`` may be ``""`` for a PR resolved from a commit subject
-    that was never confirmed against the API.
+    ``merge_commit_sha`` defaults to ``""`` (used by test constructors); the
+    discovery pipeline always fills it with ``pull.merge_commit_sha`` or the
+    range commit's SHA (see :func:`discover.hydrate_prs`), so it is non-empty
+    for a PR built there.
     """
 
     number: int

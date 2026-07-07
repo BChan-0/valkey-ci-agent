@@ -261,10 +261,12 @@ jobs:
               [[ -n "${fix//[[:space:]]/}" ]] && args+=(--security-fix "${fix}")
             done <<< "${fixes}"
           fi
-          # Read dry_run from env like every other input, not raw ${{ }}
-          # interpolation into the script body: an expression is substituted before
-          # the shell parses the line, so a value would land in the code itself,
-          # whereas an env var is only ever a string the shell reads.
+          # Read dry_run from env like every other input, not a raw workflow
+          # expression interpolated into the script body: an expression is
+          # substituted before the shell parses the line, so a value would land in
+          # the code itself, whereas an env var is only ever a string the shell
+          # reads. (Even in a comment, a literal expression is evaluated by the
+          # Actions parser, so we describe it in prose rather than writing one.)
           if [[ "${RELEASE_NOTES_DRY_RUN}" == "true" ]]; then
             args+=(--dry-run)
           fi

@@ -53,12 +53,12 @@ CATCH_ALL_CATEGORY = "Other Changes"
 # (--security-fix) and render first, ahead of the canonical categories.
 SECURITY_CATEGORY = "Security Fixes"
 
-# The contributor list is generated from the merged-PR authors of the release
+# The contributor list is generated from the commit authors of the release
 # range (contributors.py), deduplicated and alpha-sorted, not hand-edited.
 CONTRIBUTORS_SECTION = "Contributors"
 
 # Sections that are populated automatically at release time from a factual
-# source (the CVE list / the merged-PR authors), so a bullet the generator
+# source (the CVE list / the range's commit authors), so a bullet the generator
 # assigns to one of these is refused rather than rendered (:mod:`render`'s
 # ``group_bullets`` drops it and warns), keeping them the sole source of truth.
 RESERVED_SECTIONS = (SECURITY_CATEGORY, CONTRIBUTORS_SECTION)
@@ -92,7 +92,7 @@ def parse_version(version: str) -> "tuple[int, int, int]":
     """Split ``"M.m.p"`` into integer ``(major, minor, patch)``.
 
     Each component must be an integer in the inclusive range 0-255 so it fits
-    a single byte of ``VALKEY_VERSION_NUM`` (see bump_version.py).
+    a single byte of ``VALKEY_VERSION_NUM`` (see version_bump.py).
     """
     match = _VERSION_RE.match(version.strip())
     if not match:
