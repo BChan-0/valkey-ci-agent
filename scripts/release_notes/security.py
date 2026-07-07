@@ -131,9 +131,13 @@ def _cve_id(advisory: Any) -> str:
     if direct:
         return direct
     try:
-        identifiers = advisory.identifiers or []
+        identifiers = advisory.identifiers
     except Exception:  # noqa: BLE001
-        identifiers = []
+        identifiers = None
+    # A mis-parsed payload can hand back a non-list here; iterating it would raise
+    # and abort the cut, so treat anything but a list as "no identifiers".
+    if not isinstance(identifiers, list):
+        return ""
     for ident in identifiers:
         if isinstance(ident, dict) and ident.get("type") == "CVE" and ident.get("value"):
             return str(ident["value"])
@@ -170,7 +174,11 @@ def patched_version_tokens(raw_vulnerabilities: Sequence[Any]) -> set[str]:
     range never marks a boundary version as fixed.
     """
     tokens: set[str] = set()
-    for vuln in raw_vulnerabilities or []:
+    # A mis-parsed payload can put a non-list here; iterating a scalar would raise
+    # and abort the cut, so ignore anything that is not a list.
+    if not isinstance(raw_vulnerabilities, list):
+        return tokens
+    for vuln in raw_vulnerabilities:
         if not isinstance(vuln, dict):
             continue
         patched = vuln.get("patched_versions")
@@ -187,19 +195,24 @@ def patched_version_tokens(raw_vulnerabilities: Sequence[Any]) -> set[str]:
 
 
 def _render_summary(advisory: Any) -> str:
-    """Return the advisory summary collapsed to one line, for the note text.
+    """Return the advisory summary as a single line, for the note text.
 
-    An embedded newline would split the bullet or inject a stray heading into the
-    changelog (the same hazard :mod:`render` guards against), so collapse on the
-    boundaries ``str.splitlines`` uses. Falls back to the ``description`` (its
-    whole text, flattened to one line) when ``summary`` is empty, then to a
-    placeholder, so a bullet is never emitted empty.
+    ``summary`` is already a one-line field. When it is empty, falls back to the
+    first non-blank line of the (often multi-paragraph) ``description`` rather
+    than the whole thing, so the fallback bullet stays a sentence, not the entire
+    write-up. Then to a placeholder, so a bullet is never emitted empty. Any
+    embedded newline is dropped either way: it would otherwise split the bullet
+    or inject a stray heading into the changelog (the hazard :mod:`render` guards
+    against).
     """
     summary = _string_attr(advisory, "summary")
-    if not summary:
-        summary = _string_attr(advisory, "description")
-    one_line = " ".join(summary.splitlines()).strip()
-    return one_line or "(no summary provided)"
+    if summary:
+        return " ".join(summary.splitlines()).strip() or "(no summary provided)"
+    description = _string_attr(advisory, "description")
+    for line in description.splitlines():
+        if line.strip():
+            return line.strip()
+    return "(no summary provided)"
 
 
 # Sentinel distinguishing "read the advisory, it does not fix this version" (None)
@@ -216,7 +229,7 @@ def _extract_fix(advisory: Any, version: str) -> "Optional[AdvisoryFix] | object
     Returns ``None`` when the advisory was read but *version* is not among its
     patched-version tokens (exact membership, never a range comparison), or when it
     carries no CVE/GHSA id to put in the parens. Returns :data:`_UNREADABLE` when
-    the advisory's ``raw_data`` could not be read at all -- a case the caller must
+    the advisory's ``raw_data`` could not be read at all, a case the caller must
     not treat as a non-match, since an unread advisory might still fix this version.
     """
     try:

@@ -41,7 +41,7 @@ class TestBuildPrompt:
     def test_prompt_forbids_model_from_emitting_attribution(self) -> None:
         # render appends "(#N)" and "by @handle" in code, so the prompt MUST keep
         # telling the model to omit the PR number / author / "by @" / "(#N)" from
-        # its text -- drop that rule and every note gets double-attributed. Locate
+        # its text; drop that rule and every note gets double-attributed. Locate
         # the prohibition and assert each forbidden token is named *within it*, not
         # merely present elsewhere (the "(#N)" in the ## Output schema is not proof
         # the rule survives).

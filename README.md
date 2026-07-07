@@ -355,9 +355,12 @@ gh workflow run release-notes-cut.yml \
 ```
 
 Optional inputs: `date` (defaults to today), `base_ref` (explicit baseline ref
-overriding tag resolution), `contrib_base_ref` (contributor range start), and
-`dry_run` (compute and log the cut without pushing or opening a PR). Stage is
-`rc1..rcN` or `ga`, case-insensitive.
+overriding tag resolution), `contrib_base_ref` (contributor range start),
+`security_fixes` (manual Security Fixes bullets, one `--security-fix` per entry),
+`security_from_advisories` (also render published GitHub security advisories
+fixed by this version into Security Fixes), and `dry_run` (compute and log the
+cut without pushing or opening a PR). Stage is `rc1..rcN` or `ga`,
+case-insensitive.
 
 **Branch model** (one long-running branch per minor line):
 
@@ -433,7 +436,11 @@ Reuses the same secrets and OIDC role as the other workflows (see
 [Step 1](#step-1-configure-secrets-and-variables)). The workflow mints one
 short-lived App token on `valkey-io/valkey` with `contents:write` (push the prep
 branch, create/delete release lines), `pull-requests:write` (open the release PR),
-and `metadata:read`.
+and `metadata:read`. When `security_from_advisories` is set, it mints a token
+that additionally holds `repository-advisories:read`; that permission is
+requested only for an advisory cut, so an ordinary cut is never blocked when the
+App installation lacks it. The App installation must hold
+`repository-advisories:read` for an advisory cut to read the advisories.
 
 ## Safety
 

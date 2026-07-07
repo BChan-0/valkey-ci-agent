@@ -256,6 +256,38 @@ def test_cut_failure_returns_one(patched):
     assert rc == 1
 
 
+def test_valueerror_logged_without_traceback(patched, caplog):
+    # A validation ValueError from cut() carries a message written to stand on its
+    # own; it is logged as an error line (not a traceback) and exits 1.
+    def _cut(repo, **kwargs):
+        raise ValueError("--base-ref 'nope' not found in the clone")
+
+    patched.setattr(main_mod.cut_mod, "cut", _cut)
+    with caplog.at_level("ERROR"):
+        rc = main(["--token", "t", "--head-ref", "unstable", "--version", "9.1.0",
+                   "--stage", "rc2", "--urgency", "LOW"])
+    assert rc == 1
+    msgs = [r.message for r in caplog.records]
+    assert any("Release cut failed: --base-ref 'nope' not found" in m for m in msgs)
+    # An exc_info traceback would attach the exception to the record; a clean
+    # logger.error(...) does not.
+    assert all(r.exc_info is None for r in caplog.records if "Release cut failed:" in r.message)
+
+
+def test_calledprocesserror_stderr_logged(patched, caplog):
+    import subprocess
+
+    def _cut(repo, **kwargs):
+        raise subprocess.CalledProcessError(128, ["git", "push"], stderr="protected ref")
+
+    patched.setattr(main_mod.cut_mod, "cut", _cut)
+    with caplog.at_level("ERROR"):
+        rc = main(["--token", "t", "--head-ref", "unstable", "--version", "9.1.0",
+                   "--stage", "rc2", "--urgency", "LOW"])
+    assert rc == 1
+    assert any("protected ref" in r.message for r in caplog.records)
+
+
 # --- baseline glob / base-ref resolution ---
 
 class TestDefaultTagGlob:
@@ -290,13 +322,13 @@ class TestDefaultBaseRefForRc1:
 
     def test_patch_uses_prior_patch_not_previous_minor(self) -> None:
         # A patch cut covers only changes since the prior patch, so the baseline is
-        # M.m.(p-1), NOT the previous minor -- deriving 9.1.0 here would re-credit
+        # M.m.(p-1), NOT the previous minor. Deriving 9.1.0 here would re-credit
         # the entire 9.2.0/.1/.2 patch line.
         assert main_mod._default_base_ref_for_rc1("9.2.3") == "9.2.2"
         assert main_mod._default_base_ref_for_rc1("9.2.1") == "9.2.0"
 
     def test_patch_of_first_minor_uses_prior_patch(self) -> None:
-        # 9.0.5 has patch>0, so its baseline is the prior patch 9.0.4 -- the old
+        # 9.0.5 has patch>0, so its baseline is the prior patch 9.0.4. The old
         # minor==0 guard wrongly returned None (unanchored) for this.
         assert main_mod._default_base_ref_for_rc1("9.0.5") == "9.0.4"
         assert main_mod._default_base_ref_for_rc1("9.0.1") == "9.0.0"
@@ -331,7 +363,7 @@ def test_rc1_without_base_ref_warns_and_defaults(patched, caplog):
 
 def test_rc1_patch_defaults_base_ref_to_prior_patch(patched, caplog):
     # rc1 of a patch (9.2.3) must anchor to the prior patch 9.2.2, not the previous
-    # minor 9.1.0 -- the latter silently re-credits the whole 9.2.x patch line. The
+    # minor 9.1.0, which silently re-credits the whole 9.2.x patch line. The
     # anchored value must reach cut() (baseline stays anchored, not unanchored).
     captured = _capture_cut(patched)
     import logging
@@ -384,3 +416,46 @@ def test_explicit_base_ref_overrides_glob(patched):
           "--version", "9.1.0", "--stage", "rc2", "--urgency", "LOW", "--base-ref", "unstable"])
     assert captured["base_ref"] == "unstable"
     assert captured["tag_glob"] is None
+
+
+def test_rc1_derived_base_absent_degrades_not_aborts(patched, caplog):
+    # On a tagless fork, rc1 of 9.1.0 derives 9.0.0, which is absent. A *derived*
+    # (not user-supplied) base that resolves to nothing must degrade to the
+    # nearest-tag fallback (like the M.0.0 path), not hard-fail the cut.
+    import logging
+    import subprocess
+
+    captured = _capture_cut(patched)
+
+    def _run_git(repo_dir, *args, **kwargs):
+        if args[:1] == ("rev-parse",):
+            raise subprocess.CalledProcessError(1, ["git", *args])  # derived tag absent
+        return MagicMock()
+
+    patched.setattr(main_mod, "run_git", _run_git)
+    with caplog.at_level(logging.WARNING):
+        rc = main(["--token", "t", "--head-ref", "unstable",
+                   "--version", "9.1.0", "--stage", "rc1", "--urgency", "LOW"])
+    assert rc == 0                              # cut ran; did not abort
+    assert captured["base_ref"] is None         # derived value dropped
+    assert captured["baseline_unanchored"] is True
+    assert any("falling back to the nearest" in r.message for r in caplog.records)
+
+
+def test_rc2_explicit_missing_base_still_aborts(patched):
+    # Contrast with the derived case: an *explicit* --base-ref that is missing must
+    # still hard-fail (the user asked for it), not silently fall back.
+    import subprocess
+
+    captured = _capture_cut(patched)
+
+    def _run_git(repo_dir, *args, **kwargs):
+        if args[:1] == ("rev-parse",):
+            raise subprocess.CalledProcessError(1, ["git", *args])
+        return MagicMock()
+
+    patched.setattr(main_mod, "run_git", _run_git)
+    rc = main(["--token", "t", "--head-ref", "unstable", "--version", "9.1.0",
+               "--stage", "rc2", "--urgency", "LOW", "--base-ref", "no-such-ref"])
+    assert rc == 1
+    assert captured == {}  # cut() never reached

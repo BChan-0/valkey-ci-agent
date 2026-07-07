@@ -6,10 +6,12 @@ reuses its ``CATEGORIES`` so the agent never re-encodes the category names.
 
 What this module owns is purely mechanical: turning each
 :class:`CategorizedBullet` into the canonical bullet line
-``* <text> by @<handle> (#<N>)`` (with the ``(#N)`` trailing and the
-``by @handle`` present, the form the release-notes label gate expects) and
-grouping those lines by category into the ``{category: [line, ...]}`` map that
+``* <text> by @<handle> (#<N>)`` (the ``(#N)`` trailing and the ``by @handle``
+following valkey's hand-written release-note convention) and grouping those
+lines by category into the ``{category: [line, ...]}`` map that
 :func:`release_format.render_release_notes` renders into a dated section.
+valkey's ``check_release_notes`` gate is label-only and does not parse this
+file, so the form here is a convention, not something CI validates.
 """
 
 from __future__ import annotations
@@ -23,9 +25,9 @@ from scripts.release_notes.models import CategorizedBullet
 
 logger = logging.getLogger(__name__)
 
-# A GitHub login is [A-Za-z0-9-]; the attribution the label gate expects is
-# ``by @([\w-]+)``. Anything outside that set (a space, '.', '@', or parens
-# from a malformed author) would truncate or break the captured handle.
+# A GitHub login is [A-Za-z0-9-]; the attribution follows ``by @([\w-]+)``.
+# Anything outside that set (a space, '.', '@', or parens from a malformed
+# author) would truncate or break the captured handle.
 _HANDLE_SAFE_RE = re.compile(r"[^\w-]")
 
 
@@ -54,10 +56,11 @@ def format_bullet(bullet: CategorizedBullet) -> str:
     """Render one canonical bullet line: ``* <text> by @<handle> (#<N>)``.
 
     The trailing ``(#N)`` and the ``by @handle`` are appended in this fixed
-    order so they satisfy the label gate's trailing-PR-ref and author checks.
-    When the author is unknown (a ghost account), the ``by @``
-    segment is omitted; the PR-number requirement still holds, and a missing
-    attribution is a warning, not a hard failure, in the CI check.
+    order to match valkey's hand-written release-note convention (trailing PR
+    ref, then attribution). When the author is unknown (a ghost account), the
+    ``by @`` segment is omitted. This is a formatting convention only: valkey's
+    ``check_release_notes`` gate is label-only and validates neither the PR ref
+    nor the attribution.
 
     Both the text and the handle are sanitized: the text is collapsed to a
     single line (a newline would split the bullet or inject a ``##``/``###``
@@ -95,7 +98,12 @@ def group_bullets(
     ``Contributors`` sections are refused and logged; those are generated at
     release-cut time from a factual source.
     """
-    reserved = set(getattr(fmt, "RESERVED_SECTIONS", ("Security Fixes", "Contributors")))
+    # Case-folded so a lowercase "security fixes" is refused too, not coerced into
+    # the catch-all and shipped alongside the real auto-generated section.
+    reserved = {
+        r.casefold()
+        for r in getattr(fmt, "RESERVED_SECTIONS", ("Security Fixes", "Contributors"))
+    }
     canonical = set(fmt.CATEGORIES)
     # The catch-all must be a canonical category; fall back to the last canonical
     # name if the format module does not name one, so an off-list bullet always
@@ -106,7 +114,7 @@ def group_bullets(
     grouped: dict[str, list[str]] = {}
     for bullet in bullets:
         category = _one_line(bullet.category)
-        if category in reserved:
+        if category.casefold() in reserved:
             logger.warning(
                 "Refusing PR #%s under reserved section %r (auto-generated at release)",
                 bullet.pr_number, category,

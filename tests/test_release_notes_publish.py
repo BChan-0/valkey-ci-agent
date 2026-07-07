@@ -83,3 +83,12 @@ class TestEscapeCell:
         assert escape_cell("fix\rbug") == "fix bug"        # lone CR
         assert escape_cell("a\r\n\r\nb") == "a b"          # consecutive breaks
         assert "\r" not in escape_cell("fix\r\nbug")
+
+    def test_backslash_before_pipe_stays_escaped(self) -> None:
+        # A pre-existing backslash right before a pipe must not consume the pipe's
+        # escape. "a\|b" -> "a\\\|b" renders as literal "a\|b" (no cell break),
+        # not "a\\|b" (literal backslash + a live delimiter that splits the row).
+        assert escape_cell("a\\|b") == "a\\\\\\|b"
+
+    def test_lone_backslash_escaped(self) -> None:
+        assert escape_cell("C:\\path") == "C:\\\\path"

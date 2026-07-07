@@ -41,21 +41,21 @@ it to exactly one category.
 ## Rules
 - Write for an end user reading a changelog: what changed and why it matters,
   not how it was implemented. Present tense, one sentence, <= 120 characters.
-- Do NOT include the PR number, the author, "by @...", or any "(#N)" -- those
+- Do NOT include the PR number, the author, "by @...", or any "(#N)". Those
   are added automatically. Write the description text ONLY.
 - Choose the single best-fitting category from the list above, copied verbatim.
   The list is exhaustive: every user-facing change has a home. Use "Other
   Changes" only when a change genuinely fits none of the specific categories.
   Do NOT invent a new category name. If you feel the list is missing one, still
   pick "Other Changes", set "uncertain": true, and name the category you would
-  have wanted in "uncertain_reason" -- a maintainer sees it. Any category not in
+  have wanted in "uncertain_reason", which a maintainer sees. Any category not in
   the list above is treated as this kind of suggestion and the note is placed
   under "Other Changes".
 - If a PR is purely internal with no user-facing effect (and so should not have
   been labelled for release notes), put its number in "skipped" instead of
   inventing a note.
-- If you are NOT confident about a note -- unsure which category fits, or unsure
-  whether the change is really user-facing -- still emit the bullet with your
+- If you are NOT confident about a note (unsure which category fits, or unsure
+  whether the change is really user-facing), still emit the bullet with your
   best guess, but set "uncertain": true and give a short "uncertain_reason"
   (a few words, e.g. "unclear if user-facing" or "could be Bug Fixes or Behavior
   Changes"). A human reviews every uncertain note before release.

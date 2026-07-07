@@ -24,6 +24,8 @@ import logging
 import subprocess
 from typing import Any
 
+from github.GithubException import GithubException, UnknownObjectException
+
 from scripts.backport.utils import pr_numbers_from_commit_subjects
 from scripts.common.github_client import retry_github_call
 from scripts.common.proc import git_output
@@ -146,7 +148,10 @@ def hydrate_prs(repo: Any, pr_to_sha: dict[int, str]) -> list[MergedPR]:
 
     Disposition is left at its default (TRIAGE) here; :mod:`classify` assigns
     the real value. A number that 404s (an issue reference, or a ``(#N)`` from a
-    different repo) is skipped with a warning rather than aborting the run.
+    different repo) is skipped with a warning. Any other failure (a 5xx that
+    outlasts retries, an auth error) is re-raised: silently dropping a real
+    release-noted PR would ship it un-noted, and valkey's label gate would not
+    catch it.
     """
     prs: list[MergedPR] = []
     for number in sorted(pr_to_sha):
@@ -155,9 +160,14 @@ def hydrate_prs(repo: Any, pr_to_sha: dict[int, str]) -> list[MergedPR]:
             pull = retry_github_call(
                 lambda: repo.get_pull(number), retries=3, description=f"get PR #{number}"
             )
-        except Exception as exc:  # noqa: BLE001 - skip an unresolvable reference
-            logger.warning("Skipping PR #%s (could not fetch): %s", number, exc)
+        except UnknownObjectException:
+            logger.warning("Skipping PR #%s (not found; likely an issue or cross-repo ref)", number)
             continue
+        except GithubException as exc:
+            if exc.status == 404:
+                logger.warning("Skipping PR #%s (not found; likely an issue or cross-repo ref)", number)
+                continue
+            raise
         author = ""
         if pull.user is not None and pull.user.login:
             author = pull.user.login
@@ -227,17 +237,13 @@ def discover(
         # branch may only exist as origin/<name>); reuse it as the range and
         # contributor baseline so every base..head walk resolves identically.
         base_tag = _resolve_base_ref(repo_dir, base_ref)
-        base_sha = git_output(repo_dir, "rev-parse", base_tag).strip()
     else:
-        base_tag, base_sha = resolve_last_tag(repo_dir, head_ref, tag_glob=tag_glob)
-    head_sha = git_output(repo_dir, "rev-parse", head_ref).strip()
+        base_tag, _base_sha = resolve_last_tag(repo_dir, head_ref, tag_glob=tag_glob)
     commits = list_range_commits(repo_dir, base_tag, head_ref)
     pr_to_sha = resolve_commit_prs(repo, commits)
     prs = hydrate_prs(repo, pr_to_sha)
     return DiscoveryResult(
         base_tag=base_tag,
-        base_sha=base_sha,
         head_ref=head_ref,
-        head_sha=head_sha,
         prs=tuple(prs),
     )

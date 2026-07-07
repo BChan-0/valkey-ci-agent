@@ -2,14 +2,13 @@
 #
 # A maintainer dispatches this with the source branch (e.g. unstable), the target
 # version, stage, and urgency. The agent generates the release notes in one shot
-# from the labelled PRs in range (Claude via Bedrock) -- nothing accumulates notes
-# on a branch -- then renders them onto the long-running
-# release branch as a dated section, bumps src/version.h, and refreshes the
-# running contributor list, using the release-format primitives in
-# scripts/release_notes (release_format.py, version_bump.py, contributors.py --
-# valkey-io/valkey ships no release tooling, so these own the format here). It
-# opens one PR for the release branch
-# (for review); the source branch is never modified.
+# from the labelled PRs in range (Claude via Bedrock). Nothing accumulates notes
+# on a branch. It then renders them onto the long-running release branch as a dated
+# section, bumps src/version.h, and refreshes the running contributor list, using the
+# release-format primitives in scripts/release_notes (release_format.py,
+# version_bump.py, contributors.py). valkey-io/valkey ships no release tooling, so
+# these own the format here. It opens one PR for the release branch for review;
+# the source branch is never modified.
 #
 # Branch model (one long-running branch per minor line):
 #   rc1 of M.m.p -> create  pre-release-M.m.p
@@ -31,7 +30,8 @@ on:
         type: string
       stage:
         description: "Release stage: rc1..rcN or ga (rc1 has no prior RC tag, so it
-          defaults base_ref to the previous release M.(m-1).0 unless you set base_ref)"
+          defaults base_ref to the previous release: prior patch M.m.(p-1), or previous
+          minor M.(m-1).0 for a .0; M.0.0 has none, so set base_ref yourself)"
         required: true
         type: string
       urgency:
@@ -54,8 +54,9 @@ on:
         type: string
       base_ref:
         description: "Explicit baseline ref overriding tag resolution (branch/tag/SHA).
-          Leave empty for rc2+/ga (uses the nearest RC tag); required-ish for rc1, which
-          otherwise auto-defaults to the previous release M.(m-1).0."
+          Leave empty for rc2+/ga (uses the nearest RC tag); for rc1 it auto-defaults to
+          the previous release (prior patch, or previous minor for a .0), except M.0.0
+          which has no derivable baseline and needs this set."
         required: false
         type: string
       security_fixes:
@@ -93,25 +94,25 @@ jobs:
     concurrency:
       # One cut per version+stage; a re-run replaces the release branch tip.
       # NOTE: stage is interpolated raw here (GitHub expressions have no lower()),
-      # so a dispatch of "RC1" and one of "rc1" land in different groups. They
-      # still cut the same line — the prep-branch push is force-with-lease and the
-      # PR is reused — so the only effect is that two same-version dispatches
-      # differing solely in stage case won't serialize against each other.
+      # so a dispatch of "RC1" and one of "rc1" land in different groups. The cut
+      # step lowercases stage, so both still cut the same line; the prep-branch
+      # push is force-with-lease and the PR is reused, so the only effect is that
+      # two same-version dispatches differing solely in stage case won't serialize
+      # against each other.
       group: release-cut-${{ inputs.version }}-${{ inputs.stage }}
       cancel-in-progress: false
     env:
       AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
       CLAUDE_CODE_USE_BEDROCK: "1"
-      CI_AGENT_EVIDENCE_DIR: agent-evidence
     steps:
       - name: Check out agent repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.0
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
           fetch-depth: 1
 
       - name: Set up Python 3.11
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.0.0
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: "3.11"
           cache: "pip"
@@ -266,12 +267,3 @@ jobs:
             args+=(--dry-run)
           fi
           python "${args[@]}"
-
-      - name: Upload agent evidence
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: release-cut-agent-evidence-${{ github.run_id }}
-          path: agent-evidence
-          if-no-files-found: ignore
-          retention-days: 30

@@ -294,7 +294,7 @@ def render_contributors_footer(contributors: Sequence[str]) -> str:
     *contributors* is a list of display strings (``"Jane Doe @jdoe"``), possibly
     with duplicates carried across cuts. They are de-duplicated case-insensitively
     (first spelling wins) and sorted by the display-name portion before ``@``,
-    matching gen_contributors. Returns ``""`` when the list is empty.
+    matching :mod:`contributors`. Returns ``""`` when the list is empty.
     """
     seen: set = set()
     unique: List[str] = []

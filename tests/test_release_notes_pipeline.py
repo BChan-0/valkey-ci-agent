@@ -27,8 +27,7 @@ def clone(tmp_path):
 
 def _patch(monkeypatch, *, prs, bullets=(), skipped=()):
     monkeypatch.setattr(pipeline_mod.discover_mod, "discover",
-                        lambda *a, **k: DiscoveryResult(base_tag="9.1.0-rc1", base_sha="s",
-                                                        head_ref="9.1", head_sha="h", prs=prs))
+                        lambda *a, **k: DiscoveryResult(base_tag="9.1.0-rc1", head_ref="9.1", prs=prs))
     monkeypatch.setattr(pipeline_mod.generate_mod, "generate",
                         lambda *a, **k: GenerationResult(bullets=bullets, skipped=skipped))
 
@@ -85,6 +84,27 @@ def test_reserved_only_bullets_count_as_zero(monkeypatch, clone):
     r = pipeline_mod.regenerate_unreleased(object(), clone, head_ref="9.1", tag_glob=None)
     assert r.bullet_count == 0        # the reserved-category bullet was dropped, not rendered
     assert r.grouped == {}
+    # The dropped PR is folded into skipped so the cut's PR body names it; the
+    # label gate is label-only, so this is the only signal it would get.
+    assert r.skipped == (40,)
+
+
+def test_reserved_dropped_pr_folded_into_skipped_others_render(monkeypatch, clone):
+    # One PR's only bullet lands under a reserved category (dropped) while another
+    # renders normally. The dropped one is surfaced in skipped; the rendered one is
+    # not (it is credited by its surviving bullet), and bullet_count counts only it.
+    prs = (
+        MergedPR(number=40, title="t40", author="a", url="u", labels=("release-notes",)),
+        MergedPR(number=41, title="t41", author="b", url="u", labels=("release-notes",)),
+    )
+    _patch(monkeypatch, prs=prs, bullets=(
+        CategorizedBullet(pr_number=40, author="a", category="Security Fixes", text="dropped"),
+        CategorizedBullet(pr_number=41, author="b", category="Bug Fixes", text="kept"),
+    ))
+    r = pipeline_mod.regenerate_unreleased(object(), clone, head_ref="9.1", tag_glob=None)
+    assert r.bullet_count == 1
+    assert r.skipped == (40,)
+    assert any("kept" in line for line in _all_lines(r.grouped))
 
 
 def test_duplicate_pr_bullets_deduped_and_recorded(monkeypatch, clone):

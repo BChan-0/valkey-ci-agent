@@ -101,7 +101,5 @@ class DiscoveryResult:
     """
 
     base_tag: str
-    base_sha: str
     head_ref: str
-    head_sha: str
     prs: tuple[MergedPR, ...] = field(default_factory=tuple)

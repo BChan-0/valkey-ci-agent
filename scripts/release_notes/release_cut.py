@@ -157,9 +157,9 @@ def _remote_branch_exists(repo_dir: str, branch: str) -> bool:
 def resolve_branch_plan(repo_dir: str, *, version: str, stage: str, source_ref: str) -> BranchPlan:
     """Resolve the destination branch and base for this cut.
 
-    Mirrors valkey's prepare-release branch resolution: rc stages target the
-    long-running ``pre-release-M.m.p``; ``ga`` targets ``M.m`` and, when only the
-    rc branch exists, renames it (carry its history, delete the rc branch). An
+    Resolves the destination per the release-line branch model: rc stages target
+    the long-running ``pre-release-M.m.p``; ``ga`` targets ``M.m`` and, when only
+    the rc branch exists, renames it (carry its history, delete the rc branch). An
     existing line is continued (its prior dated sections are drained); otherwise
     it starts from ``source_ref``.
     """
@@ -251,7 +251,7 @@ def _warn_rc_sequence(
         )
     else:
         detail = (
-            f"`{stage_lc}` skips ahead — `{pre_branch}` records up to rc{highest}, "
+            f"`{stage_lc}` skips ahead: `{pre_branch}` records up to rc{highest}, "
             f"so the next rc should be rc{expected}."
         )
     logger.warning(
@@ -279,7 +279,7 @@ def _warn_rc_first_cut(stage_lc: str, pre_branch: str) -> Optional[str]:
     )
     return (
         f"`{stage_lc}` is the first cut of `{pre_branch}`, but that branch does not "
-        f"exist yet — rc1 was never cut (or its line was lost). The first cut of a "
+        f"exist yet: rc1 was never cut (or its line was lost). The first cut of a "
         f"line should be rc1."
     )
 
@@ -449,8 +449,8 @@ def _contrib_base(
     older nearest tag (e.g. 8.0.8 from unstable) than the real baseline (9.0.0),
     crediting a whole extra minor of history. The describe/root fallbacks remain
     for the tag-resolved path (rc2+/ga), where the notes baseline is a tag and
-    ``notes_base_ref`` is None. Matches prepare_release's chain so the
-    ``### Contributors`` list is never silently empty.
+    ``notes_base_ref`` is None. The describe/root chain keeps the
+    ``### Contributors`` list from being silently empty.
     """
     if explicit:
         return explicit
@@ -475,7 +475,7 @@ def _contrib_base(
 def _compare_ref(repo_dir: str, ref: str) -> str:
     """Resolve *ref* to a commit SHA the GitHub compare API can use.
 
-    ``gen_contributors.list_contributors`` hits ``GET /compare/{base}...{head}``,
+    ``contributors.list_contributors`` hits ``GET /compare/{base}...{head}``,
     which only accepts refs the server knows: a branch/tag name or a full commit
     SHA. The contributor base and head we have locally are neither. The base is a
     remote-tracking ref (``origin/unstable``, because the clone is

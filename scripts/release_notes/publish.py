@@ -64,10 +64,16 @@ _LINEBREAK_RE = re.compile(r"[\r\n]+")
 def escape_cell(text: str) -> str:
     """Escape a value for a Markdown table cell (pipes and line breaks).
 
+    Backslashes are escaped before pipes so a pre-existing ``\\`` right before a
+    ``|`` cannot consume the pipe's escape: ``a\\|b`` would otherwise become
+    ``a\\\\|b`` (a literal backslash followed by an unescaped ``|`` that breaks
+    the row); escaping the backslash first yields ``a\\\\\\|b`` (literal ``\\|``).
+
     Any run of CR/LF (a bare ``\\n``, a Windows ``\\r\\n``, a lone ``\\r``, or
     several in a row) collapses to a single space: a raw ``\\r`` left in the
     string would break the table row, and matching only ``\\n`` leaves the CR of
     a CRLF behind. A contributor PR title is arbitrary text, so it can carry any
     of these.
     """
-    return _LINEBREAK_RE.sub(" ", text.replace("|", "\\|")).strip()
+    escaped = text.replace("\\", "\\\\").replace("|", "\\|")
+    return _LINEBREAK_RE.sub(" ", escaped).strip()

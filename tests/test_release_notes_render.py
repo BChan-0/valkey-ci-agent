@@ -20,8 +20,8 @@ from scripts.release_notes.render import (
 
 _FIXTURE_CLONE = os.path.join(os.path.dirname(__file__), "fixtures", "valkey_clone")
 
-# The label gate's trailing-PR-ref and author regexes, replicated to assert
-# each rendered bullet is compliant.
+# The trailing-PR-ref and author regexes of valkey's hand-written release-note
+# convention, replicated to assert each rendered bullet matches that form.
 _TRAILING_PR_RE = re.compile(r"\(#([^)]*)\)\s*$")
 _AUTHOR_RE = re.compile(r"by @([\w-]+)")
 
@@ -96,7 +96,7 @@ class TestGroupBullets:
 
     def test_all_keys_are_canonical(self) -> None:
         # No matter what categories the model returns, every rendered key is one of
-        # the canonical categories -- an invented header can never be emitted.
+        # the canonical categories; an invented header can never be emitted.
         fmt = _fmt()
         bullets = [
             _bullet(1, "a", "Bug Fixes", "x"),
@@ -110,6 +110,15 @@ class TestGroupBullets:
         fmt = _fmt()
         grouped = group_bullets(
             [_bullet(1, "a", "Security Fixes", "x"), _bullet(2, "a", "Contributors", "y")], fmt
+        )
+        assert grouped == {}
+
+    def test_reserved_section_refused_case_insensitively(self) -> None:
+        # A lowercase "security fixes" must be refused too, not coerced into the
+        # catch-all where it would ship next to the real auto-generated section.
+        fmt = _fmt()
+        grouped = group_bullets(
+            [_bullet(1, "a", "security fixes", "x"), _bullet(2, "a", "CONTRIBUTORS", "y")], fmt
         )
         assert grouped == {}
 
@@ -144,7 +153,7 @@ class TestMaliciousBulletCannotBreakSection:
         section = fmt.render_version_section("9.1.0", "rc1", "LOW", "2026-06-25", grouped)
         # Both categories render; the injected heading (now inside a bullet line)
         # did not create an extra category HEADER. Count header lines, not the
-        # substring -- the sanitized bullet text legitimately contains "### Bug Fixes".
+        # substring; the sanitized bullet text legitimately contains "### Bug Fixes".
         header_lines = [ln for ln in section.splitlines() if ln.strip() == "### Bug Fixes"]
         assert len(header_lines) == 1
         assert any(ln.strip() == "### Build and Tooling" for ln in section.splitlines())

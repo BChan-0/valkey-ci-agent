@@ -142,8 +142,8 @@ class TestResolveCommitPrs:
         # The riskiest branch: the commit has no trailing (#N) so the API fallback
         # runs, and the API call itself raises (rate limit / network error surviving
         # retries). A RuntimeError is non-retryable, so retry_github_call re-raises
-        # at once (no sleeps). The failure must be swallowed to a dropped commit --
-        # discovery keeps going -- not propagated to abort the whole run.
+        # at once (no sleeps). The failure must be swallowed to a dropped commit
+        # (discovery keeps going), not propagated to abort the whole run.
         repo = MagicMock()
         repo.get_commit.side_effect = RuntimeError("500 upstream error")
         commits = [("shaX", "hand-applied cherry-pick, no ref"), ("sha2", "fix (#11)")]
@@ -191,10 +191,24 @@ class TestHydratePrs:
         assert prs[0].author == ""
         assert prs[0].merge_commit_sha == "sha5"  # falls back to the commit sha
 
-    def test_unfetchable_pr_skipped(self) -> None:
+    def test_pr_404_is_skipped(self) -> None:
+        # A 404 is a genuine non-PR reference (an issue, or a (#N) from another
+        # repo); skip it rather than aborting the run.
+        from github.GithubException import UnknownObjectException
+
         repo = MagicMock()
-        repo.get_pull.side_effect = RuntimeError("404")
+        repo.get_pull.side_effect = UnknownObjectException(404, {"message": "Not Found"}, {})
         assert hydrate_prs(repo, {404: "sha"}) == []
+
+    def test_non_404_github_error_is_reraised(self) -> None:
+        # A 5xx that outlasts retries must not be swallowed: dropping a real
+        # release-noted PR would ship it un-noted, and the label gate won't catch it.
+        from github.GithubException import GithubException
+
+        repo = MagicMock()
+        repo.get_pull.side_effect = GithubException(500, {"message": "Server Error"}, {})
+        with pytest.raises(GithubException):
+            hydrate_prs(repo, {7: "sha"})
 
 
 class TestDiscover:

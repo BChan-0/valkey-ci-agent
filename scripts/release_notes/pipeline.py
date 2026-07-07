@@ -104,9 +104,18 @@ def regenerate_unreleased(
     # The blank-cut guard and the empty-notes warning both key on bullet_count.
     promoted_count = sum(len(lines) for lines in grouped.values())
 
+    # An included PR whose only bullet group_bullets dropped (reserved/empty
+    # category) renders nowhere and, unlike a model-declined PR, is not in
+    # gen.skipped. valkey's label gate checks label presence only, so nothing
+    # downstream catches it; fold it into skipped so the PR body's declined-PRs
+    # section names it. Exclude PRs that did render (a PR with a second, dropped
+    # bullet is still credited by its surviving one).
+    dropped_prs = {b.pr_number for b in bullets} - rendered_prs
+    skipped = tuple(sorted((set(gen.skipped) | dropped_prs) - rendered_prs))
+
     return RegenResult(
         base_tag=discovery.base_tag, grouped=grouped,
-        included=len(include), bullet_count=promoted_count, skipped=tuple(gen.skipped),
+        included=len(include), bullet_count=promoted_count, skipped=skipped,
         triage=tuple(triage), had_prs=True,
         duplicate_prs=duplicate_prs, uncertain=uncertain,
     )

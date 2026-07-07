@@ -162,14 +162,14 @@ class TestPatchedVersionTokens:
         assert sec.patched_version_tokens([_vuln(patched="1.9.1.0")]) == set()
 
     def test_leading_digit_does_not_false_match_shorter_version(self):
-        # "19.1.0" is its own token, NOT "9.1.0" -- the lookbehind rejects the
+        # "19.1.0" is its own token, NOT "9.1.0"; the lookbehind rejects the
         # adjacent leading digit. So a cut of 9.1.0 must not be considered fixed by
         # an advisory that patched 19.1.0.
         assert sec.patched_version_tokens([_vuln(patched="19.1.0")]) == {"19.1.0"}
         assert "9.1.0" not in sec.patched_version_tokens([_vuln(patched="19.1.0")])
 
     def test_trailing_digit_does_not_false_match_shorter_version(self):
-        # "9.1.00" is its own token, NOT "9.1.0" -- the lookahead rejects the
+        # "9.1.00" is its own token, NOT "9.1.0"; the lookahead rejects the
         # adjacent trailing digit. A cut of 9.1.0 is not fixed by a 9.1.00 patch.
         assert sec.patched_version_tokens([_vuln(patched="9.1.00")]) == {"9.1.00"}
         assert "9.1.0" not in sec.patched_version_tokens([_vuln(patched="9.1.00")])
@@ -273,7 +273,7 @@ class TestCollectAdvisoryFixes:
     def test_unreadable_advisory_is_not_reported_as_non_match(self):
         # An advisory whose raw_data can't be read MIGHT fix this version, so it must
         # be bucketed as unreadable (a "check by hand" warning), NOT as unmatched
-        # ("did not match this version") -- the latter falsely assures the maintainer
+        # ("did not match this version"); the latter falsely assures the maintainer
         # it is irrelevant.
         repo = _FakeRepo([
             _advisory(cve_id="CVE-2026-9", ghsa_id="GHSA-z", summary="s",
@@ -326,6 +326,27 @@ class TestCollectAdvisoryFixes:
         sel = sec.collect_advisory_fixes(repo, "9.1.0")
         assert [f.display_id for f in sel.matched] == ["CVE-2026-3"]
 
+    def test_vulnerabilities_scalar_is_tolerated(self):
+        # A truthy non-list (an int) must not be iterated: `for vuln in 5` would
+        # raise TypeError and abort the whole cut. It contributes no tokens.
+        repo = _FakeRepo([_advisory(
+            cve_id="CVE-2026-11",
+            overrides={"raw_data": {"vulnerabilities": 5}},
+        )])
+        sel = sec.collect_advisory_fixes(repo, "9.1.0")
+        assert sel.matched == ()
+        assert sel.unmatched_ids == ("CVE-2026-11",)
+
+    def test_identifiers_scalar_does_not_abort(self):
+        # identifiers as a truthy scalar (int) must not be iterated; _cve_id finds
+        # nothing there and falls back to the GHSA, no TypeError aborting the cut.
+        repo = _FakeRepo([_advisory(
+            cve_id=None, ghsa_id="GHSA-b", overrides={"identifiers": 42},
+            vulnerabilities=[_vuln(patched="9.1.0")],
+        )])
+        sel = sec.collect_advisory_fixes(repo, "9.1.0")
+        assert [f.display_id for f in sel.matched] == ["GHSA-b"]
+
     def test_non_string_patched_version_skipped(self):
         # patched_versions returning a number (not a string) is skipped, not matched.
         repo = _FakeRepo([_advisory(
@@ -338,7 +359,7 @@ class TestCollectAdvisoryFixes:
 
     def test_non_string_ghsa_id_with_no_cve_is_skipped(self):
         # A version-matched advisory whose only id field is wrong-typed (ghsa_id
-        # is an int) has no usable display id, so it is skipped -- not rendered as
+        # is an int) has no usable display id, so it is skipped: not rendered as
         # "(123) ..." and not crashing.
         repo = _FakeRepo([_advisory(
             cve_id=None, ghsa_id=None, overrides={"ghsa_id": 123},
@@ -457,7 +478,7 @@ class TestMergeWithManual:
 
     def test_manual_wins_on_ghsa_collision_when_advisory_has_no_cve(self):
         # A GHSA-only advisory (no CVE yet) that a maintainer also hand-wrote,
-        # naming its GHSA id, must dedup on the GHSA -- CVE-only matching missed it
+        # naming its GHSA id, must dedup on the GHSA; CVE-only matching missed it
         # and shipped the fix twice.
         merged = sec.merge_with_manual(
             [_fix("GHSA-abcd-1234-wxyz", ghsa_id="GHSA-abcd-1234-wxyz", summary="auto wording")],

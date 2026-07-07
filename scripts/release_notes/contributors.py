@@ -15,10 +15,13 @@ dependencies. Upstream ``valkey-io/valkey`` ships no equivalent tool;
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
 import urllib.error
 import urllib.request
 from typing import List, Optional
+
+logger = logging.getLogger(__name__)
 
 _API_ROOT = "https://api.github.com"
 
@@ -41,11 +44,21 @@ def _compare_logins(repo: str, base_ref: str, head_ref: str, token: Optional[str
 
     The compare endpoint paginates commits; we walk pages until fewer than the
     page size are returned. Bot authors (login ending in ``[bot]``) are skipped.
+
+    The compare endpoint returns at most 250 commits total (``total_commits`` can
+    exceed that), so a range wider than 250 commits credits only the first 250.
+    We log a warning when that cap is hit rather than truncate silently, so a
+    maintainer knows the contributor list may be short for a very wide GA cut.
     """
     logins: List[str] = []
     seen = set()
     page = 1
-    per_page = 250
+    # GitHub caps per_page at 100 and clamps larger values down. A higher number
+    # would make the "short page" termination check below fire after page 1 and
+    # drop authors past the first 100 commits.
+    per_page = 100
+    seen_commits = 0
+    total_commits = None
     while True:
         url = "{}/repos/{}/compare/{}...{}?per_page={}&page={}".format(
             _API_ROOT, repo, base_ref, head_ref, per_page, page
@@ -53,7 +66,10 @@ def _compare_logins(repo: str, base_ref: str, head_ref: str, token: Optional[str
         data = _api_get(url, token)
         if not isinstance(data, dict):
             break
+        if total_commits is None and isinstance(data.get("total_commits"), int):
+            total_commits = data["total_commits"]
         commits = data.get("commits") or []
+        seen_commits += len(commits)
         for commit in commits:
             author = commit.get("author") or {}
             login = author.get("login")
@@ -64,6 +80,12 @@ def _compare_logins(repo: str, base_ref: str, head_ref: str, token: Optional[str
         if len(commits) < per_page:
             break
         page += 1
+    if total_commits is not None and seen_commits < total_commits:
+        logger.warning(
+            "Contributor range %s..%s spans %d commits but the compare API "
+            "returned only %d; contributors beyond that may be missing.",
+            base_ref, head_ref, total_commits, seen_commits,
+        )
     return logins
 
 
@@ -71,47 +93,14 @@ def _display_name(repo_login: str, token: Optional[str]) -> Optional[str]:
     """Resolve a login to its profile full name, or None if unavailable."""
     try:
         data = _api_get("{}/users/{}".format(_API_ROOT, repo_login), token)
-    except (urllib.error.URLError, urllib.error.HTTPError, ValueError):
+    except (OSError, urllib.error.URLError, urllib.error.HTTPError, ValueError):
+        # OSError covers socket read timeouts, which are not URLError subclasses.
         return None
     if isinstance(data, dict):
         name = data.get("name")
         if name and name.strip():
             return name.strip()
     return None
-
-
-class _PRLookupUnavailable(Exception):
-    """Raised when a PR lookup cannot be performed (no token / network error).
-
-    Distinguishes "could not check" from "checked, PR does not exist": callers
-    skip the accuracy warning entirely on this, rather than reporting a false
-    "PR #N not found".
-    """
-
-
-def pr_author(repo: str, number: int, token: Optional[str]) -> Optional[str]:
-    """Return the GitHub login that authored PR *number* in *repo*.
-
-    Returns ``None`` when the API authoritatively says the PR does not exist
-    (HTTP 404). Raises :class:`_PRLookupUnavailable` when the lookup itself could
-    not be performed (network error, rate limit, malformed response) so callers
-    can tell "no such PR" apart from "couldn't check".
-    """
-    url = "{}/repos/{}/pulls/{}".format(_API_ROOT, repo, number)
-    try:
-        data = _api_get(url, token)
-    except urllib.error.HTTPError as exc:
-        if exc.code == 404:
-            return None
-        raise _PRLookupUnavailable(str(exc)) from exc
-    except (urllib.error.URLError, ValueError) as exc:
-        raise _PRLookupUnavailable(str(exc)) from exc
-    if isinstance(data, dict):
-        user = data.get("user") or {}
-        login = user.get("login")
-        if login:
-            return str(login)
-    raise _PRLookupUnavailable("unexpected response shape for PR {}".format(number))
 
 
 def _git_shortlog_names(base_ref: str, head_ref: str, repo_dir: str) -> List[str]:
@@ -159,7 +148,9 @@ def list_contributors(
     """
     try:
         logins = _compare_logins(repo, base_ref, head_ref, token)
-    except (urllib.error.URLError, urllib.error.HTTPError, ValueError):
+    except (OSError, urllib.error.URLError, urllib.error.HTTPError, ValueError):
+        # OSError covers socket read timeouts, which are not URLError subclasses;
+        # any of these degrade to the git-shortlog fallback below.
         logins = []
 
     entries: List[str] = []

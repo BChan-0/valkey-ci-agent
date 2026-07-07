@@ -45,7 +45,7 @@ class TestSetVersion:
     def test_string_and_num_agree_on_leading_zero_input(self) -> None:
         # Regression: set_version used to write the raw version string into
         # VALKEY_VERSION while deriving VALKEY_VERSION_NUM from the parsed tuple,
-        # so "09.1.0" produced VALKEY_VERSION "09.1.0" but NUM 0x00090100 -- a
+        # so "09.1.0" produced VALKEY_VERSION "09.1.0" but NUM 0x00090100, a
         # self-inconsistent version.h. The string is now derived from the parsed
         # tuple too, so both macros always agree (and carry the canonical form).
         out = set_version(_SAMPLE, "09.1.0", "rc1")

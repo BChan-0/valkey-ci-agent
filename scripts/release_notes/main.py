@@ -208,6 +208,7 @@ def main(argv: list[str] | None = None) -> int:
     # falls back to the nearest reachable tag, which may be over-broad, so flag it
     # in the PR body too (baseline_unanchored).
     baseline_unanchored = False
+    base_ref_derived = False
     if stage == "rc1" and base_ref is None:
         derived = _default_base_ref_for_rc1(version)
         if derived:
@@ -219,6 +220,7 @@ def main(argv: list[str] | None = None) -> int:
                 version, args.head_ref, derived,
             )
             base_ref = derived
+            base_ref_derived = True
         else:
             baseline_unanchored = True
             logger.warning(
@@ -249,6 +251,7 @@ def main(argv: list[str] | None = None) -> int:
             security_from_advisories=args.security_from_advisories,
             dry_run=args.dry_run,
             baseline_unanchored=baseline_unanchored,
+            base_ref_derived=base_ref_derived,
         )
     except subprocess.CalledProcessError as exc:  # surface git's stderr, not just the exit code
         # CalledProcessError.__str__ reports only the command and exit status;
@@ -262,31 +265,45 @@ def main(argv: list[str] | None = None) -> int:
             f"\n{stderr}" if stderr else " (no stderr captured)",
         )
         return 1
+    except ValueError as exc:
+        # Validation errors (bad --base-ref, inconsistent branch state, malformed
+        # version) carry a message written to be read on its own; log just that,
+        # not a traceback, so it reads as cleanly as the CalledProcessError path.
+        logger.error("Release cut failed: %s", exc)
+        return 1
     except Exception:  # noqa: BLE001 - never crash the workflow uncaught
         logger.exception("Release cut failed")
         return 1
 
 
-def _validate_base_ref(clone_dir: str, base_ref: str) -> None:
-    """Raise a clear error if *base_ref* resolves to nothing in the fresh clone.
+def _base_ref_exists(clone_dir: str, base_ref: str) -> bool:
+    """True if *base_ref* resolves in the fresh clone, as itself or ``origin/<name>``.
 
     The clone is ``git clone --branch <source_ref>`` + fetch tags, so a non-source
     branch exists only as ``origin/<name>``; mirror discover's resolution (the ref
-    as given, then ``origin/<name>``) so a real branch/tag/SHA passes. Without this,
-    a typo'd ``--base-ref`` (or the derived rc1 default ``M.(m-1).0`` when that tag
-    is absent) is first hit deep in discovery and surfaces as an opaque exit-1
-    naming the ``origin/<name>`` form, not what the maintainer typed.
+    as given, then ``origin/<name>``) so a real branch/tag/SHA passes.
     """
     for candidate in (base_ref, f"origin/{base_ref}"):
         try:
             run_git(clone_dir, "rev-parse", "--verify", "--quiet", f"{candidate}^{{commit}}")
-            return
+            return True
         except subprocess.CalledProcessError:
             continue
-    raise ValueError(
-        f"--base-ref {base_ref!r} not found in the clone (tried {base_ref!r} and "
-        f"'origin/{base_ref}'). Pass an existing branch, tag, or commit SHA."
-    )
+    return False
+
+
+def _validate_base_ref(clone_dir: str, base_ref: str) -> None:
+    """Raise a clear error if *base_ref* resolves to nothing in the fresh clone.
+
+    Without this, a typo'd ``--base-ref`` is first hit deep in discovery and
+    surfaces as an opaque exit-1 naming the ``origin/<name>`` form, not what the
+    maintainer typed.
+    """
+    if not _base_ref_exists(clone_dir, base_ref):
+        raise ValueError(
+            f"--base-ref {base_ref!r} not found in the clone (tried {base_ref!r} and "
+            f"'origin/{base_ref}'). Pass an existing branch, tag, or commit SHA."
+        )
 
 
 _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -301,12 +318,13 @@ def _is_iso_date(value: str) -> bool:
     empty value (defaulted to today) is handled before this.
 
     The format is checked explicitly rather than relying on
-    ``date.fromisoformat``: since Python 3.11 (this runtime) that function is
-    lenient and accepts ``20260630`` and ISO week/ordinal forms like
-    ``2026-W01-1`` (which silently resolves to a *different* calendar date), any
-    of which would then ship into the heading. Requiring the ``YYYY-MM-DD`` shape
-    first and parsing with ``strptime`` accepts only the documented form and
-    still rejects impossible dates like ``2026-13-45``.
+    ``date.fromisoformat``: on Python 3.11+ that function is lenient and accepts
+    ``20260630`` and ISO week/ordinal forms like ``2026-W01-1`` (which silently
+    resolves to a *different* calendar date), any of which would then ship into
+    the heading. (Earlier supported versions down to the 3.9 floor are already
+    strict, but we do not rely on that.) Requiring the ``YYYY-MM-DD`` shape first
+    and parsing with ``strptime`` accepts only the documented form and still
+    rejects impossible dates like ``2026-13-45``.
     """
     value = value.strip()
     if not _ISO_DATE_RE.match(value):
@@ -334,6 +352,7 @@ def _run_cut(
     security_from_advisories: bool,
     dry_run: bool,
     baseline_unanchored: bool = False,
+    base_ref_derived: bool = False,
 ) -> int:
     gh = Github(auth=Auth.Token(token))
     repo = retry_github_call(
@@ -349,8 +368,19 @@ def _run_cut(
             run_git(clone_dir, "fetch", "--tags", "origin", env=git_env)
             # Validate an explicit/derived baseline now, while the error can still
             # name what the maintainer typed (discovery would later only see the
-            # origin/<name> form). A missing ref aborts before the AI run.
-            if base_ref:
+            # origin/<name> form). An explicit --base-ref that is missing aborts.
+            # A *derived* rc1 default that is missing (a tagless fork) instead
+            # degrades to the nearest-tag fallback, matching the M.0.0 path, so a
+            # guessed tag never hard-fails a cut the user did not ask to anchor.
+            if base_ref and base_ref_derived and not _base_ref_exists(clone_dir, base_ref):
+                logger.warning(
+                    "Derived rc1 baseline %r is not present; falling back to the nearest "
+                    "reachable tag. Pass --base-ref explicitly to anchor the range.",
+                    base_ref,
+                )
+                base_ref = None
+                baseline_unanchored = True
+            elif base_ref:
                 _validate_base_ref(clone_dir, base_ref)
             return cut_mod.cut(
                 repo,
