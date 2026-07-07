@@ -53,16 +53,20 @@ logger = logging.getLogger(__name__)
 # help here: "." is a non-word char, so \b sits happily between "9.1.0" and the
 # trailing ".5", matching a version this release never shipped.
 _VERSION_TOKEN_RE = re.compile(r"(?<![\d.])(\d+\.\d+\.\d+)(?![\d.])")
-# A comparison operator directly governing a token (optional whitespace between)
-# marks it as a range bound, not a discrete fixed version. patched_versions is
-# contractually a bare version or comma list of fixed backport targets (a range
-# lives in vulnerable_version_range, which we never read), but an author typo or
-# an unexpected payload could put a range here. Because we do exact membership and
-# never range math, a bound would falsely mark a version as fixed: "< 9.1.0" names
-# the first unaffected release under that bound, and ">= 9.0.0" names the
-# vulnerable floor, and neither shipped the fix. Drop operator-governed tokens; the
-# PR-body disclaimer already asks a maintainer to add anything the match missed.
-_RANGE_BOUND_RE = re.compile(r"[<>]=?\s*$")
+# A range operator directly governing a token marks it as a range bound, not a
+# discrete fixed version. patched_versions is contractually a bare version or comma
+# list of fixed backport targets (a range lives in vulnerable_version_range, which
+# we never read), but an author typo or an unexpected payload could put a range
+# here. Because we do exact membership and never range math, a bound would falsely
+# mark a version as fixed: "< 9.1.0" names the first unaffected release, ">= 9.0.0"
+# names the vulnerable floor, and the "9.1.0" end of "8.0.0 - 9.1.0" is likewise a
+# bound, none of which shipped the fix. Drop a token preceded by a comparison
+# operator ("<"/">"/"<="/">=") or a spaced range dash/tilde/caret. A version with
+# an attached pre-release suffix ("9.1.0-rc1") keeps its token: the dash there is
+# not whitespace-surrounded, so it is not read as a range. Tokens joined by an
+# unspaced dash ("9.0.0-9.1.0", not a real patched_versions form) are the residual
+# gap; the PR-body disclaimer already asks a maintainer to add anything missed.
+_RANGE_BOUND_RE = re.compile(r"(?:[<>]=?|\s[-~^])\s*$")
 # CVE identifier, used both to pick the display id and to dedup a manual
 # --security-fix that names the same CVE (manual wins).
 _CVE_ID_RE = re.compile(r"CVE-\d{4}-\d{4,}", re.IGNORECASE)
@@ -91,13 +95,12 @@ class AdvisoryFix:
 class AdvisorySelection:
     """Outcome of scanning published advisories for the version being cut.
 
-    ``bullets`` are the rendered ``(CVE-...) summary`` lines (no leading ``* ``;
-    valkey's ``emit_category`` prepends it), ready to merge into the cut's
-    ``security_fixes`` list. The counts and ``unmatched_ids`` feed the PR-body
-    disclaimer so a maintainer can see what was and was not auto-included.
+    ``matched`` carries the selected fixes; the caller renders them via
+    :func:`merge_with_manual` (the single render path, so nothing here can drift
+    from what ships). The counts and ``unmatched_ids`` feed the PR-body disclaimer
+    so a maintainer can see what was and was not auto-included.
     """
 
-    bullets: tuple[str, ...] = ()
     matched: tuple[AdvisoryFix, ...] = ()
     considered: int = 0                  # published, non-withdrawn advisories examined
     unmatched_ids: tuple[str, ...] = ()  # published advisories read cleanly that did not match this version
@@ -335,7 +338,6 @@ def collect_advisory_fixes(repo: Any, version: str) -> AdvisorySelection:
         considered, len(deduped), version, len(unmatched_ids), len(unreadable_ids),
     )
     return AdvisorySelection(
-        bullets=tuple(render_bullet(f) for f in deduped),
         matched=tuple(deduped),
         considered=considered,
         unmatched_ids=tuple(sorted(unmatched_ids)),

@@ -389,8 +389,8 @@ human merges.
    labels into include / exclude / triage, mirroring valkey's `check_release_notes`.
 4. **Generate** (AI) - Claude writes one categorized, user-facing bullet per
    included PR. The model never emits the `(#N)` reference or `by @handle` - code
-   appends those, so the format stays fixed in one place:
-   `scripts/release_notes/release_format.py`.
+   appends those in `scripts/release_notes/render.py` (`format_bullet`), so the
+   bullet format stays fixed in one place.
 5. **Render + bump** (code) - render the categorized bullets into a new dated
    section on the release line via `render_release_notes` (`release_format.py`) /
    `set_version` (`version_bump.py`), prepend prior RCs' sections, append the

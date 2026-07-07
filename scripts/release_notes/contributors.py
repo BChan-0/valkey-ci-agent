@@ -57,9 +57,14 @@ def _compare_logins(repo: str, base_ref: str, head_ref: str, token: Optional[str
     # would make the "short page" termination check below fire after page 1 and
     # drop authors past the first 100 commits.
     per_page = 100
+    # The compare endpoint returns at most 250 commits, so 3 pages of 100 exhausts
+    # it. A small ceiling stops an endpoint/proxy that ignores `page` and returns a
+    # full page forever from looping unbounded; the "short page" check ends it
+    # first in every normal case.
+    max_pages = 5
     seen_commits = 0
     total_commits = None
-    while True:
+    while page <= max_pages:
         url = "{}/repos/{}/compare/{}...{}?per_page={}&page={}".format(
             _API_ROOT, repo, base_ref, head_ref, per_page, page
         )
@@ -68,11 +73,18 @@ def _compare_logins(repo: str, base_ref: str, head_ref: str, token: Optional[str
             break
         if total_commits is None and isinstance(data.get("total_commits"), int):
             total_commits = data["total_commits"]
-        commits = data.get("commits") or []
+        commits = data.get("commits")
+        # A well-formed payload lists commits; anything else (a scalar, a dict, or a
+        # non-dict entry) must not be iterated into an AttributeError that aborts the
+        # cut. Treat a non-list as an empty page and skip non-dict entries.
+        if not isinstance(commits, list):
+            break
         seen_commits += len(commits)
         for commit in commits:
+            if not isinstance(commit, dict):
+                continue
             author = commit.get("author") or {}
-            login = author.get("login")
+            login = author.get("login") if isinstance(author, dict) else None
             if not login or login in seen or login.endswith("[bot]"):
                 continue
             seen.add(login)

@@ -389,6 +389,9 @@ class TestTrailingPrRegex:
         ("* x by @a (#44).", {44}),
         ("* x by @a (#44):", {44}),
         ("* x by @a (#44) ", {44}),
+        # A trailing run of refs credits only the last (the merge PR); render never
+        # emits this, but a hand-edited line might.
+        ("* x by @a (#44)(#45)", {45}),
     ])
     def test_credited_tolerates_trailing_punctuation(self, line, expected) -> None:
         assert rc._credited_pr_numbers(line) == expected
@@ -925,6 +928,10 @@ class TestCutOrchestration:
         assert "* (CVE-2026-23479) Use-After-Free in unblock client flow" in notes
         # SECURITY urgency now HAS content, so the "no security content" warning is gone.
         assert "no security content" not in created[0]["body"]
+        # The matched-advisory body header names what was auto-rendered.
+        assert "Security fixes (auto-generated from advisories)" in created[0]["body"]
+        assert "Rendered 1 published advisory fix" in created[0]["body"]
+        assert "CVE-2026-23479" in created[0]["body"]
         # The disclaimer to add embargoed CVEs is present.
         assert "embargoed or draft CVEs" in created[0]["body"]
         # cut() cleaned up its throwaway worktree (no leak).
@@ -1153,6 +1160,17 @@ class TestDedupAgainstDestination:
     """
 
     _GA_PLAN = BranchPlan("ga", "9.1", "pre-release-9.1.0", True, "pre-release-9.1.0")
+
+    def test_no_new_prs_section_renders_when_all_credited(self) -> None:
+        # Every PR in range was already credited on the line, so the dated section
+        # is version-bump-only; the body must say so (not read as a generation miss).
+        section = rc._no_new_prs_section([44, 45], self._GA_PLAN)
+        assert "No new release notes" in section
+        assert "#44" in section and "#45" in section
+        assert "9.1" in section  # names the target line
+
+    def test_no_new_prs_section_empty_when_nothing_dropped(self) -> None:
+        assert rc._no_new_prs_section([], self._GA_PLAN) == ""
 
     def test_credited_reads_trailing_pr_refs(self) -> None:
         text = (

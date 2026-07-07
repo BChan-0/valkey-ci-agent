@@ -50,6 +50,7 @@ def classify(prs: Sequence[MergedPR]) -> tuple[list[MergedPR], list[MergedPR], l
             title=pr.title,
             author=pr.author,
             url=pr.url,
+            body=pr.body,
             labels=pr.labels,
             merge_commit_sha=pr.merge_commit_sha,
             disposition=disposition,

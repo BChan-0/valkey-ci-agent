@@ -315,7 +315,7 @@ placeholder and a `src/version.h` with the `VALKEY_VERSION*` macros).
 Non-blocking anomalies (out-of-sequence rc, GA duplicate/orphan, rc-after-GA,
 unanchored baseline, empty/duplicate notes, security correlations) are surfaced as
 warnings in the PR body rather than blocking the cut; malformed inputs and
-inconsistent branch state (GA with both `pre-release-M.m.p` and `M.m`) are hard
+inconsistent branch state (ie GA with both `pre-release-M.m.p` and `M.m`) are hard
 errors.
 
 ### Entry Points
@@ -326,6 +326,7 @@ errors.
 - `scripts/release_notes/discover.py` - range resolution and PR discovery by graph reachability
 - `scripts/release_notes/classify.py` - label-based include / exclude / triage partition
 - `scripts/release_notes/generate.py` - Claude bullet generation (read-only tools)
+- `scripts/release_notes/security.py` - Security Fixes from published GitHub advisories (never AI-authored)
 - `scripts/release_notes/render.py` - canonical `00-RELEASENOTES` rendering
 - `scripts/release_notes/publish.py` - find/open/update the release PR
 - `scripts/release_notes/release_format.py` - `00-RELEASENOTES` dated-section rendering

@@ -40,7 +40,18 @@ it to exactly one category.
 
 ## Rules
 - Write for an end user reading a changelog: what changed and why it matters,
-  not how it was implemented. Present tense, one sentence, <= 120 characters.
+  not how it was implemented. Present tense, one sentence. Aim for <= 120
+  characters, but a somewhat longer line is fine when the extra words carry real
+  meaning (a command name, the affected config); never pad, and never truncate a
+  clearer sentence just to fit. For example, given a PR titled "Configurable DB
+  hash seed for SCAN", a good note reads:
+    Support cross node consistency for `SCAN` commands through a configurable DB hash seed
+  A bad note for the same change leaks implementation detail and states no user
+  value:
+    Refactor scanCallback to thread a per-DB seed through dictScan in db.c
+- Use the PR "body" (the author's own description) as your primary evidence for
+  what the change does and why; the title alone is often too terse. The body may
+  be empty. When it and the title disagree, prefer the body.
 - Do NOT include the PR number, the author, "by @...", or any "(#N)". Those
   are added automatically. Write the description text ONLY.
 - Choose the single best-fitting category from the list above, copied verbatim.
@@ -81,7 +92,8 @@ def build_prompt(prs: Sequence[MergedPR], *, categories: Sequence[str], repo_pat
     so the exact category strings are never hardcoded here.
     """
     payload = [
-        {"number": pr.number, "title": pr.title, "author": pr.author, "url": pr.url}
+        {"number": pr.number, "title": pr.title, "author": pr.author,
+         "url": pr.url, "body": pr.body}
         for pr in prs
     ]
     return _PROMPT_TEMPLATE.format(
@@ -162,7 +174,12 @@ def _parse_batch(
         raw_reason = raw.get("uncertain_reason", "")
         reason = raw_reason.strip() if isinstance(raw_reason, str) else ""
         if off_list and not reason:
-            reason = f"suggested new category {category!r}"
+            # An empty category (model returned null/none) reads as a nonsensical
+            # "suggested new category ''"; name the real situation instead.
+            reason = (
+                "model returned no category" if not category
+                else f"suggested new category {category!r}"
+            )
         # Author is filled by the caller (factual, not model-supplied).
         bullets.append(CategorizedBullet(
             pr_number=number, author="", category=category, text=text,

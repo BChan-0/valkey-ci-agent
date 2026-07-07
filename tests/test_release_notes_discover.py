@@ -14,6 +14,8 @@ import pytest
 from scripts.common.proc import git_output, run_git
 from scripts.release_notes import discover as discover_mod
 from scripts.release_notes.discover import (
+    _MAX_PR_BODY_CHARS,
+    _clean_pr_body,
     _pr_from_commit_api,
     _resolve_base_ref,
     hydrate_prs,
@@ -161,6 +163,64 @@ class TestPrFromCommitApi:
         assert _pr_from_commit_api(repo, "deadbeef") is None
 
 
+class TestCleanPrBody:
+    def test_none_and_empty_become_empty(self) -> None:
+        assert _clean_pr_body(None) == ""
+        assert _clean_pr_body("") == ""
+        assert _clean_pr_body("   \n  ") == ""
+
+    def test_non_string_body_becomes_empty(self) -> None:
+        # PyGithub types body as str, but a mis-parsed payload could hand back a
+        # non-string; it must degrade to "" rather than crash the cut.
+        from unittest.mock import MagicMock
+        assert _clean_pr_body(MagicMock()) == ""
+        assert _clean_pr_body(123) == ""
+
+    def test_strips_html_comments(self) -> None:
+        # PR templates render guidance/checklists as HTML comments; drop them.
+        body = "Real summary.\n<!-- please fill this in\nmultiline -->\nMore text."
+        cleaned = _clean_pr_body(body)
+        assert "please fill this in" not in cleaned
+        assert "Real summary." in cleaned
+        assert "More text." in cleaned
+
+    def test_strips_dco_trailers(self) -> None:
+        body = "Fixes a bug.\n\nSigned-off-by: Jane Dev <jane@example.com>\nCo-authored-by: Bob <bob@x>"
+        cleaned = _clean_pr_body(body)
+        assert "Fixes a bug." in cleaned
+        assert "Signed-off-by" not in cleaned
+        assert "Co-authored-by" not in cleaned
+
+    def test_collapses_blank_runs_left_by_removals(self) -> None:
+        # Removing a comment between paragraphs must not leave a 3-blank-line gap.
+        body = "Para one.\n\n<!-- comment -->\n\nPara two."
+        assert _clean_pr_body(body) == "Para one.\n\nPara two."
+
+    def test_short_body_untouched_except_strip(self) -> None:
+        assert _clean_pr_body("  Just a summary.  ") == "Just a summary."
+
+    def test_truncates_long_body_on_word_boundary(self) -> None:
+        # A long body is clipped to the cap and gets an ellipsis; the cut lands on
+        # a space so the last token is whole (no "wor…" split) since whitespace is
+        # frequent near the boundary. Every token is "alpha", so a correct
+        # boundary cut ends in a complete "alpha…", never a fragment.
+        body = ("alpha " * 1000).strip()  # ~6000 chars, spaces throughout
+        cleaned = _clean_pr_body(body)
+        assert len(cleaned) <= _MAX_PR_BODY_CHARS + 1  # +1 for the ellipsis char
+        assert cleaned.endswith("alpha…")  # whole final token, not a split fragment
+        # Body (sans ellipsis) is only whole "alpha" tokens joined by spaces.
+        assert set(cleaned[:-1].split()) == {"alpha"}
+
+    def test_truncates_hard_when_no_late_whitespace(self) -> None:
+        # A single giant token with no nearby space must still be capped, not left
+        # far short by chasing a word boundary that isn't there.
+        body = "x" * 5000
+        cleaned = _clean_pr_body(body)
+        # No usable boundary near the cap, so it clips at the cap (plus ellipsis).
+        assert len(cleaned) == _MAX_PR_BODY_CHARS + 1
+        assert cleaned.endswith("…")
+
+
 class TestHydratePrs:
     def test_builds_merged_prs(self) -> None:
         repo = MagicMock()
@@ -168,6 +228,7 @@ class TestHydratePrs:
         pull.title = "Fix the thing"
         pull.user.login = "octocat"
         pull.html_url = "https://x/10"
+        pull.body = "Fixes a crash when the thing overflows."
         pull.merge_commit_sha = "deadbeef"
         pull.labels = [MagicMock(name="lbl")]
         pull.labels[0].name = "release-notes"
@@ -176,6 +237,7 @@ class TestHydratePrs:
         assert len(prs) == 1
         assert prs[0].number == 10
         assert prs[0].author == "octocat"
+        assert prs[0].body == "Fixes a crash when the thing overflows."
         assert prs[0].labels == ("release-notes",)
 
     def test_ghost_author_becomes_empty(self) -> None:
@@ -184,11 +246,13 @@ class TestHydratePrs:
         pull.title = "t"
         pull.user = None
         pull.html_url = "u"
+        pull.body = None  # a PR with no description
         pull.merge_commit_sha = ""
         pull.labels = []
         repo.get_pull.return_value = pull
         prs = hydrate_prs(repo, {5: "sha5"})
         assert prs[0].author == ""
+        assert prs[0].body == ""  # None body coerces to ""
         assert prs[0].merge_commit_sha == "sha5"  # falls back to the commit sha
 
     def test_pr_404_is_skipped(self) -> None:
@@ -226,6 +290,7 @@ class TestDiscover:
             p.title = f"PR {n}"
             p.user.login = "dev"
             p.html_url = f"https://x/{n}"
+            p.body = f"Body of PR {n}"
             p.merge_commit_sha = ""
             p.labels = []
             return p
@@ -250,6 +315,7 @@ class TestDiscover:
             p.title = f"PR {n}"
             p.user.login = "dev"
             p.html_url = f"https://x/{n}"
+            p.body = f"Body of PR {n}"
             p.merge_commit_sha = ""
             p.labels = []
             return p
@@ -284,6 +350,7 @@ class TestDiscover:
             p.title = f"PR {n}"
             p.user.login = "dev"
             p.html_url = f"https://x/{n}"
+            p.body = f"Body of PR {n}"
             p.merge_commit_sha = ""
             p.labels = []
             return p

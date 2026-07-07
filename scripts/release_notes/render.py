@@ -79,6 +79,30 @@ def format_bullet(bullet: CategorizedBullet) -> str:
     return " ".join(parts)
 
 
+def _reserved_sections(fmt: Any) -> set[str]:
+    """Case-folded reserved section names ``group_bullets`` refuses to render.
+
+    ``Security Fixes`` / ``Contributors`` are populated at release-cut time from a
+    factual source, so a model-assigned bullet under either is dropped. Folded to
+    a case-insensitive set so a lowercase ``security fixes`` is refused too.
+    """
+    return {
+        r.casefold()
+        for r in getattr(fmt, "RESERVED_SECTIONS", ("Security Fixes", "Contributors"))
+    }
+
+
+def is_reserved_category(category: str, fmt: Any) -> bool:
+    """Whether *category* names a reserved section ``group_bullets`` will drop.
+
+    Mirrors the refusal test in :func:`group_bullets` (single-lined, case-folded)
+    so a caller that must know *before* grouping whether a bullet will render --
+    the pipeline's per-PR dedup, which must not let a to-be-dropped reserved
+    bullet shadow a renderable one -- shares one definition with the grouping.
+    """
+    return _one_line(category).casefold() in _reserved_sections(fmt)
+
+
 def group_bullets(
     bullets: Sequence[CategorizedBullet], fmt: Any
 ) -> dict[str, list[str]]:
@@ -100,10 +124,7 @@ def group_bullets(
     """
     # Case-folded so a lowercase "security fixes" is refused too, not coerced into
     # the catch-all and shipped alongside the real auto-generated section.
-    reserved = {
-        r.casefold()
-        for r in getattr(fmt, "RESERVED_SECTIONS", ("Security Fixes", "Contributors"))
-    }
+    reserved = _reserved_sections(fmt)
     canonical = set(fmt.CATEGORIES)
     # The catch-all must be a canonical category; fall back to the last canonical
     # name if the format module does not name one, so an off-list bullet always

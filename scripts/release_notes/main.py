@@ -209,7 +209,10 @@ def main(argv: list[str] | None = None) -> int:
     # in the PR body too (baseline_unanchored).
     baseline_unanchored = False
     base_ref_derived = False
-    if stage == "rc1" and base_ref is None:
+    # An explicit --tag-glob means the user chose glob-based tag resolution, so
+    # don't override it with the rc1 derived base (which would make base_ref
+    # truthy and silently discard the glob below).
+    if stage == "rc1" and base_ref is None and not args.tag_glob:
         derived = _default_base_ref_for_rc1(version)
         if derived:
             logger.warning(
@@ -279,9 +282,11 @@ def main(argv: list[str] | None = None) -> int:
 def _base_ref_exists(clone_dir: str, base_ref: str) -> bool:
     """True if *base_ref* resolves in the fresh clone, as itself or ``origin/<name>``.
 
-    The clone is ``git clone --branch <source_ref>`` + fetch tags, so a non-source
-    branch exists only as ``origin/<name>``; mirror discover's resolution (the ref
-    as given, then ``origin/<name>``) so a real branch/tag/SHA passes.
+    The candidate order (the ref as given, then ``origin/<name>``) must stay in
+    step with :func:`discover._resolve_base_ref`, which resolves the range
+    baseline the same way; if one gains a candidate (e.g. ``refs/tags/<name>``),
+    the other must too, or validation here would pass a ref discovery then can't
+    resolve (or vice versa).
     """
     for candidate in (base_ref, f"origin/{base_ref}"):
         try:

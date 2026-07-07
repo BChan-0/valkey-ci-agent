@@ -21,6 +21,7 @@ release-noted on another line surfaces as a triage signal, not an auto-merge.
 from __future__ import annotations
 
 import logging
+import re
 import subprocess
 from typing import Any
 
@@ -36,6 +37,48 @@ logger = logging.getLogger(__name__)
 # NUL is illegal in a git ref/subject, so it is a safe field separator for the
 # ``%H%x00%s`` log format (a subject may itself contain tabs or pipes).
 _LOG_FORMAT = "%H%x00%s"
+
+# PR bodies feed the generation prompt as extra context. Cap the length so a
+# handful of long descriptions can't blow the batch prompt, and strip the noise
+# a human reviewer skips anyway: HTML comments (PR-template guidance, checklists
+# rendered as comments) and DCO/attribution trailers that render.py re-derives
+# from factual fields. The model still gets the substance ("what changed, why").
+_MAX_PR_BODY_CHARS = 2000
+_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+# Sign-off / co-author trailers: whole line, case-insensitive, to end of line.
+_TRAILER_RE = re.compile(r"(?im)^[ \t]*(?:signed-off-by|co-authored-by):.*$")
+
+
+def _clean_pr_body(body: Any) -> str:
+    """Strip HTML comments and DCO trailers from a PR body, then truncate.
+
+    Returns ``""`` for a missing/empty body, or any non-string value: PyGithub
+    types ``body`` as ``str`` but the payload is not guaranteed to match, and a
+    mis-parsed attribute must degrade to "no body", never crash the cut (same
+    stance as the other ``pull`` fields, coerced with ``or ""``). HTML comments
+    (PR-template prose, hidden checklists) and ``Signed-off-by``/
+    ``Co-authored-by`` trailers carry no release-note signal; dropping them keeps
+    the prompt focused and shorter. Collapses the runs of blank lines the removals
+    leave behind, then clips to :data:`_MAX_PR_BODY_CHARS` on a word boundary
+    where one is near the cut so a token is not split mid-word.
+    """
+    if not isinstance(body, str) or not body:
+        return ""
+    text = _HTML_COMMENT_RE.sub("", body)
+    text = _TRAILER_RE.sub("", text)
+    # Normalize CRLF and collapse 3+ newlines (left by the removals) to a blank line.
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    if len(text) <= _MAX_PR_BODY_CHARS:
+        return text
+    clipped = text[:_MAX_PR_BODY_CHARS]
+    # Prefer cutting at the last whitespace in the tail so we don't split a word;
+    # only do so if that boundary is reasonably close to the cap (else a body with
+    # no late whitespace, e.g. one long token, would be truncated far too short).
+    cut = clipped.rfind(" ")
+    if cut >= _MAX_PR_BODY_CHARS - 200:
+        clipped = clipped[:cut]
+    return clipped.rstrip() + "…"
 
 
 def resolve_last_tag(repo_dir: str, head_ref: str, *, tag_glob: str | None = None) -> tuple[str, str]:
@@ -178,6 +221,7 @@ def hydrate_prs(repo: Any, pr_to_sha: dict[int, str]) -> list[MergedPR]:
                 title=pull.title or "",
                 author=author,
                 url=pull.html_url or "",
+                body=_clean_pr_body(pull.body),
                 labels=labels,
                 merge_commit_sha=pull.merge_commit_sha or sha,
             )

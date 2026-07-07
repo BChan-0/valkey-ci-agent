@@ -418,6 +418,17 @@ def test_explicit_base_ref_overrides_glob(patched):
     assert captured["tag_glob"] is None
 
 
+def test_rc1_explicit_tag_glob_not_overridden_by_derived_base(patched):
+    # An explicit --tag-glob means the user chose glob-based resolution; rc1's
+    # derived base must not preempt it (which would set base_ref and discard the
+    # glob). The glob reaches the cut and base_ref stays None.
+    captured = _capture_cut(patched)
+    main(["--token", "t", "--head-ref", "unstable", "--version", "9.1.0",
+          "--stage", "rc1", "--urgency", "LOW", "--tag-glob", "9.1.*"])
+    assert captured["base_ref"] is None
+    assert captured["tag_glob"] == "9.1.*"
+
+
 def test_rc1_derived_base_absent_degrades_not_aborts(patched, caplog):
     # On a tagless fork, rc1 of 9.1.0 derives 9.0.0, which is absent. A *derived*
     # (not user-supplied) base that resolves to nothing must degrade to the

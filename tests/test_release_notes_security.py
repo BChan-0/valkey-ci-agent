@@ -204,7 +204,9 @@ class TestCollectAdvisoryFixes:
                       vulnerabilities=[_vuln(patched="9.1.0")]),
         ])
         sel = sec.collect_advisory_fixes(repo, "9.1.0")
-        assert sel.bullets == ("(CVE-2026-23479) Use-After-Free in unblock client flow",)
+        assert [sec.render_bullet(f) for f in sel.matched] == [
+            "(CVE-2026-23479) Use-After-Free in unblock client flow"
+        ]
         assert sel.considered == 1
         assert [f.display_id for f in sel.matched] == ["CVE-2026-23479"]
         assert sel.unmatched_ids == ()
@@ -215,7 +217,7 @@ class TestCollectAdvisoryFixes:
                       vulnerabilities=[_vuln(patched="8.0.4")]),
         ])
         sel = sec.collect_advisory_fixes(repo, "9.1.0")
-        assert sel.bullets == ()
+        assert sel.matched == ()
         assert sel.considered == 1
         assert sel.unmatched_ids == ("CVE-2026-1",)
 
@@ -241,7 +243,7 @@ class TestCollectAdvisoryFixes:
                       vulnerabilities=[_vuln(patched="9.1.0")]),
         ])
         sel = sec.collect_advisory_fixes(repo, "9.1.0")
-        assert sel.bullets == ("(GHSA-zzzz) pending CVE",)
+        assert [sec.render_bullet(f) for f in sel.matched] == ["(GHSA-zzzz) pending CVE"]
 
     def test_extracts_cve_from_identifiers_when_field_null(self):
         repo = _FakeRepo([
@@ -251,14 +253,14 @@ class TestCollectAdvisoryFixes:
                       vulnerabilities=[_vuln(patched="9.1.0")]),
         ])
         sel = sec.collect_advisory_fixes(repo, "9.1.0")
-        assert sel.bullets == ("(CVE-2026-999) s",)
+        assert [sec.render_bullet(f) for f in sel.matched] == ["(CVE-2026-999) s"]
 
     def test_fetch_failure_degrades(self):
         repo = _FakeRepo([], raises=RuntimeError("no advisory permission"))
         sel = sec.collect_advisory_fixes(repo, "9.1.0")
         assert sel.fetch_failed is True
         assert "permission" in sel.fetch_error
-        assert sel.bullets == ()
+        assert sel.matched == ()
 
     def test_one_bad_advisory_does_not_abort(self):
         repo = _FakeRepo([
@@ -406,7 +408,7 @@ class TestCollectAdvisoryFixes:
                       vulnerabilities=[_vuln(patched="9.1.0")]),
         ])
         sel = sec.collect_advisory_fixes(repo, "9.1.0")
-        assert sel.bullets == ("(CVE-2026-1) line one line two",)
+        assert [sec.render_bullet(f) for f in sel.matched] == ["(CVE-2026-1) line one line two"]
 
     def test_falls_back_to_description_when_no_summary(self):
         repo = _FakeRepo([
@@ -415,7 +417,7 @@ class TestCollectAdvisoryFixes:
                       vulnerabilities=[_vuln(patched="9.1.0")]),
         ])
         sel = sec.collect_advisory_fixes(repo, "9.1.0")
-        assert sel.bullets == ("(CVE-2026-1) from the description",)
+        assert [sec.render_bullet(f) for f in sel.matched] == ["(CVE-2026-1) from the description"]
 
 
 def _fix(display_id, *, cve_id=None, ghsa_id="GHSA-x", summary="s"):

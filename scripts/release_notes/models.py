@@ -11,8 +11,9 @@ The pipeline is a chain of small, explicit handoffs:
 AI populates only the judgment fields (``CategorizedBullet`` category and text);
 code populates every factual field (PR number, author, labels, the trailing
 ``(#N)``, the ``by @handle`` attribution). The split is deliberate: the model
-decides what to say and where it goes, never the dedup identity or the format
-the downstream release tooling parses.
+decides what to say and where it goes, never the dedup identity or the canonical
+hand-written bullet layout (valkey ships no release tooling; its CI gate is
+label-only and never parses this file).
 """
 
 from __future__ import annotations
@@ -35,6 +36,10 @@ class MergedPR:
 
     ``author`` is a bare login (no leading ``@``); it may be ``""`` when GitHub
     returns no user (a deleted/ghost account), which render must tolerate.
+    ``body`` is the PR description, cleaned and truncated at discovery time (see
+    :func:`discover._clean_pr_body`); it is the model's richest signal for what a
+    change means to a user, and is ``""`` when the PR has no description. It is
+    untrusted text, so the generate prompt marks it as data, never instructions.
     ``merge_commit_sha`` may be ``""`` for a PR resolved from a commit subject
     that was never confirmed against the API.
     """
@@ -43,6 +48,7 @@ class MergedPR:
     title: str
     author: str
     url: str
+    body: str = ""
     labels: tuple[str, ...] = ()
     merge_commit_sha: str = ""
     disposition: PRDisposition = PRDisposition.TRIAGE
@@ -54,7 +60,7 @@ class CategorizedBullet:
 
     ``text`` is the human-readable description ONLY: it must not contain the
     ``(#N)`` reference or the ``by @handle`` attribution, which render appends
-    so they land in the exact positions the release tooling's regexes expect.
+    in the fixed positions of valkey's hand-written release-note convention.
 
     ``uncertain`` is set when the model was not confident about this note (the
     category, or whether the change is user-facing at all). The bullet still

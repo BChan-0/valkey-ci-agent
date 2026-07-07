@@ -86,6 +86,39 @@ class TestComparePagination:
             contrib._compare_logins("r", "base", "head", None)
         assert any("compare API returned only" in r.message for r in caplog.records)
 
+    def test_non_list_commits_does_not_raise(self, monkeypatch) -> None:
+        # A malformed 200 (commits as a scalar/dict) must not be iterated into an
+        # AttributeError that aborts the cut; it yields no logins.
+        monkeypatch.setattr(
+            contrib, "_api_get",
+            lambda url, token: {"total_commits": 1, "commits": 5},
+        )
+        assert contrib._compare_logins("r", "base", "head", None) == []
+
+    def test_non_dict_commit_entry_skipped(self, monkeypatch) -> None:
+        # A junk (non-dict) commit entry alongside a real one: the real login is
+        # still collected, the junk entry is skipped rather than crashing.
+        monkeypatch.setattr(
+            contrib, "_api_get",
+            lambda url, token: {"total_commits": 2,
+                                "commits": ["junk", {"author": {"login": "a"}}]},
+        )
+        assert contrib._compare_logins("r", "base", "head", None) == ["a"]
+
+    def test_page_cap_stops_runaway_pagination(self, monkeypatch) -> None:
+        # An endpoint that ignores `page` and returns a full page forever must not
+        # loop unbounded; the max-page cap stops it.
+        calls = {"n": 0}
+
+        def _always_full(url, token):
+            calls["n"] += 1
+            return {"total_commits": 9999,
+                    "commits": [{"author": {"login": f"u{calls['n']}_{i}"}} for i in range(100)]}
+
+        monkeypatch.setattr(contrib, "_api_get", _always_full)
+        contrib._compare_logins("r", "base", "head", None)
+        assert calls["n"] <= 5  # bounded by max_pages
+
 
 class TestListContributors:
     def test_resolves_display_names_and_sorts(self, monkeypatch) -> None:

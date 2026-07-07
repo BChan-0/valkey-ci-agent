@@ -77,8 +77,12 @@ def regenerate_unreleased(
     # The prompt asks for at most one bullet per PR, but nothing enforces it and
     # neither group_bullets nor render_release_notes dedups by PR number, so a model
     # that emits two bullets for the same PR would credit it twice (possibly under
-    # different categories). Keep the first bullet per PR and surface the rest.
-    bullets, duplicate_prs = _dedup_bullets_by_pr(gen.bullets)
+    # different categories). Keep one bullet per PR and surface the rest. The dedup
+    # is reserved-aware (needs fmt): among a PR's bullets it prefers one that will
+    # render over a reserved-section one group_bullets would drop, so a stray
+    # "Security Fixes"/"Contributors" bullet emitted before the real note can't
+    # shadow it into a dropped-and-declined PR.
+    bullets, duplicate_prs = _dedup_bullets_by_pr(gen.bullets, fmt)
     grouped = render_mod.group_bullets(bullets, fmt)
 
     # Collect the model's low-confidence flags so the cut can surface them in the
@@ -121,22 +125,44 @@ def regenerate_unreleased(
     )
 
 
-def _dedup_bullets_by_pr(bullets):
-    """Keep the first bullet per PR number; return ``(kept, duplicate_pr_numbers)``.
+def _dedup_bullets_by_pr(bullets, fmt):
+    """Keep one bullet per PR number; return ``(kept, duplicate_pr_numbers)``.
+
+    Among a PR's bullets, prefer the first that :func:`render.group_bullets` will
+    render (a canonical or off-list category, the latter coerced into the
+    catch-all) over one under a reserved section (``Security Fixes`` /
+    ``Contributors``) that grouping drops. Without this preference, a reserved
+    bullet the model emitted first for a PR would shadow the PR's real note: the
+    real note is discarded here as a duplicate, the reserved one is dropped by
+    grouping, and the PR -- which had a perfectly good note -- renders nowhere and
+    is misreported as declined. When every bullet for a PR is reserved, the first
+    is kept (grouping drops it and the pipeline folds the PR into ``skipped``).
 
     ``duplicate_pr_numbers`` lists each PR that appeared more than once, in
-    first-seen order, so the caller can flag it in the PR body. Order of *kept* is
-    preserved (group_bullets re-keys into canonical category order afterward).
+    first-seen order, so the caller can flag it in the PR body. Order of *kept*
+    follows each PR's first appearance (group_bullets re-keys into canonical
+    category order afterward).
     """
-    seen: set[int] = set()
+    order: list[int] = []
+    by_pr: dict[int, list] = {}
+    for b in bullets:
+        if b.pr_number not in by_pr:
+            by_pr[b.pr_number] = []
+            order.append(b.pr_number)
+        by_pr[b.pr_number].append(b)
+
     kept = []
     dups: list[int] = []
-    for b in bullets:
-        if b.pr_number in seen:
-            if b.pr_number not in dups:
-                dups.append(b.pr_number)
-                logger.warning("PR #%s has more than one bullet; keeping the first", b.pr_number)
-            continue
-        seen.add(b.pr_number)
-        kept.append(b)
+    for pr in order:
+        group = by_pr[pr]
+        # First renderable bullet wins; fall back to the first bullet only when
+        # every one of the PR's bullets is reserved (grouping will drop it).
+        chosen = next(
+            (b for b in group if not render_mod.is_reserved_category(b.category, fmt)),
+            group[0],
+        )
+        kept.append(chosen)
+        if len(group) > 1:
+            dups.append(pr)
+            logger.warning("PR #%s has more than one bullet; keeping one renderable bullet", pr)
     return tuple(kept), tuple(dups)

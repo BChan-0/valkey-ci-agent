@@ -95,10 +95,12 @@ jobs:
       # One cut per version+stage; a re-run replaces the release branch tip.
       # NOTE: stage is interpolated raw here (GitHub expressions have no lower()),
       # so a dispatch of "RC1" and one of "rc1" land in different groups. The cut
-      # step lowercases stage, so both still cut the same line; the prep-branch
-      # push is force-with-lease and the PR is reused, so the only effect is that
-      # two same-version dispatches differing solely in stage case won't serialize
-      # against each other.
+      # step lowercases stage, so both still cut the same line, same prep branch,
+      # and same PR; nothing duplicates or corrupts. The only edge is that these
+      # two won't serialize against each other, so if they somehow overlap in time
+      # (same version, case-variant stage, dispatched seconds apart) the second's
+      # force-with-lease push just loses the race and that run fails; re-running it
+      # picks up the winner's PR cleanly. Not worth normalizing for.
       group: release-cut-${{ inputs.version }}-${{ inputs.stage }}
       cancel-in-progress: false
     env:
