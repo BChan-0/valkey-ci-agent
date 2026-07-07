@@ -34,7 +34,15 @@ from scripts.ci_fix.apply import apply_fix
 from scripts.ci_fix.models import FixProposal, ReviewVerdict, RunResult
 from scripts.ci_fix.runner import run_verification_command
 from scripts.common.ai_output import extract_json_object
-from scripts.common.proc import EmptyPatch, build_approved_patch, git_output
+from scripts.common.proc import (
+    BOT_EMAIL,
+    BOT_NAME,
+    EmptyPatch,
+    build_approved_patch,
+    git_output,
+    run_git,
+    worktree_changed_paths,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -306,6 +314,90 @@ def verify_repeatedly(
     return result
 
 
+def _looks_like_generated_diff_failure(proposal: FixProposal, result: RunResult) -> bool:
+    """True when a failed verifier appears to be reporting stale generated files.
+
+    Some Valkey checks intentionally fail by printing ``git diff`` after running
+    a generator. In that case the diff is the fix payload, not just evidence of
+    failure. Keep the heuristic narrow: require an actual diff in the output and
+    a command/root-cause signal that this was a generated-file cleanliness check.
+    """
+    if not result.ran or result.passed:
+        return False
+    if "diff --git " not in result.output_tail:
+        return False
+    combined = " ".join(
+        (
+            combined_command(proposal),
+            proposal.failing_check,
+            proposal.root_cause,
+            proposal.reasoning,
+        )
+    ).lower()
+    return (
+        "git diff" in combined
+        or "generated" in combined
+        or "up to date" in combined
+        or "dirty" in combined
+        or "stale" in combined
+    )
+
+
+def _verify_generated_diff_converges(
+    repo_dir: str,
+    proposal: FixProposal,
+    changed_paths: tuple[str, ...],
+    *,
+    runs: int,
+    container_image: str = "",
+    run_command: RunCommand = run_verification_command,
+) -> tuple[RunResult, tuple[str, ...]] | None:
+    """Commit generated verifier output temporarily and rerun verification.
+
+    A cleanliness check that compares generated files to ``HEAD`` cannot pass
+    while those generated files are merely working-tree edits. To prove the
+    candidate patch converges, make a local temporary commit with the current
+    edits, rerun the same verifier against that commit, then restore the edits
+    as an uncommitted patch relative to the original HEAD so the normal review
+    and push path still inspects and ships the exact diff.
+    """
+    all_changed = worktree_changed_paths(repo_dir)
+    if not all_changed:
+        return None
+    if not set(changed_paths).issubset(set(all_changed)):
+        return None
+
+    try:
+        patch = build_approved_patch(repo_dir, all_changed)
+    except EmptyPatch:
+        return None
+
+    original_head = git_output(repo_dir, "rev-parse", "HEAD").strip()
+    result: RunResult | None = None
+    try:
+        run_git(repo_dir, "add", "--all", "--", *all_changed)
+        run_git(repo_dir, "config", "user.name", BOT_NAME)
+        run_git(repo_dir, "config", "user.email", BOT_EMAIL)
+        run_git(repo_dir, "commit", "-m", "Temporary generated-file verification")
+        result = verify_repeatedly(
+            repo_dir,
+            proposal,
+            runs=runs,
+            container_image=container_image,
+            run_command=run_command,
+        )
+    finally:
+        git_output(repo_dir, "reset", "--hard", original_head)
+        git_output(repo_dir, "clean", "-ffdx")
+
+    if result is None or not result.passed:
+        return (result or RunResult(False, False, -1, combined_command(proposal), "temporary verification failed"),
+                all_changed)
+
+    run_git(repo_dir, "apply", "--whitespace=nowarn", "-", input=patch)
+    return result, all_changed
+
+
 def run_fix_loop(
     repo_dir: str,
     proposal: FixProposal,
@@ -440,6 +532,42 @@ def run_fix_loop(
             )
             break
         if not run_result.passed:
+            if _looks_like_generated_diff_failure(proposal, run_result):
+                generated = _verify_generated_diff_converges(
+                    repo_dir,
+                    proposal,
+                    changed,
+                    runs=verify_runs,
+                    container_image=container_image,
+                    run_command=run_command,
+                )
+                if generated is not None:
+                    run_result, changed = generated
+                    last_run = run_result
+                    if run_result.passed:
+                        reviewed = build_and_review_patch(
+                            repo_dir, changed, proposal, review_func=review_func,
+                        )
+                        last_review = reviewed.review
+                        if reviewed.ok:
+                            return LoopResult(
+                                success=True, run_result=run_result, review=reviewed.review,
+                                changed_paths=changed, attempts=attempt,
+                                detail=(
+                                    f"generated files converged and check passed "
+                                    f"{verify_runs} run(s); review approved"
+                                ),
+                            )
+                        if reviewed.review is None:
+                            last_detail = reviewed.detail
+                            break
+                        feedback = (
+                            f"A reviewer rejected your previous fix: {reviewed.review.reasoning}\n\n"
+                            f"Your previous diff was:\n{reviewed.patch}\n\n"
+                            "Address the rejection; do not reproduce the same change."
+                        )
+                        last_detail = reviewed.detail
+                        continue
             feedback = (
                 f"The fix did not make the check pass reliably ({verify_runs} run(s) "
                 f"required). Command exit {run_result.exit_code}. Output tail:\n"
