@@ -105,6 +105,18 @@ class TestComparePagination:
         )
         assert contrib._compare_logins("r", "base", "head", None) == ["a"]
 
+    def test_non_string_login_skipped(self, monkeypatch) -> None:
+        # A non-string login (malformed payload) must not raise on .endswith and
+        # abort the cut; it is skipped, and a real login alongside is still kept.
+        monkeypatch.setattr(
+            contrib, "_api_get",
+            lambda url, token: {"total_commits": 2, "commits": [
+                {"author": {"login": 123}},
+                {"author": {"login": "a"}},
+            ]},
+        )
+        assert contrib._compare_logins("r", "base", "head", None) == ["a"]
+
     def test_page_cap_stops_runaway_pagination(self, monkeypatch) -> None:
         # An endpoint that ignores `page` and returns a full page forever must not
         # loop unbounded; the max-page cap stops it.

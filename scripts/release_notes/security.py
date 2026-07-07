@@ -58,14 +58,16 @@ _VERSION_TOKEN_RE = re.compile(r"(?<![\d.])(\d+\.\d+\.\d+)(?![\d.])")
 # list of fixed backport targets (a range lives in vulnerable_version_range, which
 # we never read), but an author typo or an unexpected payload could put a range
 # here. Because we do exact membership and never range math, a bound would falsely
-# mark a version as fixed: "< 9.1.0" names the first unaffected release, ">= 9.0.0"
-# names the vulnerable floor, and the "9.1.0" end of "8.0.0 - 9.1.0" is likewise a
-# bound, none of which shipped the fix. Drop a token preceded by a comparison
-# operator ("<"/">"/"<="/">=") or a spaced range dash/tilde/caret. A version with
-# an attached pre-release suffix ("9.1.0-rc1") keeps its token: the dash there is
-# not whitespace-surrounded, so it is not read as a range. Tokens joined by an
-# unspaced dash ("9.0.0-9.1.0", not a real patched_versions form) are the residual
-# gap; the PR-body disclaimer already asks a maintainer to add anything missed.
+# mark a version as fixed: "< 9.1.0" names the first unaffected release and
+# ">= 9.0.0" names the vulnerable floor, neither of which shipped the fix. Drop a
+# token preceded by a comparison operator ("<"/">"/"<="/">=") or a spaced range
+# dash/tilde/caret. This catches the upper (right-hand) end of a spaced range,
+# e.g. the "9.1.0" in "8.0.0 - 9.1.0"; the lower "8.0.0" has nothing before it and
+# is kept (a residual gap, alongside an unspaced "9.0.0-9.1.0"). A version with an
+# attached pre-release suffix ("9.1.0-rc1") keeps its token: the dash there is not
+# whitespace-surrounded, so it is not read as a range. patched_versions never
+# legitimately holds a range, and the PR-body disclaimer asks a maintainer to add
+# anything missed, so the residual gaps are harmless.
 _RANGE_BOUND_RE = re.compile(r"(?:[<>]=?|\s[-~^])\s*$")
 # CVE identifier, used both to pick the display id and to dedup a manual
 # --security-fix that names the same CVE (manual wins).

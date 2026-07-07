@@ -3,8 +3,9 @@
 The model does exactly one judgment job: for each included PR, write a concise,
 user-facing description and assign it to one of the canonical categories. It
 never emits the final markdown, the ``(#N)`` reference, or the ``by @handle``
-attribution; :mod:`render` appends those in code, so the format the release
-tooling parses stays authoritative there, not in model output.
+attribution; :mod:`render` appends those in code, so the canonical bullet layout
+stays authoritative there, not in model output (valkey ships no release tooling;
+its CI gate is label-only and never parses this file).
 
 The call runs through the low-level :func:`run_claude_code` wrapper with
 read-only tools (``Read,Grep,Glob``; Bash/Write denied) and ``cwd`` set to the
@@ -194,8 +195,15 @@ def _parse_batch(
     skipped: list[int] = []
     for raw in raw_skipped:
         number = _as_pr_number(raw)
-        if number is not None:
-            skipped.append(number)
+        if number is None:
+            continue
+        if number not in valid_numbers:
+            # Same guard as the bullets path: the model must not invent a PR here
+            # either. An out-of-range "skipped" would otherwise surface verbatim in
+            # the PR body's declined-PRs section as a phantom #N not in the range.
+            logger.warning("Dropping skip for unknown PR #%s", number)
+            continue
+        skipped.append(number)
     return bullets, skipped, True
 
 

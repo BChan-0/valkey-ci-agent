@@ -127,6 +127,15 @@ class TestGenerate:
                           run_fn=_fake_run(obj))
         assert set(result.skipped) == {40, 43}
 
+    def test_skipped_drops_out_of_range_pr(self) -> None:
+        # Same valid_numbers guard the bullets path has: a hallucinated out-of-range
+        # number in "skipped" must not be recorded, or it surfaces verbatim in the PR
+        # body's declined-PRs section as a phantom #N not in the range.
+        obj = {"bullets": [], "skipped": [40, 99999, 43]}
+        result = generate([_pr(40), _pr(43)], repo_dir="/c", categories=_CATEGORIES,
+                          run_fn=_fake_run(obj))
+        assert set(result.skipped) == {40, 43}
+
     def test_non_list_skipped_treated_as_empty(self) -> None:
         # A bare string ("40") would iterate per character and silently vanish;
         # any non-list "skipped" must be treated as empty, not char-iterated.

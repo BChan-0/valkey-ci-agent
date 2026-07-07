@@ -34,7 +34,7 @@ class RegenResult:
     base_tag: str
     grouped: dict[str, list[str]]  # {category: [rendered bullet line, ...]} for this cut
     included: int               # PRs included (labelled release-notes)
-    bullet_count: int           # bullets actually rendered (post group_bullets: after dup-PR dedup and reserved/empty-category drops)
+    bullet_count: int           # bullets actually rendered (post group_bullets: after dup-PR dedup and reserved-category drops)
     skipped: tuple[int, ...]    # PR numbers the model declined
     triage: tuple[MergedPR, ...]  # untagged / double-labelled PRs
     had_prs: bool               # whether the range contained any PR at all
@@ -87,7 +87,7 @@ def regenerate_unreleased(
 
     # Collect the model's low-confidence flags so the cut can surface them in the
     # PR body. Only bullets that survive into `grouped` are reported: a bullet
-    # group_bullets dropped (reserved/empty category) is not a note anyone will
+    # group_bullets dropped (reserved category) is not a note anyone will
     # read, so flagging it would be noise. group_bullets does not reorder within a
     # PR, so matching by PR number is exact.
     rendered_prs = {
@@ -104,18 +104,26 @@ def regenerate_unreleased(
 
     # Count what actually renders, not what the model returned: group_bullets drops
     # bullets under a reserved category (a hallucinated "Security Fixes"/
-    # "Contributors" note) or an empty category, so len(bullets) can exceed this.
-    # The blank-cut guard and the empty-notes warning both key on bullet_count.
+    # "Contributors" note), so len(bullets) can exceed this. The blank-cut guard
+    # and the empty-notes warning both key on bullet_count.
     promoted_count = sum(len(lines) for lines in grouped.values())
 
-    # An included PR whose only bullet group_bullets dropped (reserved/empty
-    # category) renders nowhere and, unlike a model-declined PR, is not in
+    # An included PR whose only bullet group_bullets dropped (reserved category)
+    # renders nowhere and, unlike a model-declined PR, is not in
     # gen.skipped. valkey's label gate checks label presence only, so nothing
     # downstream catches it; fold it into skipped so the PR body's declined-PRs
     # section names it. Exclude PRs that did render (a PR with a second, dropped
     # bullet is still credited by its surviving one).
     dropped_prs = {b.pr_number for b in bullets} - rendered_prs
     skipped = tuple(sorted((set(gen.skipped) | dropped_prs) - rendered_prs))
+
+    # A duplicate flag only means something if a bullet for that PR actually
+    # rendered: the PR-body section tells a maintainer to "confirm the surviving
+    # bullet." A multi-bullet PR whose bullets are all reserved renders nowhere and
+    # is already reported as declined (folded into skipped above), so also flagging
+    # it as a duplicate would assert a surviving bullet that never existed. Scope
+    # the flag to rendered PRs, mirroring `uncertain` above.
+    duplicate_prs = tuple(pr for pr in duplicate_prs if pr in rendered_prs)
 
     return RegenResult(
         base_tag=discovery.base_tag, grouped=grouped,

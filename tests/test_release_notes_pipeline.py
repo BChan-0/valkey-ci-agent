@@ -141,6 +141,22 @@ def test_reserved_bullet_does_not_shadow_real_note(monkeypatch, clone):
     assert r.duplicate_prs == (40,)  # still flagged as a multi-bullet PR
 
 
+def test_all_reserved_multi_bullet_pr_declined_not_duplicate(monkeypatch, clone):
+    # The model emits multiple bullets for one PR, all under reserved categories.
+    # Every bullet is dropped, so the PR renders nowhere and is reported as declined.
+    # It must NOT also be flagged as a duplicate: that section asserts a "surviving
+    # bullet" to confirm, and nothing survived.
+    prs = (MergedPR(number=40, title="t", author="a", url="u", labels=("release-notes",)),)
+    _patch(monkeypatch, prs=prs, bullets=(
+        CategorizedBullet(pr_number=40, author="a", category="Security Fixes", text="one"),
+        CategorizedBullet(pr_number=40, author="a", category="Contributors", text="two"),
+    ))
+    r = pipeline_mod.regenerate_unreleased(object(), clone, head_ref="9.1", tag_glob=None)
+    assert r.bullet_count == 0
+    assert r.skipped == (40,)         # rendered nowhere -> declined
+    assert r.duplicate_prs == ()      # not also flagged as a duplicate
+
+
 def test_uncertain_bullet_surfaced(monkeypatch, clone):
     # A rendered bullet the model flagged uncertain is reported as an UncertainNote
     # so the cut can list it in the PR body; the bullet still renders normally.

@@ -85,7 +85,9 @@ def _compare_logins(repo: str, base_ref: str, head_ref: str, token: Optional[str
                 continue
             author = commit.get("author") or {}
             login = author.get("login") if isinstance(author, dict) else None
-            if not login or login in seen or login.endswith("[bot]"):
+            # A non-string login (a malformed payload) would raise on .endswith and
+            # abort the cut; treat anything but a non-empty str as no login.
+            if not isinstance(login, str) or not login or login in seen or login.endswith("[bot]"):
                 continue
             seen.add(login)
             logins.append(login)
