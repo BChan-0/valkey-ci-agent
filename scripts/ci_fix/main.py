@@ -30,9 +30,11 @@ from scripts.ci_fix.comment import render_comment
 from scripts.ci_fix.gate import ParsedCommand, parse_command
 from scripts.ci_fix.models import FixOutcome, OutcomeKind
 from scripts.ci_fix.pipeline import run_ci_fix
+from scripts.ci_fix.review import DEFAULT_VERIFY_RUNS
 from scripts.ci_fix.verify.macos import MacosVerifier
 from scripts.common.git_auth import GitAuth
 from scripts.common.github_client import retry_github_call
+from scripts.common.polling import env_int
 from scripts.common.workflow_artifacts import ArtifactClient
 
 logger = logging.getLogger(__name__)
@@ -48,6 +50,17 @@ _AUTH_TEAM = os.environ.get("CI_FIX_AUTH_TEAM", "contributors")
 _MACOS_AGENT_REPO = os.environ.get("CI_FIX_MACOS_AGENT_REPO", "")
 _MACOS_AGENT_REF = os.environ.get("CI_FIX_MACOS_AGENT_REF", "main")
 _MACOS_TOKEN = os.environ.get("CI_FIX_MACOS_TOKEN", "")
+_MAX_VERIFY_RUNS = 10
+
+
+def _verify_runs() -> int:
+    """Return the local/Docker verification repeat count."""
+    return env_int(
+        "CI_FIX_VERIFY_RUNS",
+        DEFAULT_VERIFY_RUNS,
+        minimum=1,
+        maximum=_MAX_VERIFY_RUNS,
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -96,6 +109,7 @@ def _run_and_comment(
         agent_gh = Github(auth=Auth.Token(_MACOS_TOKEN))
         macos_verifier = MacosVerifier(
             agent_gh, agent_repo_full_name=_MACOS_AGENT_REPO, ref=_MACOS_AGENT_REF,
+            artifact_client=ArtifactClient(agent_gh, token=_MACOS_TOKEN),
         )
     try:
         with GitAuth(token=token) as auth:
@@ -109,6 +123,7 @@ def _run_and_comment(
                 artifact_client=artifact_client,
                 org=_AUTH_ORG,
                 auth_team=_AUTH_TEAM,
+                verify_runs=_verify_runs(),
                 macos_verifier=macos_verifier,
             )
     except Exception:  # noqa: BLE001 - never crash without telling the PR
