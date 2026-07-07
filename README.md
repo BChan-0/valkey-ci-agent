@@ -339,7 +339,17 @@ short-lived App tokens:
 - On `valkey-io/valkey-ci-agent`: `actions:write` (dispatch and read the
   macOS verification workflow). Used only for the macOS backend.
 
-<<<<<<< release-notes-generator
+`ci-fix-comment-poll.yml` runs hourly and polls twice inside the same runner,
+30 minutes apart. The in-run loop is capped below the GitHub App token lifetime,
+so the second tick does not depend on GitHub scheduling another workflow exactly
+on time. Optional poller tuning lives in `CI_FIX_POLL_INTERVAL_SECONDS` and
+`CI_FIX_POLL_DURATION_SECONDS`.
+
+Optional verification tuning: `CI_FIX_VERIFY_RUNS` sets how many times a
+Linux/Docker fix must pass the verify command before it is trusted (default 2,
+maximum 10). The build runs once regardless, so raising it only repeats the
+verify step. macOS verification runs once on its dedicated runner.
+
 ## Release Notes Workflow
 
 Cuts a Valkey release in one shot. A maintainer dispatches the source branch, the
@@ -448,18 +458,6 @@ that additionally holds `repository-advisories:read`; that permission is
 requested only for an advisory cut, so an ordinary cut is never blocked when the
 App installation lacks it. The App installation must hold
 `repository-advisories:read` for an advisory cut to read the advisories.
-=======
-`ci-fix-comment-poll.yml` runs hourly and polls twice inside the same runner,
-30 minutes apart. The in-run loop is capped below the GitHub App token lifetime,
-so the second tick does not depend on GitHub scheduling another workflow exactly
-on time. Optional poller tuning lives in `CI_FIX_POLL_INTERVAL_SECONDS` and
-`CI_FIX_POLL_DURATION_SECONDS`.
-
-Optional verification tuning: `CI_FIX_VERIFY_RUNS` sets how many times a
-Linux/Docker fix must pass the verify command before it is trusted (default 2,
-maximum 10). The build runs once regardless, so raising it only repeats the
-verify step. macOS verification runs once on its dedicated runner.
->>>>>>> release-notes
 
 ## Safety
 
