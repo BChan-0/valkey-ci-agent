@@ -185,13 +185,13 @@ def test_generated_diff_failure_is_verified_after_temporary_commit(tmp_path):
     def run_command(_repo_dir: str, command: str, **_kwargs) -> RunResult:
         calls.append(command)
         if command == "make && regen && git diff --exit-code":
-            return RunResult(True, False, 1, command, "diff --git a/generated.h b/generated.h")
+            return RunResult(True, False, 1, command, "generator output without a visible diff")
         if command == "make":
             return _passed()
         if command == "regen && git diff --exit-code":
             if (repo / "generated.h").read_text() != "new generated\n":
                 (repo / "generated.h").write_text("new generated\n")
-                return RunResult(True, False, 1, command, "diff --git a/generated.h b/generated.h")
+                return RunResult(True, False, 1, command, "generator output without a visible diff")
             return _passed()
         raise AssertionError(f"unexpected command: {command}")
 
@@ -218,6 +218,31 @@ def test_generated_diff_failure_is_verified_after_temporary_commit(tmp_path):
         "regen && git diff --exit-code",
         "regen && git diff --exit-code",
     ]
+
+
+def test_generated_diff_detection_requires_verifier_git_diff_signal():
+    """AI-authored stale/dirty wording alone must not route into the generated
+    diff path; the verifier that ran must itself involve git diff."""
+    from scripts.ci_fix.review import _looks_like_generated_diff_failure
+
+    proposal = FixProposal(
+        path=FixPath.AUTHOR,
+        failing_check="test stale replica cleanup",
+        root_cause="dirty stale state after failover",
+        reasoning="clean up stale state",
+        confidence=0.9,
+        build_command="make",
+        verify_command="./runtest --single cluster",
+    )
+    result = RunResult(
+        ran=True,
+        passed=False,
+        exit_code=1,
+        command="./runtest --single cluster",
+        output_tail="[err]: stale replica state did not converge",
+    )
+
+    assert _looks_like_generated_diff_failure(proposal, result) is False
 
 
 def test_rejected_review_is_not_handed_off():

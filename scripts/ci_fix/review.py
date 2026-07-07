@@ -318,15 +318,18 @@ def _looks_like_generated_diff_failure(proposal: FixProposal, result: RunResult)
     """True when a failed verifier appears to be reporting stale generated files.
 
     Some Valkey checks intentionally fail by printing ``git diff`` after running
-    a generator. In that case the diff is the fix payload, not just evidence of
-    failure. Keep the heuristic narrow: require an actual diff in the output and
-    a command/root-cause signal that this was a generated-file cleanliness check.
+    a generator, while others hide the diff in shell command substitution
+    (``test -z "$(git diff)"``). In either case the dirty worktree is the fix
+    payload, not just evidence of failure. Keep the heuristic narrow: require
+    the verifier that actually ran to involve ``git diff`` and require a
+    generated-file cleanliness signal from the command/proposal context.
     """
     if not result.ran or result.passed:
         return False
-    if "diff --git " not in result.output_tail:
+    factual = " ".join((result.command, result.output_tail)).lower()
+    if "git diff" not in factual and "diff --git " not in factual:
         return False
-    combined = " ".join(
+    context = " ".join(
         (
             combined_command(proposal),
             proposal.failing_check,
@@ -335,11 +338,12 @@ def _looks_like_generated_diff_failure(proposal: FixProposal, result: RunResult)
         )
     ).lower()
     return (
-        "git diff" in combined
-        or "generated" in combined
-        or "up to date" in combined
-        or "dirty" in combined
-        or "stale" in combined
+        "generated" in context
+        or "up to date" in context
+        or "commands.def" in context
+        or "test_files.h" in context
+        or "dirty" in context
+        or "stale" in context
     )
 
 
