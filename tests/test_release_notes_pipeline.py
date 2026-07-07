@@ -33,11 +33,15 @@ def _patch(monkeypatch, *, prs, bullets=(), skipped=()):
                         lambda *a, **k: GenerationResult(bullets=bullets, skipped=skipped))
 
 
+def _all_lines(grouped):
+    return [line for lines in grouped.values() for line in lines]
+
+
 def test_empty_range(monkeypatch, clone):
     _patch(monkeypatch, prs=())
     r = pipeline_mod.regenerate_unreleased(object(), clone, head_ref="9.1", tag_glob=None)
     assert r.had_prs is False
-    assert r.updated_text == r.existing_text
+    assert r.grouped == {}
 
 
 def test_generates_and_renders(monkeypatch, clone):
@@ -46,8 +50,7 @@ def test_generates_and_renders(monkeypatch, clone):
            bullets=(CategorizedBullet(pr_number=40, author="a", category="Bug Fixes", text="fix"),))
     r = pipeline_mod.regenerate_unreleased(object(), clone, head_ref="9.1", tag_glob=None)
     assert r.had_prs and r.included == 1 and r.bullet_count == 1
-    assert "* fix by @a (#40)" in r.updated_text
-    assert not r.wipes_existing  # the fixture block was empty, so nothing is lost
+    assert r.grouped["Bug Fixes"] == ["* fix by @a (#40)"]
 
 
 def test_triage_surfaced(monkeypatch, clone):
@@ -58,24 +61,30 @@ def test_triage_surfaced(monkeypatch, clone):
     assert r.included == 0
 
 
-def test_wipes_existing_detected(monkeypatch, clone):
-    # Seed a populated block, then have generate produce nothing.
-    from scripts.release_notes import render as render_mod
-    fmt = render_mod.load_format_module(clone)
-    notes = os.path.join(clone, "00-RELEASENOTES")
-    existing = open(notes, encoding="utf-8").read()
-    seeded = render_mod.apply_to_file(
-        existing,
-        render_mod.group_bullets(
-            [CategorizedBullet(pr_number=1, author="x", category="Bug Fixes", text="prior")], fmt),
-        fmt)
-    open(notes, "w", encoding="utf-8").write(seeded)
-
+def test_no_usable_bullets_yields_empty_grouped(monkeypatch, clone):
+    # Included PRs but generate produces nothing: bullet_count is 0 and grouped is
+    # empty, which is what the cut's blank-cut guard (included and not bullet_count)
+    # keys on to refuse the cut.
     prs = (MergedPR(number=40, title="t", author="a", url="u", labels=("release-notes",)),)
     _patch(monkeypatch, prs=prs, bullets=(), skipped=(40,))
     r = pipeline_mod.regenerate_unreleased(object(), clone, head_ref="9.1", tag_glob=None)
     assert r.bullet_count == 0
-    assert r.wipes_existing is True
+    assert r.grouped == {}
+
+
+def test_reserved_only_bullets_count_as_zero(monkeypatch, clone):
+    # Regression: bullet_count must reflect what group_bullets actually renders,
+    # not what the model returned. If the model's only bullet is under a reserved
+    # category ("Security Fixes", auto-generated at release), group_bullets drops
+    # it -> grouped == {} -> bullet_count 0, so the cut's blank-cut guard
+    # (included and not bullet_count) fires instead of silently cutting empty notes.
+    prs = (MergedPR(number=40, title="t", author="a", url="u", labels=("release-notes",)),)
+    _patch(monkeypatch, prs=prs, bullets=(
+        CategorizedBullet(pr_number=40, author="a", category="Security Fixes", text="hallucinated"),
+    ))
+    r = pipeline_mod.regenerate_unreleased(object(), clone, head_ref="9.1", tag_glob=None)
+    assert r.bullet_count == 0        # the reserved-category bullet was dropped, not rendered
+    assert r.grouped == {}
 
 
 def test_duplicate_pr_bullets_deduped_and_recorded(monkeypatch, clone):
@@ -89,8 +98,47 @@ def test_duplicate_pr_bullets_deduped_and_recorded(monkeypatch, clone):
     r = pipeline_mod.regenerate_unreleased(object(), clone, head_ref="9.1", tag_glob=None)
     assert r.bullet_count == 1            # second dropped
     assert r.duplicate_prs == (40,)
-    assert "first" in r.updated_text
-    assert "second" not in r.updated_text
+    lines = _all_lines(r.grouped)
+    assert any("first" in line for line in lines)
+    assert not any("second" in line for line in lines)
+
+
+def test_uncertain_bullet_surfaced(monkeypatch, clone):
+    # A rendered bullet the model flagged uncertain is reported as an UncertainNote
+    # so the cut can list it in the PR body; the bullet still renders normally.
+    prs = (MergedPR(number=40, title="t", author="a", url="u", labels=("release-notes",)),)
+    _patch(monkeypatch, prs=prs, bullets=(
+        CategorizedBullet(pr_number=40, author="a", category="Bug Fixes", text="fix",
+                          uncertain=True, uncertain_reason="could be Behavior Changes"),
+    ))
+    r = pipeline_mod.regenerate_unreleased(object(), clone, head_ref="9.1", tag_glob=None)
+    assert r.bullet_count == 1
+    assert [(n.pr_number, n.category, n.reason) for n in r.uncertain] == [
+        (40, "Bug Fixes", "could be Behavior Changes")
+    ]
+
+
+def test_confident_bullets_produce_no_uncertain_notes(monkeypatch, clone):
+    prs = (MergedPR(number=40, title="t", author="a", url="u", labels=("release-notes",)),)
+    _patch(monkeypatch, prs=prs, bullets=(
+        CategorizedBullet(pr_number=40, author="a", category="Bug Fixes", text="fix"),
+    ))
+    r = pipeline_mod.regenerate_unreleased(object(), clone, head_ref="9.1", tag_glob=None)
+    assert r.uncertain == ()
+
+
+def test_uncertain_dropped_bullet_not_surfaced(monkeypatch, clone):
+    # A bullet flagged uncertain but dropped by group_bullets (reserved category)
+    # must NOT appear in the uncertain notes: it isn't rendered, so there is
+    # nothing for a reviewer to check. Only rendered notes are surfaced.
+    prs = (MergedPR(number=40, title="t", author="a", url="u", labels=("release-notes",)),)
+    _patch(monkeypatch, prs=prs, bullets=(
+        CategorizedBullet(pr_number=40, author="a", category="Security Fixes", text="dropped",
+                          uncertain=True, uncertain_reason="should not surface"),
+    ))
+    r = pipeline_mod.regenerate_unreleased(object(), clone, head_ref="9.1", tag_glob=None)
+    assert r.grouped == {}
+    assert r.uncertain == ()
 
 
 def test_dedup_bullets_by_pr_keeps_first_preserves_order(monkeypatch):

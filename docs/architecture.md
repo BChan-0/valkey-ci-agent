@@ -1,8 +1,9 @@
 # Architecture
 
 The Valkey CI Agent runs workflows that act on Valkey repositories defined in
-the central `repos.yml` registry. Three workflows are active today: backports
-and fuzzer monitoring (scheduled), and the CI test-fix bot (on-demand).
+the central `repos.yml` registry. Five workflows are active today: backports,
+fuzzer monitoring, and the test-failure detector (scheduled), and the CI
+test-fix bot and release-notes cut (on-demand).
 
 ## Layers
 
@@ -12,6 +13,7 @@ scripts/
   fuzzer/      Fuzzer monitor workflow
   test_failure_detector/ Test Failure Detector workflow
   ci_fix/      CI test-fix bot
+  release_notes/ Release-notes cutter: AI notes + version bump
   ai/          Claude Code subprocess orchestration
   common/      Shared infrastructure
 repos.yml      Registry of repos, release branches, and project boards
@@ -293,8 +295,9 @@ main.py (manual dispatch: source_ref, version, stage, urgency)
             -> discover()  labelled PRs over base..HEAD, deduped by PR number
             -> classify()  include / exclude / triage from labels
             -> generate()  AI: one categorized bullet per included PR
-            -> render()    canonical markdown, dedup bullets by PR number
-       -> promote_and_bump()  valkey primitives: dated section + version.h bump
+            -> dedup bullets by PR number (pipeline; surfaces duplicate_prs)
+            -> group_bullets()  {category: [canonical bullet line, ...]}
+       -> promote_and_bump()  render_release_notes(): dated section + version.h bump
        -> _commit_push_release_pr()  prep branch (force-with-lease) + PR into the line
        -> GA rename: delete the old pre-release branch
 ```
@@ -303,8 +306,11 @@ The branch model is one long-running branch per minor line: rc1 creates
 `pre-release-M.m.p`, rcN continues it, ga creates/renames to `M.m`. The cut lands
 on an agent-namespaced `agent/release-cut/...` prep branch and opens a PR into the
 release line, so the line only advances when a human merges. The notes/version
-format stays authoritative in valkey - `promote`, `set_version`, and
-`list_contributors` are loaded from `utils/releasetools` in the clone at runtime.
+format is fixed in one place - `render_release_notes` (`release_format.py`),
+`set_version` (`version_bump.py`), and `list_contributors` (`contributors.py`).
+They live in-repo because `valkey-io/valkey` ships no release tooling of its own,
+so a cut runs against unmodified upstream `unstable` (a plaintext `00-RELEASENOTES`
+placeholder and a `src/version.h` with the `VALKEY_VERSION*` macros).
 
 Non-blocking anomalies (out-of-sequence rc, GA duplicate/orphan, rc-after-GA,
 unanchored baseline, empty/duplicate notes, security correlations) are surfaced as
@@ -315,14 +321,16 @@ errors.
 ### Entry Points
 
 - `scripts/release_notes/main.py` - CLI entry point, input validation, clone
-- `scripts/release_notes/release_cut.py` - branch-plan resolution, promotion, PR body + warnings
+- `scripts/release_notes/release_cut.py` - branch-plan resolution, notes rendering, PR body + warnings
 - `scripts/release_notes/pipeline.py` - discover -> classify -> generate -> render orchestration
 - `scripts/release_notes/discover.py` - range resolution and PR discovery by graph reachability
 - `scripts/release_notes/classify.py` - label-based include / exclude / triage partition
 - `scripts/release_notes/generate.py` - Claude bullet generation (read-only tools)
 - `scripts/release_notes/render.py` - canonical `00-RELEASENOTES` rendering
 - `scripts/release_notes/publish.py` - find/open/update the release PR
-- `scripts/release_notes/clone_tools.py` - loads valkey's releasetools primitives at runtime
+- `scripts/release_notes/release_format.py` - `00-RELEASENOTES` dated-section rendering
+- `scripts/release_notes/version_bump.py` - `src/version.h` macro rewriting
+- `scripts/release_notes/contributors.py` - deduplicated contributor list
 
 ## Planned Workflows
 

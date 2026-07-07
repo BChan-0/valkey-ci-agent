@@ -14,6 +14,8 @@ import pytest
 from scripts.common.proc import git_output, run_git
 from scripts.release_notes import discover as discover_mod
 from scripts.release_notes.discover import (
+    _pr_from_commit_api,
+    _resolve_base_ref,
     hydrate_prs,
     list_range_commits,
     resolve_commit_prs,
@@ -70,6 +72,23 @@ class TestResolveLastTag:
         with pytest.raises(ValueError):
             resolve_last_tag(repo, "main")
 
+    def test_timeout_propagates_not_masked_as_no_tag(self, tmp_path, monkeypatch) -> None:
+        # A hung `git describe` (TimeoutExpired) is an operational failure, not
+        # "no baseline tag": it must propagate, not be disguised as a missing tag
+        # that would send the caller to a wrong baseline. Only a non-zero exit
+        # (CalledProcessError) maps to the "no tag reachable" ValueError.
+        import subprocess
+
+        repo = _init_repo(tmp_path)
+        _commit(repo, "only (#1)")
+
+        def _hang(*args, **kwargs):
+            raise subprocess.TimeoutExpired(cmd="git describe", timeout=300)
+
+        monkeypatch.setattr(discover_mod, "git_output", _hang)
+        with pytest.raises(subprocess.TimeoutExpired):
+            resolve_last_tag(repo, "main")
+
 
 class TestListRangeCommits:
     def test_lists_range_oldest_first(self, tmp_path) -> None:
@@ -118,6 +137,28 @@ class TestResolveCommitPrs:
         repo = MagicMock()
         pr_to_sha = resolve_commit_prs(repo, [("sha", 'Revert "X (#3)" (#9)')])
         assert set(pr_to_sha) == {9}
+
+    def test_api_failure_drops_commit_without_aborting(self) -> None:
+        # The riskiest branch: the commit has no trailing (#N) so the API fallback
+        # runs, and the API call itself raises (rate limit / network error surviving
+        # retries). A RuntimeError is non-retryable, so retry_github_call re-raises
+        # at once (no sleeps). The failure must be swallowed to a dropped commit --
+        # discovery keeps going -- not propagated to abort the whole run.
+        repo = MagicMock()
+        repo.get_commit.side_effect = RuntimeError("500 upstream error")
+        commits = [("shaX", "hand-applied cherry-pick, no ref"), ("sha2", "fix (#11)")]
+        pr_to_sha = resolve_commit_prs(repo, commits)
+        # shaX dropped; the well-formed commit is still resolved.
+        assert pr_to_sha == {11: "sha2"}
+
+
+class TestPrFromCommitApi:
+    def test_returns_none_on_api_error_instead_of_raising(self) -> None:
+        # Isolated: a lookup failure returns None (caller drops the commit) rather
+        # than letting the exception escape _pr_from_commit_api.
+        repo = MagicMock()
+        repo.get_commit.side_effect = RuntimeError("network down")
+        assert _pr_from_commit_api(repo, "deadbeef") is None
 
 
 class TestHydratePrs:
@@ -237,3 +278,13 @@ class TestDiscover:
         result = discover_mod.discover(gh_repo, clone_dir, "main", base_ref="unstable")
         assert result.base_tag == "origin/unstable"  # fell back to remote-tracking ref
         assert {p.number for p in result.prs} == {2}  # only commits after the baseline
+
+    def test_unresolvable_base_ref_raises_valueerror_naming_ref(self, tmp_path) -> None:
+        # A --base-ref that resolves neither as given nor as origin/<name> (a
+        # typo'd branch/tag) must raise a ValueError naming the ref, mirroring
+        # resolve_last_tag, not leak a raw CalledProcessError from the fallback
+        # rev-parse.
+        repo = _init_repo(tmp_path)
+        _commit(repo, "root (#1)")
+        with pytest.raises(ValueError, match="no-such-ref"):
+            _resolve_base_ref(repo, "no-such-ref")

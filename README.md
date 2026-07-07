@@ -115,7 +115,7 @@ The scheduled sweep runs automatically.
 
 #### Daily sweep (automatic)
 
-Runs daily at 09:00 UTC via cron. The preflight job reads `repos.yml` and fans out one job per `{repo, branch}`. Each produces one PR with up to five successfully applied backports for that branch; skipped or unresolved candidates do not count against that cap.
+Runs daily at 09:00 UTC via cron. The preflight job reads `repos.yml` and fans out one job per `{repo, branch}`. Each produces one PR with up to two successfully applied backports for that branch (`--max-candidates 2`); skipped or unresolved candidates do not count against that cap.
 
 #### Manual backport (on-demand)
 
@@ -337,11 +337,11 @@ short-lived App tokens:
 
 Cuts a Valkey release in one shot. A maintainer dispatches the source branch, the
 target version, stage, and urgency; the agent generates the release notes from the
-labelled PRs in range (Claude via Bedrock), promotes them onto the long-running
+labelled PRs in range (Claude via Bedrock), renders them onto the long-running
 release line as a dated section, bumps `src/version.h`, refreshes the running
-contributor list, and opens one PR for review. There is no accumulated
-`## Unreleased` block on any branch - the notes for a release are generated all at
-once. The source branch is never modified.
+contributor list, and opens one PR for review. Nothing accumulates notes on a
+branch - the notes for a release are generated all at once. The source branch is
+never modified.
 
 Dispatch it from this agent repository:
 
@@ -370,7 +370,7 @@ overriding tag resolution), `contrib_base_ref` (contributor range start), and
 
 ### How it works
 
-The promoted commit lands on an agent-namespaced `agent/release-cut/...` prep
+The rendered commit lands on an agent-namespaced `agent/release-cut/...` prep
 branch that opens a PR into the release line, so the line only advances when a
 human merges.
 
@@ -386,12 +386,16 @@ human merges.
    labels into include / exclude / triage, mirroring valkey's `check_release_notes`.
 4. **Generate** (AI) - Claude writes one categorized, user-facing bullet per
    included PR. The model never emits the `(#N)` reference or `by @handle` - code
-   appends those, so the format the release tooling parses stays authoritative in
-   valkey (`utils/releasetools`).
-5. **Promote + bump** (code) - drain the bullets into a new dated section on the
-   release line via valkey's own `promote` / `set_version` primitives (loaded from
-   the clone at runtime), prepend prior RCs' sections, append the contributor list,
-   and bump `src/version.h`.
+   appends those, so the format stays fixed in one place:
+   `scripts/release_notes/release_format.py`.
+5. **Render + bump** (code) - render the categorized bullets into a new dated
+   section on the release line via `render_release_notes` (`release_format.py`) /
+   `set_version` (`version_bump.py`), prepend prior RCs' sections, append the
+   contributor list (`contributors.py`), and bump `src/version.h`. These format
+   primitives live in-repo rather than being imported from valkey, because upstream
+   `valkey-io/valkey` ships no such tooling - so a cut runs against unmodified
+   upstream `unstable` (a plaintext `00-RELEASENOTES` placeholder and a
+   `src/version.h` with the `VALKEY_VERSION*` macros).
 6. **Open the PR** (code) - commit on the prep branch, push it (force-with-lease),
    and open/update a PR into the release line with a body that explains the cut and
    surfaces any advisories (below).

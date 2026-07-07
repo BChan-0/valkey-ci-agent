@@ -1,9 +1,9 @@
 """Assign a release-notes disposition to each discovered PR from its labels.
 
 Pure (no I/O): every input is already on the :class:`MergedPR`, so this is
-trivially unit-testable. The label names and the "exactly one label" rule
-mirror valkey's ``utils/releasetools/check_release_notes.py`` so the generator
-agrees with the CI check that gates PRs.
+trivially unit-testable. The label names and the "exactly one label" rule are
+the convention this automation defines for gating release-note PRs; keep them
+in step with whatever label gate the ``release-notes`` workflow enforces.
 """
 
 from __future__ import annotations
@@ -12,12 +12,12 @@ from typing import Sequence
 
 from scripts.release_notes.models import MergedPR, PRDisposition
 
-# Must match check_release_notes.py exactly.
+# Must match the labels the release-notes workflow gate enforces.
 RELEASE_LABEL = "release-notes"
 NO_RELEASE_LABEL = "no-release-notes"
 
 
-def disposition_for(labels: tuple[str, ...]) -> PRDisposition:
+def disposition_for(labels: Sequence[str]) -> PRDisposition:
     """Map a PR's labels to a :class:`PRDisposition`.
 
     ``no-release-notes`` always suppresses inclusion, so a PR carrying both

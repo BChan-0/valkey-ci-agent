@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Set the Valkey version macros in src/version.h.
 
 Rewrites three macros in place:
@@ -11,24 +10,26 @@ Rewrites three macros in place:
 documented ``0x00MMmmpp`` scheme used by ``VM_GetServerVersion`` (src/module.c)
 and parsed by ``version2num`` (src/util.c). Other macros (SERVER_NAME,
 REDIS_VERSION, ...) are left untouched.
+
+Upstream ``valkey-io/valkey`` ships no equivalent tool, so this module owns the
+``src/version.h`` format and :mod:`release_cut` drives it against a clone.
 """
 
 from __future__ import annotations
 
-import argparse
 import re
-import sys
 
-try:  # Allow both `python -m` and direct-script execution.
-    from release_notes import parse_version
-except ImportError:  # pragma: no cover - import shim
-    from utils.releasetools.release_notes import parse_version  # type: ignore
+from scripts.release_notes.release_format import parse_version
 
 _VERSION_DEFINE_RE = re.compile(r'^(#define\s+VALKEY_VERSION\s+)"[^"]*"', re.MULTILINE)
 _VERSION_NUM_DEFINE_RE = re.compile(r"^(#define\s+VALKEY_VERSION_NUM\s+)0x[0-9A-Fa-f]+", re.MULTILINE)
 _STAGE_DEFINE_RE = re.compile(r'^(#define\s+VALKEY_RELEASE_STAGE\s+)"[^"]*"', re.MULTILINE)
 
-_STAGE_RE = re.compile(r"^(dev|ga|rc\d+)$")
+# dev/ga plus rcN, N starting at 1 with no leading zeros ("rc1", "rc12" but not
+# "rc0"/"rc01"). The rc sub-pattern matches _RC_STAGE_RE in release_format /
+# release_cut; "dev" (the unstable-branch stage) is accepted here but nowhere
+# else, so this stays a superset of that regex rather than reusing it.
+_STAGE_RE = re.compile(r"^(dev|ga|rc[1-9]\d*)$")
 
 
 def version_num(version: str) -> str:
@@ -48,15 +49,19 @@ def _validate_stage(stage: str) -> str:
 
 def set_version(version_h_text: str, version: str, stage: str) -> str:
     """Return *version_h_text* with the three Valkey version macros updated."""
-    # parse_version validates the M.m.p range and raises on bad input.
-    parse_version(version)
+    # parse_version validates the M.m.p range and raises on bad input. Derive the
+    # canonical string from the parsed tuple (not the raw input) so VALKEY_VERSION
+    # and VALKEY_VERSION_NUM can never disagree: writing the raw string would leave
+    # "09.1.0" in VALKEY_VERSION while VALKEY_VERSION_NUM normalized to 0x00090100.
+    major, minor, patch = parse_version(version)
+    canonical = "{}.{}.{}".format(major, minor, patch)
     stage = _validate_stage(stage)
 
     text, n1 = _VERSION_DEFINE_RE.subn(
-        lambda m: '{}"{}"'.format(m.group(1), version), version_h_text
+        lambda m: '{}"{}"'.format(m.group(1), canonical), version_h_text
     )
     text, n2 = _VERSION_NUM_DEFINE_RE.subn(
-        lambda m: "{}{}".format(m.group(1), version_num(version)), text
+        lambda m: "{}{}".format(m.group(1), version_num(canonical)), text
     )
     text, n3 = _STAGE_DEFINE_RE.subn(
         lambda m: '{}"{}"'.format(m.group(1), stage), text
@@ -79,40 +84,3 @@ def set_version(version_h_text: str, version: str, stage: str) -> str:
             "but they were missing or duplicated: {}".format(", ".join(missing))
         )
     return text
-
-
-def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(description="Set the Valkey version macros in version.h.")
-    parser.add_argument("--version", required=True, help="Target version, e.g. 9.1.0")
-    parser.add_argument(
-        "--stage",
-        required=True,
-        help="Release stage: dev, rc1..rcN, or ga",
-    )
-    parser.add_argument(
-        "--file",
-        default="src/version.h",
-        help="Path to version.h (default: src/version.h)",
-    )
-    args = parser.parse_args(argv)
-
-    with open(args.file, "r", encoding="utf-8") as fh:
-        original = fh.read()
-    try:
-        updated = set_version(original, args.version, args.stage)
-    except ValueError as exc:
-        print("error: {}".format(exc), file=sys.stderr)
-        return 2
-    if updated != original:
-        with open(args.file, "w", encoding="utf-8") as fh:
-            fh.write(updated)
-    print(
-        "Set VALKEY_VERSION={} VALKEY_VERSION_NUM={} VALKEY_RELEASE_STAGE={} in {}".format(
-            args.version, version_num(args.version), args.stage.strip().lower(), args.file
-        )
-    )
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())

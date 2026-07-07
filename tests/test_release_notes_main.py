@@ -15,6 +15,27 @@ import pytest
 from scripts.release_notes import main as main_mod
 from scripts.release_notes.main import main
 
+# Every RELEASE_NOTES_* env var main() reads as an argparse default. The
+# validation tests assert that a *missing* CLI flag triggers a usage error, which
+# only holds if the corresponding env default is empty. main() reads these at
+# call time (not import time), so clearing them here reaches the real defaults --
+# an ambient value (CI, a dev shell, another test) would otherwise supply the
+# "missing" argument and make a validation test pass for the wrong reason.
+_RELEASE_NOTES_ENV = (
+    "RELEASE_NOTES_REPO", "RELEASE_NOTES_HEAD_REF", "RELEASE_NOTES_VERSION",
+    "RELEASE_NOTES_STAGE", "RELEASE_NOTES_URGENCY", "RELEASE_NOTES_DATE",
+    "RELEASE_NOTES_TAG_GLOB", "RELEASE_NOTES_BASE_REF", "RELEASE_NOTES_CONTRIB_BASE",
+    "RELEASE_NOTES_SECURITY_FROM_ADVISORIES",
+    "RELEASE_NOTES_GITHUB_TOKEN", "TARGET_TOKEN", "GITHUB_TOKEN",
+)
+
+
+@pytest.fixture(autouse=True)
+def _clear_release_notes_env(monkeypatch):
+    """Give every test a clean env so argparse defaults are the real defaults."""
+    for name in _RELEASE_NOTES_ENV:
+        monkeypatch.delenv(name, raising=False)
+
 
 @pytest.fixture
 def patched(monkeypatch, tmp_path):
@@ -112,7 +133,13 @@ def test_urgency_uppercased_before_cut(patched):
     assert captured["urgency"] == "HIGH"
 
 
-@pytest.mark.parametrize("bad_date", ["06/30/2026", "2026-13-45", "Jun 30 2026"])
+@pytest.mark.parametrize("bad_date", [
+    "06/30/2026", "2026-13-45", "Jun 30 2026",
+    # Rejected only if the format is checked explicitly: date.fromisoformat is
+    # lenient on Python 3.11+ and would accept these, shipping a wrong/raw date
+    # into the release heading (2026-W01-1 resolves to 2025-12-29).
+    "20260630", "2026-W01-1", "2026-6-3",
+])
 def test_malformed_date_is_usage_error(bad_date):
     with pytest.raises(SystemExit) as exc:
         main(["--token", "t", "--head-ref", "unstable", "--version", "9.1.0",
@@ -184,6 +211,41 @@ def test_dry_run_threads_through(patched):
     assert captured["dry_run"] is True
 
 
+def test_security_from_advisories_defaults_false(patched):
+    # Absent the flag/env, the cut must not attempt the advisory fetch.
+    captured = _capture_cut(patched)
+    main(["--token", "t", "--head-ref", "unstable", "--version", "9.1.0",
+          "--stage", "rc2", "--urgency", "LOW"])
+    assert captured["security_from_advisories"] is False
+
+
+def test_security_from_advisories_flag_threads_through(patched):
+    captured = _capture_cut(patched)
+    main(["--token", "t", "--head-ref", "unstable", "--version", "9.1.0",
+          "--stage", "rc2", "--urgency", "LOW", "--security-from-advisories"])
+    assert captured["security_from_advisories"] is True
+
+
+def test_security_from_advisories_env_default_reaches_cut(patched, monkeypatch):
+    # The workflow passes this input only as RELEASE_NOTES_SECURITY_FROM_ADVISORIES
+    # ('true'/'false'), never as a CLI flag, so the env default must reach cut().
+    captured = _capture_cut(patched)
+    monkeypatch.setenv("RELEASE_NOTES_SECURITY_FROM_ADVISORIES", "true")
+    main(["--token", "t", "--head-ref", "unstable", "--version", "9.1.0",
+          "--stage", "rc2", "--urgency", "LOW"])
+    assert captured["security_from_advisories"] is True
+
+
+def test_security_from_advisories_env_false_is_false(patched, monkeypatch):
+    # 'false' is the literal string GitHub Actions exports for an unchecked box;
+    # a bare bool(os.environ.get(...)) would misread it as truthy.
+    captured = _capture_cut(patched)
+    monkeypatch.setenv("RELEASE_NOTES_SECURITY_FROM_ADVISORIES", "false")
+    main(["--token", "t", "--head-ref", "unstable", "--version", "9.1.0",
+          "--stage", "rc2", "--urgency", "LOW"])
+    assert captured["security_from_advisories"] is False
+
+
 def test_cut_failure_returns_one(patched):
     def _cut(repo, **kwargs):
         raise RuntimeError("boom")
@@ -222,14 +284,25 @@ class TestDefaultTagGlob:
 
 
 class TestDefaultBaseRefForRc1:
-    def test_previous_minor_ga(self) -> None:
+    def test_new_minor_uses_previous_minor_ga(self) -> None:
+        # A new minor (patch 0) covers changes since the previous minor's GA.
         assert main_mod._default_base_ref_for_rc1("9.1.0") == "9.0.0"
 
-    def test_patch_release(self) -> None:
-        assert main_mod._default_base_ref_for_rc1("9.2.3") == "9.1.0"
+    def test_patch_uses_prior_patch_not_previous_minor(self) -> None:
+        # A patch cut covers only changes since the prior patch, so the baseline is
+        # M.m.(p-1), NOT the previous minor -- deriving 9.1.0 here would re-credit
+        # the entire 9.2.0/.1/.2 patch line.
+        assert main_mod._default_base_ref_for_rc1("9.2.3") == "9.2.2"
+        assert main_mod._default_base_ref_for_rc1("9.2.1") == "9.2.0"
 
-    def test_first_minor_of_major_has_none(self) -> None:
-        # 9.0.0 has no obvious previous-minor GA on the same major.
+    def test_patch_of_first_minor_uses_prior_patch(self) -> None:
+        # 9.0.5 has patch>0, so its baseline is the prior patch 9.0.4 -- the old
+        # minor==0 guard wrongly returned None (unanchored) for this.
+        assert main_mod._default_base_ref_for_rc1("9.0.5") == "9.0.4"
+        assert main_mod._default_base_ref_for_rc1("9.0.1") == "9.0.0"
+
+    def test_first_release_of_major_has_none(self) -> None:
+        # 9.0.0 has no previous release on this major to derive.
         assert main_mod._default_base_ref_for_rc1("9.0.0") is None
 
     def test_non_version_is_none(self) -> None:
@@ -254,6 +327,20 @@ def test_rc1_without_base_ref_warns_and_defaults(patched, caplog):
     assert captured["base_ref"] == "9.0.0"
     assert captured["tag_glob"] is None
     assert any("rc1" in r.message and "9.0.0" in r.message for r in caplog.records)
+
+
+def test_rc1_patch_defaults_base_ref_to_prior_patch(patched, caplog):
+    # rc1 of a patch (9.2.3) must anchor to the prior patch 9.2.2, not the previous
+    # minor 9.1.0 -- the latter silently re-credits the whole 9.2.x patch line. The
+    # anchored value must reach cut() (baseline stays anchored, not unanchored).
+    captured = _capture_cut(patched)
+    import logging
+    with caplog.at_level(logging.WARNING):
+        main(["--token", "t", "--head-ref", "unstable",
+              "--version", "9.2.3", "--stage", "rc1", "--urgency", "LOW"])
+    assert captured["base_ref"] == "9.2.2"
+    assert captured["tag_glob"] is None
+    assert captured["baseline_unanchored"] is False
 
 
 def test_rc1_uppercase_stage_still_defaults_base_ref(patched, caplog):

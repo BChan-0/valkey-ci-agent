@@ -1,11 +1,12 @@
-"""Cut a release: generate notes, promote them, bump the version, drain prior RCs.
+"""Cut a release: generate notes, render a dated section, bump the version.
 
-Each cut regenerates the notes from the labelled PRs in range and promotes them
-in one shot. The orchestration mirrors valkey's
-``utils/releasetools/prepare_release.py`` but reuses that repo's primitives
-(``promote``, ``set_version``, ``version_num``, ``list_contributors``), loaded
-from the clone at runtime (:mod:`clone_tools`). This keeps the version macros,
-the dated-section format, and the contributor list authoritative in valkey.
+Each cut generates the notes from the labelled PRs in range and renders them in
+one shot. The orchestration reuses the release-format primitives
+(``render_release_notes`` from :mod:`release_format`, ``set_version``/
+``version_num`` from :mod:`version_bump`, ``list_contributors`` from
+:mod:`contributors`); valkey-io/valkey ships no release tooling of its own, so
+these modules own the version-macro, dated-section, and contributor-list format
+decisions and let the cut run against unmodified upstream ``unstable``.
 
 The release-line branch model (one long-running branch per minor line):
 
@@ -15,15 +16,15 @@ The release-line branch model (one long-running branch per minor line):
                       delete pre-release-M.m.p (a rename)
     later patches  -> continue the existing M.m branch
 
-The AI generates the bullets in a transient ``## Unreleased`` block, built in
-memory by the discover/generate/render pipeline and never written to a branch.
-``promote`` then drains that block into a new dated section on the release line,
-prepends prior RCs' dated sections, appends the running contributor list, and
-bumps ``src/version.h``.
+The AI generates the bullets for the range as an in-memory ``{category:
+[line, ...]}`` map (the discover/generate/render pipeline); nothing is ever
+written to a branch as an "unreleased" block. ``render_release_notes`` renders
+that map into a new dated section on the release line, prepends prior RCs' dated
+sections, appends the running contributor list, and bumps ``src/version.h``.
 
 Successive RCs do not double-note. Each cut discovers PRs by graph range from
 HEAD back to the most recent reachable RC tag, so a PR captured by rc1's tag is
-outside rc2's range. The source branch is never modified. The promoted commit
+outside rc2's range. The source branch is never modified. The rendered commit
 lands on an agent prep branch that opens a PR into the release line, so the cut
 is reviewed before the line advances.
 """
@@ -38,9 +39,12 @@ from dataclasses import dataclass
 from typing import Any, Optional, Sequence
 
 from scripts.common.proc import BOT_EMAIL, BOT_NAME, git_output, run_git
+from scripts.release_notes import contributors as gc
 from scripts.release_notes import pipeline as pipeline_mod
 from scripts.release_notes import publish as publish_mod
-from scripts.release_notes.clone_tools import load_releasetools_module
+from scripts.release_notes import release_format as rn
+from scripts.release_notes import security as security_mod
+from scripts.release_notes import version_bump as bv
 
 logger = logging.getLogger(__name__)
 
@@ -69,11 +73,11 @@ _BULLET_LINE_RE = re.compile(r"^\s*[*-]\s+\S")
 # render always emits a single canonical "(#N)"; the punctuation tolerance only
 # matters for destination-side hand-edits / pre-existing valkey files, where a
 # missed ref would let a credited PR be promoted a second time. A trailing run
-# like "(#44)(#45)" still captures only the last ref (45) -- rare enough to leave.
+# like "(#44)(#45)" still captures only the last ref (45), rare enough to leave.
 _TRAILING_PR_RE = re.compile(r"\(#(\d+)\)[\s.,:;)]*$")
 
-# Urgency values valkey's promote() accepts; a SECURITY cut with no fixes is
-# flagged in the PR body. Mirrors VALID_URGENCIES in the valkey format module
+# Urgency values render_release_notes() accepts; a SECURITY cut with no fixes is
+# flagged in the PR body. Mirrors VALID_URGENCIES in the release-format module
 # (validated authoritatively there) and the workflow's `urgency` choice list.
 _SECURITY_URGENCY = "SECURITY"
 
@@ -102,9 +106,10 @@ class _NotesMeta:
     regen: Any                          # pipeline.RegenResult for this cut
     already_credited: Sequence[int]     # PRs dropped as already on the line
     urgency: str                        # the requested upgrade urgency
-    security_fixes: Sequence[str]       # sanitized --security-fix bullets (may be empty)
+    security_fixes: Optional[Sequence[str]]  # sanitized security bullets: manual + advisory-derived (None when empty)
     security_dup_prs: Sequence[int]     # PRs noted both as a security fix and a normal bullet
     baseline_unanchored: bool           # rc1 of M.0.0 with no --base-ref (over-broad range risk)
+    advisories: Optional[Any] = None    # security.AdvisorySelection when --security-from-advisories ran, else None
 
 
 def _split_version(version: str) -> tuple[int, int, int]:
@@ -114,7 +119,7 @@ def _split_version(version: str) -> tuple[int, int, int]:
     parts = (int(m.group(1)), int(m.group(2)), int(m.group(3)))
     # Each component must fit one byte of VALKEY_VERSION_NUM (valkey's parse_version
     # enforces the same 0-255 bound). Reject here so a too-large version fails at the
-    # input boundary, not deep inside promote() after a wasted clone + AI run.
+    # input boundary, not deep inside rendering after a wasted clone + AI run.
     for name, value in zip(("major", "minor", "patch"), parts):
         if not 0 <= value <= 255:
             raise ValueError(f"{name} version {value} is out of range 0-255 (got {version!r})")
@@ -287,9 +292,9 @@ def _warn_ga_continuation(
     The GA continue path bases on ``M.m`` and ignores ``pre-release-M.m.p``. Two
     states warrant a heads-up, both non-blocking:
 
-    * The line already records a ``Valkey <version> GA`` dated section -- a repeat
+    * The line already records a ``Valkey <version> GA`` dated section: a repeat
       GA stacks a SECOND dated heading for the same version above the existing one.
-    * A ``pre-release-M.m.p`` still exists on origin -- its ``rcN`` dated sections
+    * A ``pre-release-M.m.p`` still exists on origin: its ``rcN`` dated sections
       will NOT be carried onto ``M.m`` and the branch is not auto-deleted by this
       continue path.
 
@@ -375,7 +380,7 @@ def commit_title(version: str, stage_lc: str) -> str:
 def promote_and_bump(
     valkey_clone_dir: str,
     *,
-    source_notes_text: str,
+    grouped: dict[str, list[str]],
     dest_notes_text: str,
     dest_version_text: str,
     version: str,
@@ -387,21 +392,18 @@ def promote_and_bump(
     token: Optional[str],
     security_fixes: Optional[Sequence[str]],
 ) -> tuple[str, str]:
-    """Drain *source_notes_text*'s block onto the destination changelog and bump the version.
+    """Render *grouped* onto the destination changelog and bump the version.
 
-    Returns ``(new_dest_notes, new_version_h)``. The valkey primitives make all
-    formatting decisions: ``promote`` in drain mode (``prior_text`` is the
-    destination's running changelog) produces a frozen dated changelog with no
-    ``## Unreleased`` block, and ``set_version`` rewrites the three version
-    macros. The contributor list is generated over ``contrib_base..HEAD`` and
-    merged into the cumulative footer by ``promote``.
+    Returns ``(new_dest_notes, new_version_h)``. ``render_release_notes`` renders
+    the categorized bullets into a new dated section atop the destination's
+    running changelog (``dest_notes_text``, empty on a first cut), and
+    ``set_version`` rewrites the three version macros. The contributor list is
+    generated over ``contrib_base..HEAD`` and merged into the cumulative footer.
+    *valkey_clone_dir* is needed for the git range resolution behind the
+    contributor lookup, not to load any format code.
     """
-    rn = load_releasetools_module(valkey_clone_dir, "release_notes")
-    bv = load_releasetools_module(valkey_clone_dir, "bump_version")
-
     contributors: list[str] = []
     if contrib_base:
-        gc = load_releasetools_module(valkey_clone_dir, "gen_contributors")
         # Resolve both ends to SHAs the GitHub compare API accepts. contrib_base
         # is typically a remote-tracking ref (origin/unstable) and the head is the
         # literal "HEAD"; both 404 the API and silently fall back to git shortlog
@@ -415,15 +417,15 @@ def promote_and_bump(
     else:
         logger.warning("No contributor base ref/tag found; skipping contributor list")
 
-    new_notes = rn.promote(
-        source_notes_text,
+    new_notes = rn.render_release_notes(
+        grouped,
         version=version,
         stage=stage_lc,
         urgency=urgency,
         date=date,
+        prior_text=dest_notes_text,
         contributors=contributors,
         security_fixes=list(security_fixes) if security_fixes else None,
-        prior_text=dest_notes_text,
     )
     new_version = bv.set_version(dest_version_text, version, stage_lc)
     logger.info(
@@ -502,10 +504,27 @@ def _credited_pr_numbers(notes_text: str) -> set[int]:
     branch and re-finds PRs the line already shipped. Deduping the cut's bullets
     against this set makes promotion idempotent regardless of tags: a PR the line
     already lists is dropped instead of double-noted.
+
+    Bullets inside the ``### Security Fixes`` section are skipped: that section is
+    sourced only from ``security_fixes`` (never from PR bullets), so its bullets
+    carry no legitimate PR credit. Their trailing ``(#N)``, if a CVE summary
+    happens to end in one, is prose, not a credit, and must not seed the dedup
+    set, or a later cut would drop an unrelated real PR that reused that number.
     """
+    security_header = getattr(rn, "SECURITY_CATEGORY", "Security Fixes")
     credited: set[int] = set()
+    in_security = False
     for line in notes_text.splitlines():
-        if not _BULLET_LINE_RE.match(line):
+        stripped = line.strip()
+        if stripped.startswith("### "):
+            in_security = stripped[len("### "):].strip() == security_header
+            continue
+        # Any level-2 header (a new dated section) leaves whatever ### category
+        # we were in.
+        if stripped.startswith("## "):
+            in_security = False
+            continue
+        if in_security or not _BULLET_LINE_RE.match(line):
             continue
         m = _TRAILING_PR_RE.search(line)
         if m:
@@ -513,27 +532,46 @@ def _credited_pr_numbers(notes_text: str) -> set[int]:
     return credited
 
 
-def _drop_already_credited(source_notes_text: str, credited: set[int]) -> tuple[str, list[int]]:
-    """Drop bullets whose trailing ``(#N)`` is in *credited* from the source block.
+def _grouped_pr_numbers(grouped: dict[str, list[str]]) -> set[int]:
+    """Return the PR numbers credited by the bullets in *grouped*.
 
-    Returns ``(filtered_text, dropped_numbers)``. Only bullet lines are touched;
-    headers, prose, and blank lines pass through unchanged, so the block still
-    renders through the canonical format. A category left with no bullets stays
-    as an empty ``### Header``; promote() and the format module already omit
-    empty categories from the dated section, so no extra cleanup is needed here.
+    Each rendered bullet ends with the canonical trailing ``(#N)``; this reads
+    those. Used to intersect this cut's PRs with what the destination already
+    credits (dedup) and with the ``--security-fix`` refs (double-listing check).
+    """
+    numbers: set[int] = set()
+    for lines in grouped.values():
+        for line in lines:
+            m = _TRAILING_PR_RE.search(line)
+            if m:
+                numbers.add(int(m.group(1)))
+    return numbers
+
+
+def _drop_already_credited(
+    grouped: dict[str, list[str]], credited: set[int]
+) -> tuple[dict[str, list[str]], list[int]]:
+    """Drop bullets whose trailing ``(#N)`` is in *credited* from *grouped*.
+
+    Returns ``(filtered_grouped, dropped_numbers)``. A category left with no
+    bullets is dropped entirely; render_release_notes already omits empty
+    categories, so this just keeps the map tidy.
     """
     if not credited:
-        return source_notes_text, []
-    kept: list[str] = []
+        return grouped, []
+    kept: dict[str, list[str]] = {}
     dropped: list[int] = []
-    for line in source_notes_text.split("\n"):
-        if _BULLET_LINE_RE.match(line):
+    for category, lines in grouped.items():
+        kept_lines: list[str] = []
+        for line in lines:
             m = _TRAILING_PR_RE.search(line)
             if m and int(m.group(1)) in credited:
                 dropped.append(int(m.group(1)))
                 continue
-        kept.append(line)
-    return "\n".join(kept), dropped
+            kept_lines.append(line)
+        if kept_lines:
+            kept[category] = kept_lines
+    return kept, dropped
 
 
 def _sanitize_security_fixes(
@@ -604,19 +642,35 @@ def cut(
     git_env: dict[str, str],
     dry_run: bool,
     baseline_unanchored: bool = False,
+    security_from_advisories: bool = False,
 ) -> int:
-    """Cut a release: regenerate source notes with AI, drain onto the release line, open PRs.
+    """Cut a release: generate notes with AI, render onto the release line, open PRs.
 
     ``source_clone_dir`` is a clone of the source branch; it doubles as
-    ``valkey_clone_dir`` for loading the release primitives. The destination
+    ``valkey_clone_dir`` for the contributor range lookup. The destination
     release branch is materialized in a worktree under it. Returns 0 on success,
     1 on failure.
+
+    When *security_from_advisories* is set, published GitHub repository advisories
+    fixed by *version* are rendered into the Security Fixes section (merged with
+    any manual ``--security-fix`` entries, which win on CVE collision). See
+    :mod:`scripts.release_notes.security` for why this is a version-string match,
+    not the PR graph-walk, and why embargoed advisories are surfaced as a
+    reviewer disclaimer rather than auto-included.
     """
     # Canonicalize once at the boundary so version.h, the dated heading, the commit
     # title, the prep-branch ref, and the release line all carry the same string.
     # Raw input may have a trailing space or leading zeros (see canonical_version).
     version = canonical_version(version)
-    # Drop empty/whitespace --security-fix entries and collapse each to one physical
+    # Auto-derive Security Fixes from published advisories fixed by this version,
+    # merged with manual --security-fix entries (manual wins on CVE collision).
+    # Fetch never raises: a permission gap degrades to an empty selection whose
+    # disclaimer asks a maintainer to add fixes by hand.
+    advisories = None
+    if security_from_advisories:
+        advisories = security_mod.collect_advisory_fixes(repo, version)
+        security_fixes = security_mod.merge_with_manual(advisories.matched, security_fixes)
+    # Drop empty/whitespace security entries and collapse each to one physical
     # line: unlike AI bullets (sanitized in render._one_line), these bypass render
     # and an embedded newline would inject a raw non-bullet line into the changelog.
     security_fixes = _sanitize_security_fixes(security_fixes)
@@ -628,17 +682,17 @@ def cut(
         plan.stage, plan.target, plan.base_ref, plan.continuing, plan.rename_from or "<none>",
     )
 
-    # 1. Regenerate the source branch's ## Unreleased block from labelled PRs.
+    # 1. Generate the categorized bullets for the range from labelled PRs.
     regen = pipeline_mod.regenerate_unreleased(
         repo, source_clone_dir, head_ref=source_ref, tag_glob=tag_glob, base_ref=base_ref
     )
-    if regen.included and not regen.bullet_count and regen.wipes_existing:
+    if regen.included and not regen.bullet_count:
         logger.error(
-            "%d PR(s) included but no bullets generated; refusing to cut with a blanked block.",
+            "%d PR(s) included but no bullets generated; refusing to cut empty notes.",
             regen.included,
         )
         return 1
-    source_notes = regen.updated_text  # source block now carries the fresh bullets
+    grouped = dict(regen.grouped)  # {category: [bullet line, ...]} for this cut
 
     # 2. Materialize a throwaway worktree at the release line's base. We never
     #    check out (or force-push) the real release branch; instead we build the
@@ -665,12 +719,10 @@ def cut(
         # where discovery already returns only new PRs.
         already_credited = sorted(
             _credited_pr_numbers(dest_notes_text)
-            & _credited_pr_numbers(source_notes)
+            & _grouped_pr_numbers(grouped)
         )
         if already_credited:
-            source_notes, _dropped = _drop_already_credited(
-                source_notes, set(already_credited)
-            )
+            grouped, _dropped = _drop_already_credited(grouped, set(already_credited))
             logger.info(
                 "Dropped %d PR(s) already credited on %s: %s",
                 len(already_credited), plan.target, already_credited,
@@ -687,15 +739,15 @@ def cut(
         # A --security-fix bullet whose trailing (#N) also names a release-noted PR
         # in this cut means the same change is listed twice (Security Fixes + its
         # category). Flag for the reviewer; do not auto-drop (a maintainer may want
-        # both). Match against the PRs actually noted now (source_notes post-drop).
+        # both). Match against the PRs actually noted now (grouped post-drop).
         security_dup_prs = _security_dup_prs(
-            security_fixes, _credited_pr_numbers(source_notes)
+            security_fixes, _grouped_pr_numbers(grouped)
         )
 
-        # 3. Drain source bullets -> dated section on dest; bump version.h.
+        # 3. Render bullets -> dated section on dest; bump version.h.
         new_dest_notes, new_version = promote_and_bump(
             valkey_clone_dir,
-            source_notes_text=source_notes,
+            grouped=grouped,
             dest_notes_text=dest_notes_text,
             dest_version_text=dest_version_text,
             version=version, stage_lc=plan.stage, urgency=urgency, date=date,
@@ -706,7 +758,7 @@ def cut(
         notes_meta = _NotesMeta(
             regen=regen, already_credited=already_credited, urgency=urgency,
             security_fixes=security_fixes, security_dup_prs=security_dup_prs,
-            baseline_unanchored=baseline_unanchored,
+            baseline_unanchored=baseline_unanchored, advisories=advisories,
         )
 
         if dry_run:
@@ -721,11 +773,11 @@ def cut(
                     f"origin/{plan.base_ref}:refs/heads/{plan.target}", env=git_env)
             logger.info("Created release line %s at origin/%s", plan.target, plan.base_ref)
 
-        # 5. Commit the promoted notes + bumped version on the prep branch, push
+        # 5. Commit the rendered notes + bumped version on the prep branch, push
         #    it (agent-namespaced, force-with-lease), and PR it into the line. The
-        #    source branch is never modified: there is no ## Unreleased block to
-        #    empty, so no companion PR. Each cut rediscovers PRs from the last RC
-        #    tag, so prior RCs' PRs are excluded by the graph range, not by reset.
+        #    source branch is never modified, so no companion PR. Each cut
+        #    rediscovers PRs from the last RC tag, so prior RCs' PRs are excluded
+        #    by the graph range.
         _write(dest_notes_path, new_dest_notes)
         _write(os.path.join(dest_dir, VERSION_FILE), new_version)
         release_url = _commit_push_release_pr(
@@ -733,12 +785,17 @@ def cut(
             version=version, prep_branch=prep_branch, notes_meta=notes_meta,
             git_env=git_env,
         )
-        # 6. GA rename: delete the old pre-release branch (best-effort). The M.m
-        #    line was created from it above, so its history is already carried.
+        # Log the PR before the rename cleanup so a delete failure below still
+        # leaves the created PR's URL in the CI log.
+        logger.info("Release PR: %s", release_url)
+
+        # 6. GA rename: delete the old pre-release branch. The M.m line was created
+        #    from it above, so its history is already carried. A branch already
+        #    gone is fine; a delete that fails with the branch still on origin
+        #    raises (both branches present is what the next GA hard-refuses).
         if plan.rename_from:
             _delete_remote_branch(source_clone_dir, plan.rename_from, git_env)
 
-        logger.info("Release PR: %s", release_url)
         return 0
     finally:
         run_git(source_clone_dir, "worktree", "remove", "--force", dest_dir)
@@ -764,12 +821,28 @@ def _print_dry_run(plan, version, dest_notes, version_h, notes_meta: "_NotesMeta
         print(f"already credited on {plan.target} (dropped): {list(notes_meta.already_credited)}")
     if regen.duplicate_prs:
         print(f"⚠️  PR(s) noted more than once (extra bullets dropped): {list(regen.duplicate_prs)}")
+    if regen.skipped:
+        print(f"⚠️  model declined (labelled but no bullet): {list(regen.skipped)}")
+    if regen.uncertain:
+        flagged = [f"#{n.pr_number} ({n.reason or 'no reason'})" for n in regen.uncertain]
+        print(f"⚠️  notes to double-check: {flagged}")
     if not regen.had_prs:
         print("note: no PRs in range (empty dated section)")
+    if notes_meta.advisories is not None:
+        sel = notes_meta.advisories
+        if sel.fetch_failed:
+            print(f"⚠️  advisory fetch failed ({sel.fetch_error}); no CVEs auto-added")
+        else:
+            matched = [f.display_id for f in sel.matched]
+            print(f"advisories: {sel.considered} published, matched {matched or 'none'}")
+            if sel.unmatched_ids:
+                print(f"advisories not matching {version}: {list(sel.unmatched_ids)}")
+            if sel.unreadable_ids:
+                print(f"⚠️  advisories unreadable (may match {version}): {list(sel.unreadable_ids)}")
     if notes_meta.security_dup_prs:
         print(f"⚠️  security fix also noted normally: {list(notes_meta.security_dup_prs)}")
     if notes_meta.urgency.strip().upper() == _SECURITY_URGENCY and not notes_meta.security_fixes:
-        print("⚠️  urgency SECURITY but no --security-fix entries")
+        print("⚠️  urgency SECURITY but no security-fix entries")
     if regen.triage:
         print(f"triage PRs (untagged): {[p.number for p in regen.triage]}")
     print(f"\n===== {NOTES_FILE} (release branch, dry run) =====\n{dest_notes}")
@@ -843,6 +916,9 @@ def _build_pr_body(plan: BranchPlan, version: str, notes_meta: "_NotesMeta") -> 
         + _empty_notes_section(notes_meta, plan)
         + _no_new_prs_section(notes_meta.already_credited, plan)
         + _duplicate_pr_section(regen.duplicate_prs)
+        + _skipped_section(regen.skipped)
+        + _uncertain_section(regen.uncertain)
+        + _advisory_section(notes_meta)
         + _security_warning_section(notes_meta)
         + _triage_section(regen.triage)
         + "\n*Generated by valkey-ci-agent. Review before merging into the release line.*"
@@ -945,6 +1021,115 @@ def _duplicate_pr_section(duplicate_prs: Sequence[int]) -> str:
     )
 
 
+def _skipped_section(skipped: Sequence[int]) -> str:
+    """Flag included PRs the model declined to note, so they don't vanish silently.
+
+    A PR in *skipped* carried the ``release-notes`` label (it was included) but the
+    generator produced no bullet for it: it judged the change purely internal or
+    non-user-facing, or its output for that PR was lost/unparseable and folded into
+    skipped as "what was dropped." Either way the PR is absent from the dated
+    section. valkey's ``check_release_notes`` gate is label-only, so a PR the model
+    wrongly declined has no other signal; surface it here for a maintainer to
+    confirm each is genuinely not user-facing (or was mislabelled) before merging.
+    """
+    if not skipped:
+        return ""
+    refs = ", ".join(f"#{n}" for n in sorted(skipped))
+    return (
+        "\n### ⚠️ Model declined to note these PRs\n\n"
+        f"These PRs carried the `release-notes` label but the generator produced no "
+        f"bullet for them, so they are **absent** from the dated section: {refs}. It "
+        "judged them purely internal / not user-facing (or its output for them was "
+        "lost). Because the label gate is label-only, this is the only signal a "
+        "declined PR gets. Confirm each is genuinely not user-facing (or was "
+        "mislabelled); if one should be noted, re-cut after correcting it.\n"
+    )
+
+
+def _uncertain_section(uncertain: Sequence[Any]) -> str:
+    """List notes the generator flagged as low-confidence, for a human to confirm.
+
+    Each entry is an :class:`~scripts.release_notes.models.UncertainNote` naming a
+    PR the model was unsure about (which category fits, or whether the change is
+    user-facing at all). The note is still rendered in the dated section; this
+    table asks a maintainer to check the category and wording before merging. A
+    non-canonical category the model invented is flagged here too, with the reason
+    filled in by the generator.
+    """
+    if not uncertain:
+        return ""
+    lines = [
+        "",
+        "### ⚠️ Notes to double-check",
+        "",
+        "The generator was not fully confident about these notes. They are included "
+        "in the dated section above with its best guess; confirm the category and "
+        "wording (or recategorize) before merging:",
+        "",
+        "| PR | Category | Why flagged |",
+        "|----|----------|-------------|",
+    ]
+    for note in uncertain:
+        reason = publish_mod.escape_cell(note.reason) if note.reason else "(no reason given)"
+        category = publish_mod.escape_cell(note.category) if note.category else "(none)"
+        lines.append(f"| #{note.pr_number} | {category} | {reason} |")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _advisory_section(notes_meta: "_NotesMeta") -> str:
+    """Explain the auto-generated Security Fixes and disclaim what could be missed.
+
+    Only rendered when ``--security-from-advisories`` ran (``advisories`` is set).
+    Because only *published* advisories are visible to the token and the version
+    match is against author-typed metadata, this always tells a maintainer to
+    confirm and to add any embargoed/draft CVEs by hand. When the fetch failed
+    (most often a missing advisory-read permission), it says so explicitly rather
+    than implying "no security fixes".
+    """
+    sel = notes_meta.advisories
+    if sel is None:
+        return ""
+    if sel.fetch_failed:
+        return (
+            "\n### ⚠️ Security advisories could not be read\n\n"
+            "`--security-from-advisories` was set, but listing the repository's "
+            "security advisories failed (often the token lacks advisory-read "
+            f"permission): {publish_mod.escape_cell(sel.fetch_error)}. No CVEs were "
+            "auto-added. A maintainer with access should add any Security Fixes by "
+            "hand and re-cut.\n"
+        )
+    lines = [
+        "\n### Security fixes (auto-generated from advisories)\n",
+    ]
+    if sel.matched:
+        refs = ", ".join(f"`{f.display_id}`" for f in sel.matched)
+        lines.append(
+            f"Rendered {len(sel.matched)} published advisory fix(es) matching this "
+            f"version into **Security Fixes**: {refs}."
+        )
+    else:
+        lines.append(
+            f"No published advisory names this version as a patched version "
+            f"({sel.considered} published advisor{'y' if sel.considered == 1 else 'ies'} examined)."
+        )
+    if sel.unreadable_ids:
+        refs = ", ".join(f"`{publish_mod.escape_cell(i)}`" for i in sel.unreadable_ids)
+        lines.append(
+            f"\n⚠️ {len(sel.unreadable_ids)} published advisor"
+            f"{'y' if len(sel.unreadable_ids) == 1 else 'ies'} could **not** be read "
+            f"({refs}), so they were neither matched nor ruled out and MAY fix this "
+            "version. Check each by hand and add it with `--security-fix` if it applies."
+        )
+    lines.append(
+        "\nOnly **published** advisories are visible here, and the match is on the "
+        "advisory's author-entered patched-version, so treat this as a starting "
+        "point: confirm the list, and add any embargoed or draft CVEs (and any the "
+        "match missed) by hand with `--security-fix` before merging."
+    )
+    return "\n".join(lines) + "\n"
+
+
 def _security_warning_section(notes_meta: "_NotesMeta") -> str:
     """Render security-fix correlation warnings: duplicate listing, urgency mismatch.
 
@@ -1022,9 +1207,31 @@ def _triage_section(triage: Sequence[Any]) -> str:
 
 
 def _delete_remote_branch(repo_dir: str, branch: str, git_env: dict[str, str]) -> None:
-    """Delete a remote branch (best-effort: a missing branch is not an error)."""
+    """Delete a remote branch, tolerating one that is already gone.
+
+    A branch that no longer exists on origin is the desired end state, so a
+    delete that fails for that reason is fine. But a delete that fails while the
+    branch is still on origin must not pass as success: for a GA rename that
+    leaves both ``pre-release-M.m.p`` and ``M.m`` on origin, that is precisely the
+    inconsistent state the next GA of that line hard-refuses (see
+    ``resolve_branch_plan``). Confirm the branch is gone before treating a
+    failure as benign; otherwise raise so the caller returns non-zero.
+    """
     try:
         run_git(repo_dir, "push", "origin", "--delete", branch, env=git_env)
         logger.info("Deleted remote branch %s (GA rename)", branch)
+        return
     except Exception as exc:  # noqa: BLE001
-        logger.info("Could not delete %s (already gone?): %s", branch, exc)
+        try:
+            still_present = _remote_branch_exists(repo_dir, branch)
+        except Exception:  # noqa: BLE001 - can't confirm; assume the worst (still there)
+            still_present = True
+        if not still_present:
+            logger.info("Remote branch %s already gone; delete was a no-op: %s", branch, exc)
+            return
+        raise RuntimeError(
+            f"Failed to delete {branch} during the GA rename and it still exists on "
+            f"origin ({exc}). Both {branch} and the release line are now present, which "
+            f"the next GA of this line refuses as an inconsistent state. Delete {branch} "
+            f"manually to reconcile."
+        ) from exc

@@ -50,7 +50,10 @@ def resolve_last_tag(repo_dir: str, head_ref: str, *, tag_glob: str | None = Non
     args.append(head_ref)
     try:
         tag = git_output(repo_dir, *args).strip()
-    except Exception as exc:  # noqa: BLE001 - normalize any git failure to a clear error
+    except subprocess.CalledProcessError as exc:
+        # Only a non-zero exit means "no tag reachable". An operational failure
+        # (TimeoutExpired from a hung git) must propagate, not be disguised as a
+        # missing baseline that would send the caller to the wrong range.
         raise ValueError(
             f"no tag reachable from {head_ref!r}"
             + (f" matching {tag_glob!r}" if tag_glob else "")
@@ -189,7 +192,15 @@ def _resolve_base_ref(repo_dir: str, base_ref: str) -> str:
         return base_ref
     except subprocess.CalledProcessError:
         remote = f"origin/{base_ref}"
-        git_output(repo_dir, "rev-parse", "--verify", "--quiet", f"{remote}^{{commit}}")
+        try:
+            git_output(repo_dir, "rev-parse", "--verify", "--quiet", f"{remote}^{{commit}}")
+        except subprocess.CalledProcessError as exc:
+            # Neither the name as given nor origin/<name> resolves (a typo'd
+            # branch/tag). Raise a ValueError naming the ref, mirroring
+            # resolve_last_tag, rather than leaking a raw CalledProcessError.
+            raise ValueError(
+                f"base ref {base_ref!r} resolves neither as given nor as {remote!r}"
+            ) from exc
         logger.info("Base ref %r resolved via remote-tracking ref %r", base_ref, remote)
         return remote
 

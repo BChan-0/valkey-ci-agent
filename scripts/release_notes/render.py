@@ -1,17 +1,15 @@
-"""Render generated bullets into the canonical ``00-RELEASENOTES`` markdown.
+"""Turn generated bullets into the canonical release-notes lines and grouping.
 
-The format is authoritative in the valkey repo, not here: this module imports
-``utils/releasetools/release_notes.py`` from the valkey clone at runtime (via
-importlib) and reuses its ``CATEGORIES``, the exact ``## Unreleased`` header,
-and the byte-for-byte contributor-guidance HTML comment. The agent never
-re-encodes the category names or that comment, so a change to the format in
-valkey flows through automatically.
+The format lives in :mod:`scripts.release_notes.release_format` (valkey-io/valkey
+ships no release tooling of its own; see that module's docstring). This module
+reuses its ``CATEGORIES`` so the agent never re-encodes the category names.
 
 What this module owns is purely mechanical: turning each
 :class:`CategorizedBullet` into the canonical bullet line
 ``* <text> by @<handle> (#<N>)`` (with the ``(#N)`` trailing and the
-``by @handle`` present, exactly as ``check_release_notes.py`` requires) and
-splicing the filled block into the file in place of the existing one.
+``by @handle`` present, the form the release-notes label gate expects) and
+grouping those lines by category into the ``{category: [line, ...]}`` map that
+:func:`release_format.render_release_notes` renders into a dated section.
 """
 
 from __future__ import annotations
@@ -20,13 +18,13 @@ import logging
 import re
 from typing import Any, Sequence
 
-from scripts.release_notes.clone_tools import load_releasetools_module
+from scripts.release_notes import release_format as _release_format
 from scripts.release_notes.models import CategorizedBullet
 
 logger = logging.getLogger(__name__)
 
-# A GitHub login is [A-Za-z0-9-]; the attribution regex check_release_notes uses
-# is ``by @([\w-]+)``. Anything outside that set (a space, '.', '@', or parens
+# A GitHub login is [A-Za-z0-9-]; the attribution the label gate expects is
+# ``by @([\w-]+)``. Anything outside that set (a space, '.', '@', or parens
 # from a malformed author) would truncate or break the captured handle.
 _HANDLE_SAFE_RE = re.compile(r"[^\w-]")
 
@@ -34,31 +32,30 @@ _HANDLE_SAFE_RE = re.compile(r"[^\w-]")
 def _one_line(text: str) -> str:
     """Collapse *text* to a single physical line.
 
-    A bullet and a category header are parsed line-by-line by the format module,
-    so an embedded line break would split the bullet, terminate the whole block
-    (a line starting ``"## "``), or inject a spurious category (``"### ..."``).
-    We split on exactly the boundaries ``str.splitlines()`` recognizes (the same
-    call ``parse_unreleased`` uses), so our notion of "one line" cannot disagree
-    with the parser's, then join with single spaces.
+    A bullet and a category header are line-oriented, so an embedded line break
+    would split the bullet or inject a spurious ``"### ..."``/``"## ..."`` line
+    into the rendered section. We split on exactly the boundaries
+    ``str.splitlines()`` recognizes, then join with single spaces.
     """
     return " ".join(text.splitlines()).strip()
 
 
-def load_format_module(valkey_clone_dir: str) -> Any:
-    """Import the valkey ``release_notes`` format module from *valkey_clone_dir*.
+def load_format_module(valkey_clone_dir: str | None = None) -> Any:
+    """Return the release-notes format module.
 
-    Thin wrapper over :func:`clone_tools.load_releasetools_module` kept for the
-    existing call sites; the format stays authoritative in the valkey repo.
+    The format lives in :mod:`scripts.release_notes.release_format`, so no clone
+    is consulted. The optional *valkey_clone_dir* argument is retained for the
+    existing call sites and is ignored.
     """
-    return load_releasetools_module(valkey_clone_dir, "release_notes")
+    return _release_format
 
 
 def format_bullet(bullet: CategorizedBullet) -> str:
     """Render one canonical bullet line: ``* <text> by @<handle> (#<N>)``.
 
     The trailing ``(#N)`` and the ``by @handle`` are appended in this fixed
-    order so they satisfy ``check_release_notes``'s ``_TRAILING_PR_REF_RE`` and
-    ``_AUTHOR_RE``. When the author is unknown (a ghost account), the ``by @``
+    order so they satisfy the label gate's trailing-PR-ref and author checks.
+    When the author is unknown (a ghost account), the ``by @``
     segment is omitted; the PR-number requirement still holds, and a missing
     attribution is a warning, not a hard failure, in the CI check.
 
@@ -81,96 +78,53 @@ def format_bullet(bullet: CategorizedBullet) -> str:
 
 def group_bullets(
     bullets: Sequence[CategorizedBullet], fmt: Any
-) -> "dict[str, list[str]]":
+) -> dict[str, list[str]]:
     """Group bullets into ``{category: [rendered line, ...]}``.
 
-    Canonical categories (``fmt.CATEGORIES``) come first, in their canonical
-    order; any non-canonical category the model emitted follows, in first-seen
-    order, so a miscategorized note is never dropped (mirrors the format
-    module's own behavior). Bullets the model placed under the reserved
-    ``Security Fixes`` / ``Contributors`` sections are refused and logged; those
-    are generated at release-cut time.
+    Only canonical categories (``fmt.CATEGORIES``) are ever emitted as headers, in
+    their canonical order. The model never creates a new ``### <name>`` header: a
+    category it returns that is not canonical is a *suggestion*, so the bullet is
+    coerced into the catch-all (``fmt.CATCH_ALL_CATEGORY``, "Other Changes") rather
+    than rendered under an invented header. The suggestion is surfaced separately
+    for review (:mod:`generate` flags the bullet uncertain with the suggested name;
+    the cut lists it in the PR body). This also closes an injection vector: an
+    attacker-controlled category string can no longer emit a raw ``### ``/``## ``
+    header line into the changelog.
+
+    Bullets the model placed under the reserved ``Security Fixes`` /
+    ``Contributors`` sections are refused and logged; those are generated at
+    release-cut time from a factual source.
     """
     reserved = set(getattr(fmt, "RESERVED_SECTIONS", ("Security Fixes", "Contributors")))
     canonical = set(fmt.CATEGORIES)
-    grouped: "dict[str, list[str]]" = {}
+    # The catch-all must be a canonical category; fall back to the last canonical
+    # name if the format module does not name one, so an off-list bullet always
+    # has a valid home rather than resurrecting an invented header.
+    catch_all = getattr(fmt, "CATCH_ALL_CATEGORY", "Other Changes")
+    if catch_all not in canonical:
+        catch_all = fmt.CATEGORIES[-1]
+    grouped: dict[str, list[str]] = {}
     for bullet in bullets:
         category = _one_line(bullet.category)
-        if category not in canonical:
-            # A non-canonical category is rendered as a verbatim "### <name>"
-            # header, so sanitize it the same way as a bullet: strip leading '#'
-            # (which would otherwise let "## x" terminate the block) and skip it
-            # entirely if nothing usable remains.
-            category = category.lstrip("#").strip()
-            if not category:
-                logger.warning("Dropping PR #%s with empty category", bullet.pr_number)
-                continue
         if category in reserved:
             logger.warning(
                 "Refusing PR #%s under reserved section %r (auto-generated at release)",
                 bullet.pr_number, category,
             )
             continue
+        if category not in canonical:
+            # Off-list category: the model's choice is only a suggestion, never a
+            # new header. Land the note in the catch-all so it still ships.
+            logger.warning(
+                "PR #%s assigned non-canonical category %r; placing under %r",
+                bullet.pr_number, category, catch_all,
+            )
+            category = catch_all
         grouped.setdefault(category, []).append(format_bullet(bullet))
 
-    # Re-key into canonical order first, then trailing non-canonical categories.
-    ordered: "dict[str, list[str]]" = {}
+    # Emit in canonical order; every key is canonical by construction.
+    ordered: dict[str, list[str]] = {}
     for name in fmt.CATEGORIES:
         if grouped.get(name):
             ordered[name] = grouped[name]
-    for name, lines in grouped.items():
-        if name not in ordered:
-            ordered[name] = lines
     return ordered
-
-
-def render_unreleased_block(grouped: "dict[str, list[str]]", fmt: Any) -> str:
-    """Build the ``## Unreleased`` block: header + guidance comment + categories.
-
-    Starts from the canonical empty block (``fmt.render_empty_unreleased()``) so
-    the header and HTML comment are byte-exact, then re-emits each category
-    header followed by its bullets. Canonical categories are always emitted (even
-    when empty) to match the empty-block shape; non-canonical categories with
-    bullets are appended after.
-    """
-    canonical = list(fmt.CATEGORIES)
-    # Reuse the canonical empty block to capture everything up to the first
-    # category header (the "## Unreleased" line, blank line, and HTML comment),
-    # so that preamble stays byte-identical to what valkey emits.
-    empty = fmt.render_empty_unreleased()
-    first_header = f"### {canonical[0]}"
-    preamble = empty.split(first_header, 1)[0].rstrip("\n")
-
-    parts: list[str] = [preamble, ""]
-    for name in canonical:
-        parts.append(f"### {name}")
-        parts.extend(grouped.get(name, []))
-        parts.append("")
-    for name, lines in grouped.items():
-        if name not in canonical:
-            parts.append(f"### {name}")
-            parts.extend(lines)
-            parts.append("")
-    return "\n".join(parts).rstrip() + "\n"
-
-
-def apply_to_file(existing_text: str, grouped: "dict[str, list[str]]", fmt: Any) -> str:
-    """Return *existing_text* with its ``## Unreleased`` block replaced.
-
-    Everything before the block is preserved verbatim. We locate the block the
-    way the format module's ``reset_unreleased`` does: by the header preceded by
-    a newline (``"\\n## Unreleased"``), not a bare ``find``. The intro prose
-    mentions ``"## Unreleased"`` in quotes, so a bare search would match that
-    mention and splice the block into the middle of the paragraph.
-    """
-    header = fmt.UNRELEASED_HEADER
-    filled_block = render_unreleased_block(grouped, fmt)
-    anchor = "\n" + header
-    idx = existing_text.find(anchor)
-    if idx == -1:
-        if existing_text.startswith(header):
-            return filled_block
-        # No block at all; append a fresh, filled one.
-        return existing_text.rstrip() + "\n\n" + filled_block
-    # Keep everything up to and including the newline before the header.
-    return existing_text[: idx + 1] + filled_block

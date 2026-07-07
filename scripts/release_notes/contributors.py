@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Generate the deduplicated, alpha-sorted contributor list for a release.
 
 Collects the GitHub authors of every commit in a ``base..head`` range and
@@ -8,17 +7,15 @@ login is then resolved to a display name via the users API. When the API is
 unavailable (no token / offline), it falls back to ``git shortlog`` over the
 same range for names only.
 
-Stdlib only (urllib) so it runs in the same minimal environment as the rest of
-utils/.
+Stdlib only (urllib) so it runs in a minimal environment with no third-party
+dependencies. Upstream ``valkey-io/valkey`` ships no equivalent tool;
+:mod:`release_cut` calls :func:`list_contributors` directly.
 """
 
 from __future__ import annotations
 
-import argparse
 import json
-import os
 import subprocess
-import sys
 import urllib.error
 import urllib.request
 from typing import List, Optional
@@ -171,7 +168,7 @@ def list_contributors(
             name = _display_name(login, token) or login
             entries.append("{} @{}".format(name, login))
     else:
-        # Fallback path — names only, deduplicated preserving first sight.
+        # Fallback path: names only, deduplicated preserving first sight.
         seen = set()
         for name in _git_shortlog_names(base_ref, head_ref, repo_dir):
             if name not in seen:
@@ -180,33 +177,3 @@ def list_contributors(
 
     entries.sort(key=_sort_key)
     return entries
-
-
-def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(
-        description="Generate the deduplicated contributor list for a release range."
-    )
-    parser.add_argument("--repo", required=True, help="owner/name, e.g. valkey-io/valkey")
-    parser.add_argument("--base-ref", required=True, help="Range start (e.g. last tag)")
-    parser.add_argument("--head-ref", default="HEAD", help="Range end (default: HEAD)")
-    parser.add_argument(
-        "--repo-dir", default=".", help="Local clone dir for the git fallback (default: .)"
-    )
-    parser.add_argument(
-        "--token",
-        default=os.environ.get("GITHUB_TOKEN"),
-        help="GitHub token (defaults to $GITHUB_TOKEN)",
-    )
-    args = parser.parse_args(argv)
-
-    entries = list_contributors(
-        args.repo, args.base_ref, args.head_ref, args.token, repo_dir=args.repo_dir
-    )
-    print("### Contributors")
-    for entry in entries:
-        print("* {}".format(entry))
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())

@@ -11,6 +11,7 @@ the triage list embedded in the PR body. The branch push discipline lives in
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from scripts.backport.pr_creator import build_pull_create_head_ref, build_pull_search_head_ref
@@ -57,6 +58,16 @@ def open_or_update_pr(
     return pr.html_url
 
 
+_LINEBREAK_RE = re.compile(r"[\r\n]+")
+
+
 def escape_cell(text: str) -> str:
-    """Escape a value for a Markdown table cell (pipes and newlines)."""
-    return text.replace("|", "\\|").replace("\n", " ").strip()
+    """Escape a value for a Markdown table cell (pipes and line breaks).
+
+    Any run of CR/LF (a bare ``\\n``, a Windows ``\\r\\n``, a lone ``\\r``, or
+    several in a row) collapses to a single space: a raw ``\\r`` left in the
+    string would break the table row, and matching only ``\\n`` leaves the CR of
+    a CRLF behind. A contributor PR title is arbitrary text, so it can carry any
+    of these.
+    """
+    return _LINEBREAK_RE.sub(" ", text.replace("|", "\\|")).strip()

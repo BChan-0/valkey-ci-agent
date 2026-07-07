@@ -24,9 +24,9 @@ from enum import Enum
 class PRDisposition(str, Enum):
     """What the labelling says to do with a discovered PR."""
 
-    INCLUDE = "include"   # carries only 'release-notes'
-    EXCLUDE = "exclude"   # carries only 'no-release-notes'
-    TRIAGE = "triage"     # neither label, or both -> a human must decide
+    INCLUDE = "include"   # has 'release-notes', not 'no-release-notes' (other labels ignored)
+    EXCLUDE = "exclude"   # has 'no-release-notes', not 'release-notes' (other labels ignored)
+    TRIAGE = "triage"     # neither gate label, or both -> a human must decide
 
 
 @dataclass(frozen=True)
@@ -55,12 +55,33 @@ class CategorizedBullet:
     ``text`` is the human-readable description ONLY: it must not contain the
     ``(#N)`` reference or the ``by @handle`` attribution, which render appends
     so they land in the exact positions the release tooling's regexes expect.
+
+    ``uncertain`` is set when the model was not confident about this note (the
+    category, or whether the change is user-facing at all). The bullet still
+    renders normally; ``uncertain_reason`` is a short human-readable explanation
+    surfaced in the PR body so a maintainer can confirm or fix it before merging.
     """
 
     pr_number: int
     author: str
     category: str
     text: str
+    uncertain: bool = False
+    uncertain_reason: str = ""
+
+
+@dataclass(frozen=True)
+class UncertainNote:
+    """A note the model flagged as low-confidence, for the PR-body warning.
+
+    Carried separately from the rendered bullet so the warning can name the PR,
+    the category the model landed on, and why it was unsure, without re-parsing
+    the rendered line.
+    """
+
+    pr_number: int
+    category: str
+    reason: str
 
 
 @dataclass(frozen=True)

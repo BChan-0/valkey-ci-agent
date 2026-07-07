@@ -2,14 +2,14 @@
 
 Driven by ``workflow_dispatch``: a maintainer supplies the source branch
 (``--head-ref``) and the target ``--version``/``--stage``/``--urgency``, and the
-agent cuts the release in one shot. There is no accumulated ``## Unreleased``
-block; the notes for a release are generated all at once from the labelled PRs
-in range, promoted into a dated section, and the version is bumped.
+agent cuts the release in one shot. Nothing accumulates notes on a branch; the
+notes for a release are generated all at once from the labelled PRs in range,
+rendered into a dated section, and the version is bumped.
 
 Pipeline: clone valkey (full depth + tags), :mod:`discover` the range (the
 ``release-notes``-labelled PRs from HEAD back to the most recent reachable RC
 tag), :mod:`generate` bullets via Claude/Bedrock, then :mod:`release_cut`
-promotes them onto the release line (dated section + ``src/version.h`` bump +
+renders them onto the release line (dated section + ``src/version.h`` bump +
 running contributor list, draining prior RCs) and opens the PR.
 
 Returns 0 on success or a benign no-op (empty range), 1 on failure, and 2 on a
@@ -42,18 +42,19 @@ from scripts.release_notes import release_cut as cut_mod
 
 logger = logging.getLogger(__name__)
 
-# Upgrade-urgency values valkey's promote() accepts, mirrored here so a bogus
-# value fails at argparse (exit 2) rather than deep in promote() after a wasted
+# Upgrade-urgency values render_release_notes() accepts, mirrored here so a bogus
+# value fails at argparse (exit 2) rather than deep in rendering after a wasted
 # clone + AI run. Kept in sync with the workflow's `urgency` choice list and the
 # valkey format module's VALID_URGENCIES.
 _VALID_URGENCIES = ("LOW", "MODERATE", "HIGH", "CRITICAL", "SECURITY")
 
 # Config via env so the workflow can pass GitHub Actions context directly; the
-# RELEASE_NOTES_ prefix mirrors the CI_FIX_/FUZZER_ convention.
-_REPO = os.environ.get("RELEASE_NOTES_REPO", "valkey-io/valkey")
-_HEAD_REF = os.environ.get("RELEASE_NOTES_HEAD_REF", "")
-_TAG_GLOB = os.environ.get("RELEASE_NOTES_TAG_GLOB", "")
-_BASE_REF = os.environ.get("RELEASE_NOTES_BASE_REF", "")
+# RELEASE_NOTES_ prefix mirrors the CI_FIX_/FUZZER_ convention. These are read at
+# argparse-build time inside main() (not captured as import-time module
+# constants), so a test can monkeypatch the environment before calling main() --
+# an import-time read would freeze the value at first import, out of any test's
+# reach and dependent on the ambient env when the module first loaded.
+_DEFAULT_REPO = "valkey-io/valkey"
 
 
 def _token() -> str:
@@ -63,6 +64,16 @@ def _token() -> str:
         or os.environ.get("TARGET_TOKEN", "")
         or os.environ.get("GITHUB_TOKEN", "")
     )
+
+
+def _env_flag(name: str) -> bool:
+    """True if env var *name* holds a truthy string ('true'/'1'/'yes').
+
+    Boolean workflow inputs arrive as the literal strings ``'true'``/``'false'``
+    (see the ``RELEASE_NOTES_*`` exports), so a bare ``bool(os.environ.get(...))``
+    would read ``'false'`` as truthy. Parse the string explicitly.
+    """
+    return os.environ.get(name, "").strip().lower() in {"true", "1", "yes"}
 
 
 def _default_tag_glob(version: str, stage: str) -> str | None:
@@ -95,27 +106,41 @@ def _default_tag_glob(version: str, stage: str) -> str | None:
 def _default_base_ref_for_rc1(version: str) -> str | None:
     """Best-effort previous-release baseline for an rc1 cut, e.g. 9.1.0 -> 9.0.0.
 
-    rc1 of ``M.m.p`` covers everything since the previous minor's GA. We can only
-    guess that tag's name (``M.(m-1).0``); whether it is actually reachable as a
-    range base is checked after the clone (see :func:`_validate_base_ref`), where
-    a missing ref aborts with a clear error. Returns None when the version is not
-    ``M.m.p`` or there is no previous minor (``M.0.*``), in which case the user
-    must supply ``--base-ref`` explicitly.
+    The baseline depends on which component is being incremented, so the derived
+    previous release differs by shape:
+
+    * patch (``p > 0``, e.g. ``9.2.3``) -> the prior patch GA ``M.m.(p-1)``
+      (``9.2.2``). A patch cut covers only the changes since the previous patch;
+      deriving the previous *minor* (``9.1.0``) would re-credit the whole
+      ``9.2.0``/``.1``/``.2`` patch history.
+    * new minor (``p == 0``, ``m > 0``, e.g. ``9.2.0``) -> the previous minor's GA
+      ``M.(m-1).0`` (``9.1.0``).
+    * ``M.0.0`` -> None: the first release of a major has no previous release on
+      this major to derive, and the prior major's final release is not derivable
+      from the version alone; the user must supply ``--base-ref`` explicitly.
+
+    We can only guess the tag's name; whether it is actually reachable as a range
+    base is checked after the clone (see :func:`_validate_base_ref`), where a
+    missing ref aborts with a clear error. Returns None when the version is not
+    ``M.m.p`` or is ``M.0.0``.
     """
     m = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", version.strip())
     if not m:
         return None
-    major, minor, _ = (int(g) for g in m.groups())
-    if minor == 0:
-        return None  # first minor of a major: no obvious previous-minor GA
-    return f"{major}.{minor - 1}.0"
+    major, minor, patch = (int(g) for g in m.groups())
+    if patch > 0:
+        return f"{major}.{minor}.{patch - 1}"  # prior patch on the same line
+    if minor > 0:
+        return f"{major}.{minor - 1}.0"  # previous minor's GA
+    return None  # M.0.0: first release of a major, no derivable previous release
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--token", default=_token(), help="GitHub token (App installation or PAT)")
-    parser.add_argument("--repo", default=_REPO, help="Target repo, owner/name")
-    parser.add_argument("--head-ref", default=_HEAD_REF,
+    parser.add_argument("--repo", default=os.environ.get("RELEASE_NOTES_REPO", _DEFAULT_REPO),
+                        help="Target repo, owner/name")
+    parser.add_argument("--head-ref", default=os.environ.get("RELEASE_NOTES_HEAD_REF", ""),
                         help="Source branch whose merged PRs are cut, e.g. unstable "
                              "(a short branch/tag name, passed to `git clone --branch`)")
     parser.add_argument("--version", default=os.environ.get("RELEASE_NOTES_VERSION", ""),
@@ -126,15 +151,19 @@ def main(argv: list[str] | None = None) -> int:
                         help="Upgrade urgency: LOW, MODERATE, HIGH, CRITICAL, SECURITY")
     parser.add_argument("--date", default=os.environ.get("RELEASE_NOTES_DATE", ""),
                         help="Release date YYYY-MM-DD (default: today)")
-    parser.add_argument("--tag-glob", default=_TAG_GLOB,
+    parser.add_argument("--tag-glob", default=os.environ.get("RELEASE_NOTES_TAG_GLOB", ""),
                         help="Optional --match glob restricting the baseline tag, e.g. '9.1.0-rc*'")
-    parser.add_argument("--base-ref", default=_BASE_REF,
+    parser.add_argument("--base-ref", default=os.environ.get("RELEASE_NOTES_BASE_REF", ""),
                         help="Explicit baseline ref (branch/tag/SHA) overriding tag resolution. "
                              "Use when the line has no reachable tag, e.g. a fork.")
     parser.add_argument("--contrib-base-ref", default=os.environ.get("RELEASE_NOTES_CONTRIB_BASE", ""),
                         help="Contributor range start (default: last tag, else root commit)")
     parser.add_argument("--security-fix", action="append", default=None, dest="security_fixes",
                         help="A Security Fixes bullet (repeatable)")
+    parser.add_argument("--security-from-advisories", action="store_true",
+                        default=_env_flag("RELEASE_NOTES_SECURITY_FROM_ADVISORIES"),
+                        help="Auto-render PUBLISHED GitHub security advisories fixed by this "
+                             "version into Security Fixes (merged with any --security-fix bullets)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Compute and print the cut without pushing or opening a PR")
     args = parser.parse_args(argv)
@@ -217,6 +246,7 @@ def main(argv: list[str] | None = None) -> int:
             base_ref=base_ref,
             contrib_base_ref=args.contrib_base_ref or None,
             security_fixes=args.security_fixes,
+            security_from_advisories=args.security_from_advisories,
             dry_run=args.dry_run,
             baseline_unanchored=baseline_unanchored,
         )
@@ -259,16 +289,30 @@ def _validate_base_ref(clone_dir: str, base_ref: str) -> None:
     )
 
 
+_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
 def _is_iso_date(value: str) -> bool:
     """True if *value* is a valid ISO ``YYYY-MM-DD`` date.
 
-    A malformed ``--date`` otherwise passes verbatim through valkey's
-    ``_format_date`` into the dated heading (it returns unparseable input
-    unchanged), so a typo like ``06/30/2026`` ships as the release date. Validate
-    at the boundary; an empty value (defaulted to today) is handled before this.
+    A malformed ``--date`` otherwise passes through ``release_format._format_date``
+    into the dated heading (it returns unparseable input unchanged), so a typo
+    like ``06/30/2026`` ships as the release date. Validate at the boundary; an
+    empty value (defaulted to today) is handled before this.
+
+    The format is checked explicitly rather than relying on
+    ``date.fromisoformat``: since Python 3.11 (this runtime) that function is
+    lenient and accepts ``20260630`` and ISO week/ordinal forms like
+    ``2026-W01-1`` (which silently resolves to a *different* calendar date), any
+    of which would then ship into the heading. Requiring the ``YYYY-MM-DD`` shape
+    first and parsing with ``strptime`` accepts only the documented form and
+    still rejects impossible dates like ``2026-13-45``.
     """
+    value = value.strip()
+    if not _ISO_DATE_RE.match(value):
+        return False
     try:
-        datetime.date.fromisoformat(value.strip())
+        datetime.datetime.strptime(value, "%Y-%m-%d")
     except ValueError:
         return False
     return True
@@ -287,6 +331,7 @@ def _run_cut(
     base_ref: str | None,
     contrib_base_ref: str | None,
     security_fixes: list[str] | None,
+    security_from_advisories: bool,
     dry_run: bool,
     baseline_unanchored: bool = False,
 ) -> int:
@@ -315,7 +360,8 @@ def _run_cut(
                 source_ref=source_ref,
                 version=version, stage=stage, urgency=urgency, date=resolved_date,
                 tag_glob=tag_glob, base_ref=base_ref, contrib_base_ref=contrib_base_ref,
-                security_fixes=security_fixes, token=token, git_env=git_env, dry_run=dry_run,
+                security_fixes=security_fixes, security_from_advisories=security_from_advisories,
+                token=token, git_env=git_env, dry_run=dry_run,
                 baseline_unanchored=baseline_unanchored,
             )
         finally:

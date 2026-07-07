@@ -1,71 +1,67 @@
-#!/usr/bin/env python3
-"""Parse the 00-RELEASENOTES "## Unreleased" block.
+"""Render the 00-RELEASENOTES dated release sections.
 
-The unstable branch keeps a "## Unreleased" block in 00-RELEASENOTES that
-user-facing PRs append to as they merge. This module extracts and measures
-that block; it is consumed by the release-notes CI check
-(check_release_notes.py) to require a net-new entry on labelled PRs.
+Owns valkey's release-notes format. A cut hands this module the categorized
+bullets for the range (a ``{category: [bullet, ...]}`` map produced by
+:mod:`render`) and it renders a dated release section, prepends the release
+line's prior dated sections, and appends the cumulative contributor footer.
+Upstream ``valkey-io/valkey`` ships no release tooling of its own, so this is
+the single authoritative place the dated-section format lives.
 
-The module is pure (no I/O, no network) so it is cheap to unit test. Rendering
-and promotion of the block into dated release sections live elsewhere and are
-added alongside the release-cutting tooling.
+The bullets are always carried as an in-memory map and rendered straight into a
+dated section: nothing is ever written to a branch as an "unreleased" block.
+The render/measure helpers are pure (no I/O, no network) so they are cheap to
+unit test.
 """
 
 from __future__ import annotations
 
 import datetime
 import re
-from collections import OrderedDict
 from typing import Dict, List, Optional, Sequence
 
-# Canonical category order. Contributors append under these headers in the
-# "## Unreleased" block; dated sections render them in this same order.
+# Canonical category order. The generator assigns each bullet to one of these;
+# dated sections render them in this order. The set is intentionally exhaustive:
+# every release-notes-labelled PR should have a natural home, and "Other Changes"
+# is the catch-all so a change that fits none of the specific buckets still lands
+# somewhere rather than forcing the model to invent a header. The specific
+# categories beyond the original eight (Cluster and Replication, Configuration,
+# CLI and Tools) cover surfaces valkey release notes have historically used that
+# the eight did not (cluster/replication changes, config option changes, and the
+# valkey-cli / valkey-benchmark family), so the model rarely needs the catch-all.
 CATEGORIES: List[str] = [
     "Behavior Changes",
     "New Features and Enhanced Behavior",
     "Performance and Efficiency Improvements",
     "Bug Fixes",
     "Command and API Updates",
+    "Cluster and Replication",
+    "Configuration",
     "Module API Changes",
     "Observability and Logging",
-    "Build and Tooling",
+    "CLI and Tools",        # user-facing CLI programs: valkey-cli, valkey-benchmark, etc.
+    "Build and Tooling",    # build system, packaging, CI, developer tooling
+    "Other Changes",        # catch-all: a user-facing change fitting none of the above
 ]
 
-# Security fixes are never seeded in the unstable block: they are supplied at
-# release-cut time from the embargo CVE list (prepare_release --security-fix) and
-# render first, ahead of the canonical categories.
+# The catch-all bucket. A category the generator returns that is not in
+# CATEGORIES is treated as a suggestion, not a new header: the bullet lands here
+# (see render.group_bullets) and the suggestion is surfaced in the PR body. Must
+# be one of CATEGORIES.
+CATCH_ALL_CATEGORY = "Other Changes"
+
+# Security fixes are supplied at release-cut time from the embargo CVE list
+# (--security-fix) and render first, ahead of the canonical categories.
 SECURITY_CATEGORY = "Security Fixes"
 
 # The contributor list is generated from the merged-PR authors of the release
-# range (gen_contributors.py), deduplicated and alpha-sorted, not hand-edited.
+# range (contributors.py), deduplicated and alpha-sorted, not hand-edited.
 CONTRIBUTORS_SECTION = "Contributors"
 
-# Sections that are populated automatically at release time and therefore must
-# never be hand-added to the "## Unreleased" block. If one appears there it is
-# *ignored* at render time (the generated section is the source of truth) rather
-# than merged, which would otherwise emit a duplicate header. Callers (the CI
-# check and the release cut) surface a non-blocking warning so a maintainer
-# removes the stray section.
+# Sections that are populated automatically at release time from a factual
+# source (the CVE list / the merged-PR authors), so a bullet the generator
+# assigns to one of these is refused rather than rendered (:mod:`render`'s
+# ``group_bullets`` drops it and warns), keeping them the sole source of truth.
 RESERVED_SECTIONS = (SECURITY_CATEGORY, CONTRIBUTORS_SECTION)
-
-UNRELEASED_HEADER = "## Unreleased"
-
-UNRELEASED_COMMENT = """<!--
-Contributors: if your change is user-facing, add the `release-notes` label to your
-PR and append a bullet under the matching category below, in the form:
-
-    * <human-readable description> by @<your-github-handle> (#<PR number>)
-
-If your change is not user-facing, add the `no-release-notes` label instead. A CI
-check requires exactly one of these two labels, and a note here when `release-notes`
-is set. The `.github/workflows/prepare-release.yml` workflow promotes this block into
-a dated release section when a release is cut, so keep entries user-readable.
-
-Do not add `### Security Fixes` or `### Contributors` sections here: they are
-generated automatically when a release is cut (security fixes from the embargo
-CVE list, contributors from the merged PRs), so anything you add under them is
-dropped. The CI check warns if you do.
--->"""
 
 # Upgrade urgency legend rendered at the top of a release-branch notes file.
 URGENCY_LEGEND = """Upgrade urgency levels:
@@ -81,8 +77,6 @@ URGENCY_LEGEND = """Upgrade urgency levels:
 VALID_URGENCIES = ("LOW", "MODERATE", "HIGH", "CRITICAL", "SECURITY")
 
 _BULLET_RE = re.compile(r"^\s*[*-]\s+\S")
-_CATEGORY_RE = re.compile(r"^###\s+(.*\S)\s*$")
-_H2_RE = re.compile(r"^##\s+\S")
 _DATED_SECTION_RE = re.compile(r"^Valkey\s+\d+\.\d+\.\d+", re.MULTILINE)
 _VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 # rcN, N starting at 1 with no leading zeros: "rc1", "rc12" but not "rc0"/"rc01".
@@ -121,72 +115,16 @@ def ordinal(n: int) -> str:
     return "{}th".format(n)
 
 
-def parse_unreleased(text: str) -> "OrderedDict[str, List[str]]":
-    """Extract the "## Unreleased" block as an ordered ``category -> bullets`` map.
-
-    Only the region between the ``## Unreleased`` header and the next level-2
-    header (or end of file) is considered. HTML comments and blank lines are
-    skipped. Categories are returned in the order they appear; categories that
-    appear in :data:`CATEGORIES` but are absent from the text are not added.
-    """
-    result: "OrderedDict[str, List[str]]" = OrderedDict()
-    lines = text.splitlines()
-
-    # Locate the "## Unreleased" header.
-    start = None
-    for i, line in enumerate(lines):
-        if line.strip() == UNRELEASED_HEADER:
-            start = i + 1
-            break
-    if start is None:
-        return result
-
-    current: Optional[str] = None
-    in_comment = False
-    for line in lines[start:]:
-        stripped = line.strip()
-        if _H2_RE.match(line) and stripped != UNRELEASED_HEADER:
-            break  # next top-level section ends the Unreleased block
-        if in_comment:
-            if "-->" in stripped:
-                in_comment = False
-            continue
-        if stripped.startswith("<!--"):
-            if "-->" not in stripped:
-                in_comment = True
-            continue
-        cat_match = _CATEGORY_RE.match(line)
-        if cat_match:
-            current = cat_match.group(1)
-            result.setdefault(current, [])
-            continue
-        if current is not None and _BULLET_RE.match(line):
-            result[current].append(stripped)
-    return result
-
-
-def is_unreleased_empty(notes: "Dict[str, List[str]]") -> bool:
-    """True when no category in *notes* carries any bullet."""
-    return not any(bullets for bullets in notes.values())
-
-
-def count_bullets(notes: "Dict[str, List[str]]") -> int:
-    """Total number of bullets across all categories."""
-    return sum(len(bullets) for bullets in notes.values())
-
-
 def unrecognized_categories(notes: "Dict[str, List[str]]") -> List[str]:
     """Return the names of bullet-bearing categories that are not canonical.
 
-    A contributor may typo a header (``### Bug Fix`` for ``### Bug Fixes``) or
-    invent one (``### Networking``). Such bullets are still rendered verbatim at
-    promotion time (nothing is dropped), but they fall outside :data:`CATEGORIES`,
-    so callers warn on them and ask a maintainer to recategorize. Reserved
-    sections (:data:`RESERVED_SECTIONS`) are deliberately excluded -- they are not
-    "miscategorized notes" to be promoted verbatim but auto-generated sections
-    that should be removed from the block; :func:`reserved_sections_present`
-    reports them separately. Categories with no bullets are ignored. Order
-    follows *notes*.
+    The generator may assign a bullet to a typo'd (``Bug Fix`` for ``Bug Fixes``)
+    or invented (``Networking``) category. Such bullets are still rendered
+    verbatim in the dated section (nothing is dropped), but they fall outside
+    :data:`CATEGORIES`, so callers warn on them and ask a maintainer to
+    recategorize. Reserved sections (:data:`RESERVED_SECTIONS`) are excluded --
+    ``group_bullets`` already refuses those. Categories with no bullets are
+    ignored. Order follows *notes*.
     """
     known = set(CATEGORIES) | set(RESERVED_SECTIONS)
     return [
@@ -194,18 +132,6 @@ def unrecognized_categories(notes: "Dict[str, List[str]]") -> List[str]:
         for category, bullets in notes.items()
         if bullets and category not in known
     ]
-
-
-def reserved_sections_present(notes: "Dict[str, List[str]]") -> List[str]:
-    """Return the names of :data:`RESERVED_SECTIONS` that carry bullets in *notes*.
-
-    ``Security Fixes`` and ``Contributors`` are populated automatically at release
-    time, so a contributor should never hand-add them to ``## Unreleased``. When
-    one does, the bullets are ignored at render time (not promoted), so this lets
-    callers warn that the stray section will be dropped and should be removed.
-    Order follows :data:`RESERVED_SECTIONS`.
-    """
-    return [name for name in RESERVED_SECTIONS if notes.get(name)]
 
 
 def _format_date(date: str) -> str:
@@ -277,7 +203,7 @@ def render_version_section(
     rendered first. Any non-canonical category (a typo'd or invented header) is
     rendered verbatim *after* the canonical ones so its bullets are never dropped;
     callers warn on them via :func:`unrecognized_categories`. The reserved
-    sections (:data:`RESERVED_SECTIONS`) are never read from *notes* -- a
+    sections (:data:`RESERVED_SECTIONS`) are never read from *notes*: a
     ``Security Fixes`` or ``Contributors`` section a contributor hand-added to the
     block is ignored here, since *security_fixes* is the source of truth for the
     former and the latter is rendered once for the whole file (not per section).
@@ -285,7 +211,8 @@ def render_version_section(
 
     Contributors are deliberately *not* rendered here: a single cumulative
     ``### Contributors`` footer for the whole file is rendered by
-    :func:`render_contributors_footer` and assembled in :func:`promote`.
+    :func:`render_contributors_footer` and assembled in
+    :func:`render_release_notes`.
     """
     stage = _normalize_stage(stage)
     urgency = urgency.strip().upper()
@@ -308,8 +235,8 @@ def render_version_section(
         out.append("")
 
     # Security Fixes come only from *security_fixes* (the embargo CVE list), never
-    # from *notes*: a hand-added "### Security Fixes" in the block is ignored so it
-    # cannot duplicate this header (reserved_sections_present warns about it).
+    # from *notes*: group_bullets refuses a bullet the model assigned to a reserved
+    # section, so this header cannot be duplicated.
     if security_fixes:
         emit_category(SECURITY_CATEGORY, list(security_fixes))
     for category in CATEGORIES:
@@ -323,30 +250,6 @@ def render_version_section(
         emit_category(category, notes[category])
 
     return "\n".join(out).rstrip() + "\n"
-
-
-def render_empty_unreleased() -> str:
-    """Render the canonical empty ``## Unreleased`` block."""
-    parts = [UNRELEASED_HEADER, "", UNRELEASED_COMMENT, ""]
-    for category in CATEGORIES:
-        parts.append("### {}".format(category))
-        parts.append("")
-    return "\n".join(parts).rstrip() + "\n"
-
-
-def reset_unreleased(text: str) -> str:
-    """Return *text* with the ``## Unreleased`` block reset to empty categories.
-
-    Everything before ``## Unreleased`` is preserved verbatim; the block itself
-    is replaced with :func:`render_empty_unreleased`.
-    """
-    idx = text.find("\n" + UNRELEASED_HEADER)
-    if idx == -1:
-        if text.startswith(UNRELEASED_HEADER):
-            return render_empty_unreleased()
-        # No Unreleased block at all — append a fresh one.
-        return text.rstrip() + "\n\n" + render_empty_unreleased()
-    return text[: idx + 1] + render_empty_unreleased()
 
 
 _CONTRIBUTORS_HEADER_RE = re.compile(r"^###\s+Contributors\s*$", re.MULTILINE)
@@ -368,7 +271,7 @@ def _split_contributors_footer(text: str) -> "tuple[str, List[str]]":
     display names parsed from that section (bullet markers removed). When no such
     header exists, returns ``(text, [])``. Using the *last* header means a legacy
     per-section ``### Contributors`` is folded into the cumulative footer on the
-    next promote(), migrating old files to the single-footer layout.
+    next cut, migrating old files to the single-footer layout.
     """
     matches = list(_CONTRIBUTORS_HEADER_RE.finditer(text))
     if not matches:
@@ -377,10 +280,7 @@ def _split_contributors_footer(text: str) -> "tuple[str, List[str]]":
     body = text[: last.start()].rstrip()
     names: List[str] = []
     for line in text[last.end():].splitlines():
-        # The footer's bullets run until the next header. Stopping here matters in
-        # legacy mode, where the footer precedes the ## Unreleased block: without
-        # the break we would scoop up the example bullet inside that block's
-        # guidance comment as if it were a contributor.
+        # The footer's bullets run until the next header.
         if line.lstrip().startswith("#"):
             break
         if _BULLET_RE.match(line):
@@ -414,68 +314,48 @@ def render_contributors_footer(contributors: Sequence[str]) -> str:
     return "\n".join(out)
 
 
-def _existing_dated_sections(before_unreleased: str) -> str:
-    """Return the dated-section region of the text preceding ``## Unreleased``."""
-    match = _DATED_SECTION_RE.search(before_unreleased)
+def _existing_dated_sections(text: str) -> str:
+    """Return the dated-section region of a prior changelog (from the first
+    ``Valkey M.m.p`` heading onward)."""
+    match = _DATED_SECTION_RE.search(text)
     if not match:
         return ""
-    return before_unreleased[match.start():].strip()
+    return text[match.start():].strip()
 
 
-def promote(
-    text: str,
+def render_release_notes(
+    notes: "Dict[str, List[str]]",
     *,
     version: str,
     stage: str,
     urgency: str,
     date: str,
+    prior_text: str,
     contributors: Optional[Sequence[str]] = None,
     security_fixes: Optional[Sequence[str]] = None,
-    prior_text: Optional[str] = None,
 ) -> str:
-    """Promote a ``## Unreleased`` block into a new dated release section.
+    """Render the release line's frozen changelog with a new dated section on top.
 
-    The bullets to promote always come from the ``## Unreleased`` block of *text*.
-    Two output shapes, selected by *prior_text*:
+    *notes* is the ``{category: [bullet, ...]}`` map for this cut (from
+    :func:`render.group_bullets`); it is rendered straight into a dated section --
+    there is no intermediate "unreleased" block. *prior_text* is the destination
+    release line's existing changelog (the ``pre-release-M.m.p`` / ``M.m`` branch,
+    which carries the earlier dated sections); an empty string on a first cut.
 
-    **Two-source (drain) mode -- when *prior_text* is given.** *text* is the
-    *source* branch's file (the base/feature branch, whose block accumulates the
-    bullets) and *prior_text* is the *destination* branch's existing changelog
-    (the pre-release branch, which carries earlier dated sections). The result is
-    the destination's frozen changelog: title + legend, the new dated section,
-    then *prior_text*'s previously dated sections -- and **no** ``## Unreleased``
-    block, because the destination does not accumulate notes; the source branch
-    does (and is emptied separately with :func:`reset_unreleased`). This is the
-    rc1 -> rcN -> GA flow: every cut drains the base branch's block onto the
-    running pre-release branch.
-
-    **Single-source (legacy) mode -- when *prior_text* is None.** *text* supplies
-    both the bullets and the prior dated sections, and the result re-emits an
-    **emptied** ``## Unreleased`` block at the foot so a single file can keep
-    accumulating between cuts. Retained for callers/tests that promote in place.
-
-    The trailing block (legacy mode) sits *after* the dated sections on purpose:
-    :func:`parse_unreleased` reads from ``## Unreleased`` to the next ``##`` header
-    or EOF, so a foot-position block contains only its own categories and never
-    bleeds into the dated sections above it.
+    The result is: title + urgency legend, the new dated section, then
+    *prior_text*'s previously dated sections, then one cumulative
+    ``### Contributors`` footer, and never an "unreleased" block, because the
+    release line only ever holds frozen dated sections.
     """
     major, minor, _ = parse_version(version)
-    notes = parse_unreleased(text)
     dated = render_version_section(version, stage, urgency, date, notes, security_fixes)
 
-    # Prior dated sections come from the destination changelog in drain mode, or
-    # from the source file itself in legacy mode. Restrict to the region *before*
-    # the ## Unreleased header first: a ``### Contributors`` header inside the
-    # source's Unreleased block is a hand-added (reserved) section, not the running
-    # footer, and must not be folded into the roll-up. Splitting on the header is a
-    # no-op when it is absent (a frozen pre-release file), returning the whole text.
-    prior_source = prior_text if prior_text is not None else text
-    before_unreleased_raw = prior_source.split("\n" + UNRELEASED_HEADER, 1)[0]
-    # Peel off any existing ``### Contributors`` footer so (a) it is not swept into
-    # the dated region below, and (b) its names roll into the new cumulative footer
-    # -- this is what dedups the roll-up across rc1..rcN..GA.
-    before_unreleased, prior_contributors = _split_contributors_footer(before_unreleased_raw)
-    existing = _existing_dated_sections(before_unreleased)
+    # Peel off any existing ``### Contributors`` footer from the prior changelog so
+    # (a) it is not swept into the dated region below, and (b) its names roll into
+    # the new cumulative footer, which is what dedups the roll-up across
+    # rc1..rcN..GA.
+    before_contrib, prior_contributors = _split_contributors_footer(prior_text)
+    existing = _existing_dated_sections(before_contrib)
 
     parts: List[str] = [render_header(major, minor), "", dated.rstrip()]
     if existing:
@@ -489,13 +369,5 @@ def promote(
     footer = render_contributors_footer(merged)
     if footer:
         parts += ["", footer]
-
-    # Legacy mode re-emits an emptied ## Unreleased block so the single file keeps
-    # accumulating; drain mode leaves the destination frozen (the source branch
-    # holds the block). The block goes *last*: it is level-2, so a preceding
-    # level-3 ``### Contributors`` footer reads as a dated-section trailer, while a
-    # footer placed *after* the block would be parsed as a category inside it.
-    if prior_text is None:
-        parts += ["", render_empty_unreleased().rstrip()]
 
     return "\n".join(parts).rstrip() + "\n"

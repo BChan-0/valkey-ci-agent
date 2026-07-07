@@ -1,7 +1,9 @@
 """Tests for the release-cut orchestration.
 
 Branch resolution and the version/notes promotion are exercised against the
-real valkey primitives in the test fixture; git and GitHub are mocked.
+release-format primitives (:mod:`scripts.release_notes.release_format`,
+:mod:`version_bump`, :mod:`contributors`); the fixture clone supplies only data
+files, and git and GitHub are mocked.
 """
 
 from __future__ import annotations
@@ -188,6 +190,52 @@ class TestResolveBranchPlan:
             resolve_branch_plan("/d", version="9.1", stage="rc1", source_ref="unstable")
 
 
+class TestDeleteRemoteBranch:
+    """The GA-rename branch delete must not report success when it fails.
+
+    A failed delete that leaves pre-release-M.m.p on origin alongside the M.m
+    line is exactly the state the next GA of that line hard-refuses, so it must
+    surface as a non-zero signal rather than being swallowed.
+    """
+
+    def test_delete_success(self, monkeypatch) -> None:
+        calls = []
+        monkeypatch.setattr(rc, "run_git", lambda *a, **k: calls.append(a) or None)
+        # _remote_branch_exists must not even be consulted on success.
+        monkeypatch.setattr(rc, "_remote_branch_exists",
+                            lambda *a, **k: pytest.fail("should not check on success"))
+        rc._delete_remote_branch("/d", "pre-release-9.1.0", {})
+        assert any("--delete" in c for c in calls)
+
+    def test_delete_failure_but_branch_gone_is_tolerated(self, monkeypatch) -> None:
+        # Push failed, yet the branch is confirmed absent -> desired end state, no raise.
+        def _boom(*a, **k):
+            raise RuntimeError("push rejected")
+        monkeypatch.setattr(rc, "run_git", _boom)
+        monkeypatch.setattr(rc, "_remote_branch_exists", lambda *a, **k: False)
+        rc._delete_remote_branch("/d", "pre-release-9.1.0", {})  # no exception
+
+    def test_delete_failure_branch_still_present_raises(self, monkeypatch) -> None:
+        def _boom(*a, **k):
+            raise RuntimeError("protected ref")
+        monkeypatch.setattr(rc, "run_git", _boom)
+        monkeypatch.setattr(rc, "_remote_branch_exists", lambda *a, **k: True)
+        with pytest.raises(RuntimeError) as exc:
+            rc._delete_remote_branch("/d", "pre-release-9.1.0", {})
+        assert "pre-release-9.1.0" in str(exc.value)
+
+    def test_delete_failure_existence_check_also_fails_raises(self, monkeypatch) -> None:
+        # If we cannot even confirm the branch is gone, assume the worst and raise.
+        def _boom(*a, **k):
+            raise RuntimeError("push rejected")
+        def _boom_exists(*a, **k):
+            raise RuntimeError("ls-remote failed")
+        monkeypatch.setattr(rc, "run_git", _boom)
+        monkeypatch.setattr(rc, "_remote_branch_exists", _boom_exists)
+        with pytest.raises(RuntimeError):
+            rc._delete_remote_branch("/d", "pre-release-9.1.0", {})
+
+
 class TestRcSequenceWarning:
     """The out-of-sequence rc detection feeding BranchPlan.rc_warning."""
 
@@ -345,34 +393,56 @@ class TestTrailingPrRegex:
     def test_credited_tolerates_trailing_punctuation(self, line, expected) -> None:
         assert rc._credited_pr_numbers(line) == expected
 
+    def test_security_section_pr_refs_not_credited(self) -> None:
+        # A CVE summary ending in "(#500)" is prose, not a PR credit. It must not
+        # seed the dedup set, or a later cut would drop an unrelated real PR #500.
+        # A normal bullet's (#44) in the same file is still credited.
+        notes = (
+            "Valkey 9.1.0-rc1  -  Released Tue 24 June 2026\n"
+            "-----\n\n"
+            "### Security Fixes\n"
+            "* (CVE-2026-23479) Use-after-free in unblock client flow (#500)\n\n"
+            "### Bug Fixes\n"
+            "* Fix a thing by @a (#44)\n"
+        )
+        assert rc._credited_pr_numbers(notes) == {44}
+
+    def test_new_dated_section_ends_security_scope(self) -> None:
+        # After the Security Fixes section, a later dated section's normal bullets
+        # are credited again (the section flag resets on the next "## "/"### ").
+        notes = (
+            "### Security Fixes\n"
+            "* (CVE-2026-1) something (#500)\n\n"
+            "## Valkey 9.1 release notes\n"
+            "### Bug Fixes\n"
+            "* real note (#77)\n"
+        )
+        assert rc._credited_pr_numbers(notes) == {77}
+
 
 class TestPromoteAndBump:
-    def _source_with_bullet(self, clone):
+    def _grouped_with_bullet(self, clone):
         from scripts.release_notes import render as render_mod
         fmt = render_mod.load_format_module(clone)
         from scripts.release_notes.models import CategorizedBullet
-        existing = open(os.path.join(clone, "00-RELEASENOTES"), encoding="utf-8").read()
-        return render_mod.apply_to_file(
-            existing,
-            render_mod.group_bullets(
-                [CategorizedBullet(pr_number=40, author="a", category="Bug Fixes", text="fix a crash")],
-                fmt),
+        return render_mod.group_bullets(
+            [CategorizedBullet(pr_number=40, author="a", category="Bug Fixes", text="fix a crash")],
             fmt)
 
     def test_promotes_dated_section_and_bumps_version(self, clone, monkeypatch) -> None:
         # No contributor base -> skip the network lookup entirely.
-        source = self._source_with_bullet(clone)
+        grouped = self._grouped_with_bullet(clone)
         version_text = open(os.path.join(clone, "src", "version.h"), encoding="utf-8").read()
         new_notes, new_version = promote_and_bump(
             clone,
-            source_notes_text=source,
+            grouped=grouped,
             dest_notes_text="",          # first cut: no prior changelog
             dest_version_text=version_text,
             version="9.1.0", stage_lc="rc1", urgency="LOW", date="2026-06-25",
             repo_full_name="valkey-io/valkey", contrib_base=None, token=None,
             security_fixes=None,
         )
-        # Dated section rendered, bullet promoted, no ## Unreleased in drain mode.
+        # Dated section rendered, bullet included, never an unreleased block.
         assert "Valkey 9.1.0-rc1" in new_notes
         assert "* fix a crash by @a (#40)" in new_notes
         assert "## Unreleased" not in new_notes
@@ -383,7 +453,7 @@ class TestPromoteAndBump:
 
     def test_drains_prior_rc_notes(self, clone) -> None:
         # A prior rc1 dated section on the destination must survive into rc2.
-        source = self._source_with_bullet(clone)
+        grouped = self._grouped_with_bullet(clone)
         prior = (
             "Valkey 9.1 release notes\n========================\n\n"
             "Valkey 9.1.0-rc1  -  Released 2026-06-01\n"
@@ -392,7 +462,7 @@ class TestPromoteAndBump:
         )
         version_text = open(os.path.join(clone, "src", "version.h"), encoding="utf-8").read()
         new_notes, _ = promote_and_bump(
-            clone, source_notes_text=source, dest_notes_text=prior,
+            clone, grouped=grouped, dest_notes_text=prior,
             dest_version_text=version_text, version="9.1.0", stage_lc="rc2",
             urgency="LOW", date="2026-06-25", repo_full_name="valkey-io/valkey",
             contrib_base=None, token=None, security_fixes=None,
@@ -403,21 +473,14 @@ class TestPromoteAndBump:
         assert "* fix a crash by @a (#40)" in new_notes
 
     def test_contributor_list_included(self, clone, monkeypatch) -> None:
-        source = self._source_with_bullet(clone)
+        grouped = self._grouped_with_bullet(clone)
         version_text = open(os.path.join(clone, "src", "version.h"), encoding="utf-8").read()
-        # Stub the contributor lookup primitive so no network is touched.
-        import scripts.release_notes.clone_tools as ct
-        real_load = ct.load_releasetools_module
-
-        def _fake_load(d, name):
-            mod = real_load(d, name)
-            if name == "gen_contributors":
-                mod.list_contributors = lambda *a, **k: ["Jane Doe @jane", "Bob @bob"]
-            return mod
-
-        monkeypatch.setattr(rc, "load_releasetools_module", _fake_load)
+        # Stub the contributor lookup so no network is touched.
+        monkeypatch.setattr(
+            rc.gc, "list_contributors", lambda *a, **k: ["Jane Doe @jane", "Bob @bob"]
+        )
         new_notes, _ = promote_and_bump(
-            clone, source_notes_text=source, dest_notes_text="",
+            clone, grouped=grouped, dest_notes_text="",
             dest_version_text=version_text, version="9.1.0", stage_lc="rc1",
             urgency="LOW", date="2026-06-25", repo_full_name="valkey-io/valkey",
             contrib_base="9.0.0", token=None, security_fixes=None,
@@ -432,31 +495,23 @@ class TestPromoteAndBump:
         # names-only git-shortlog fallback. promote_and_bump must dereference both
         # to SHAs (via _compare_ref) before calling list_contributors, so the API
         # path, and thus the "Full Name @handle" format, is preserved.
-        source = self._source_with_bullet(clone)
+        grouped = self._grouped_with_bullet(clone)
         version_text = open(os.path.join(clone, "src", "version.h"), encoding="utf-8").read()
         captured: dict = {}
 
-        import scripts.release_notes.clone_tools as ct
-        real_load = ct.load_releasetools_module
+        def _list(repo, base, head, token, *, repo_dir=None):
+            captured["base"] = base
+            captured["head"] = head
+            return ["Jane Doe @jane"]
 
-        def _fake_load(d, name):
-            mod = real_load(d, name)
-            if name == "gen_contributors":
-                def _list(repo, base, head, token, *, repo_dir=None):
-                    captured["base"] = base
-                    captured["head"] = head
-                    return ["Jane Doe @jane"]
-                mod.list_contributors = _list
-            return mod
-
-        monkeypatch.setattr(rc, "load_releasetools_module", _fake_load)
+        monkeypatch.setattr(rc.gc, "list_contributors", _list)
         # Stub ref resolution so no real git repo is needed: prove the values
         # passed to list_contributors are what _compare_ref returned, not the
         # raw origin/unstable / HEAD refs.
         monkeypatch.setattr(rc, "_compare_ref",
                             lambda repo_dir, ref: {"origin/unstable": "base_sha", "HEAD": "head_sha"}[ref])
         promote_and_bump(
-            clone, source_notes_text=source, dest_notes_text="",
+            clone, grouped=grouped, dest_notes_text="",
             dest_version_text=version_text, version="9.1.0", stage_lc="rc1",
             urgency="LOW", date="2026-06-25", repo_full_name="valkey-io/valkey",
             contrib_base="origin/unstable", token="t", security_fixes=None,
@@ -485,26 +540,29 @@ class TestCutOrchestration:
     """End-to-end cut() with git + GitHub + pipeline mocked, real fixture worktree."""
 
     def _setup(self, monkeypatch, clone, *, line_exists, bullets=True, triage=(),
-               had_prs=True, duplicate_prs=(), stub_contrib_base=True):
+               had_prs=True, duplicate_prs=(), uncertain=(), stub_contrib_base=True,
+               writes=None):
         from scripts.release_notes import pipeline as pipeline_mod
         from scripts.release_notes import render as render_mod
         from scripts.release_notes.models import CategorizedBullet
         from scripts.release_notes.pipeline import RegenResult
 
         fmt = render_mod.load_format_module(clone)
-        existing = open(os.path.join(clone, "00-RELEASENOTES"), encoding="utf-8").read()
         bl = ([CategorizedBullet(pr_number=40, author="a", category="Bug Fixes", text="fix")]
               if bullets else [])
-        updated = render_mod.apply_to_file(existing, render_mod.group_bullets(bl, fmt), fmt)
+        grouped = render_mod.group_bullets(bl, fmt)
         monkeypatch.setattr(
             pipeline_mod, "regenerate_unreleased",
             lambda *a, **k: RegenResult(
-                base_tag="9.0.0", existing_text=existing, updated_text=updated,
-                included=1 if bullets else 0, bullet_count=len(bl), skipped=(),
-                triage=tuple(triage), had_prs=had_prs, wipes_existing=False,
-                duplicate_prs=tuple(duplicate_prs)),
+                base_tag="9.0.0", grouped=grouped,
+                included=1 if bullets else 0,
+                bullet_count=sum(len(v) for v in grouped.values()), skipped=(),
+                triage=tuple(triage), had_prs=had_prs,
+                duplicate_prs=tuple(duplicate_prs), uncertain=tuple(uncertain)),
         )
-        # Record git commands; emulate worktree by copying the clone tree.
+        # Record git commands; emulate worktree by copying the clone tree on add
+        # and actually removing it on remove, so cut()'s cleanup is exercised (a
+        # no-op remove would leave .release-dest behind and mask a cleanup leak).
         calls = []
 
         def _fake_git(repo_dir, *args, **kwargs):
@@ -512,10 +570,23 @@ class TestCutOrchestration:
             if args[:1] == ("worktree",) and args[1] == "add":
                 dest = args[-2]
                 shutil.copytree(clone, dest, dirs_exist_ok=True)
+            elif args[:1] == ("worktree",) and args[1] == "remove":
+                shutil.rmtree(args[-1], ignore_errors=True)
             from unittest.mock import MagicMock
             return MagicMock()
 
         monkeypatch.setattr(rc, "run_git", _fake_git)
+        # Capture every _write(path, text) so a test can assert on the notes cut()
+        # actually produces, rather than reading a post-cleanup filesystem path
+        # that only survives if the worktree-remove was stubbed to a no-op.
+        if writes is not None:
+            real_write = rc._write
+
+            def _spy_write(path, text):
+                writes[path] = text
+                return real_write(path, text)
+
+            monkeypatch.setattr(rc, "_write", _spy_write)
         monkeypatch.setattr(rc, "_remote_branch_exists", lambda d, b: line_exists.get(b, False))
         if stub_contrib_base:
             monkeypatch.setattr(rc, "_contrib_base", lambda *a, **k: None)
@@ -552,6 +623,42 @@ class TestCutOrchestration:
         # The source branch is never pushed to.
         assert not any("HEAD:unstable" in " ".join(c) or ":refs/heads/unstable" in " ".join(c)
                        for c in pushed)
+        # rc1 is not a rename (plan.rename_from is None), so no branch is deleted.
+        assert not any("--delete" in c for c in pushed), pushed
+
+    def test_included_prs_but_no_bullets_aborts_without_pr(self, monkeypatch, clone):
+        # The cut()-level guard: PRs were included but generation produced no
+        # renderable bullets. cut() must return 1 and open no PR / push nothing,
+        # rather than commit empty notes. Override _setup's RegenResult with a
+        # guard-tripping one (included=1, bullet_count=0, empty grouped).
+        from unittest.mock import MagicMock
+
+        from scripts.release_notes import pipeline as pipeline_mod
+        from scripts.release_notes.pipeline import RegenResult
+
+        calls = self._setup(monkeypatch, clone, line_exists={})
+        monkeypatch.setattr(
+            pipeline_mod, "regenerate_unreleased",
+            lambda *a, **k: RegenResult(
+                base_tag="9.0.0", grouped={},
+                included=1, bullet_count=0, skipped=(40,), triage=(), had_prs=True,
+                duplicate_prs=()),
+        )
+        repo = MagicMock()
+        repo.get_pulls.return_value = []
+        created = []
+        repo.create_pull.side_effect = lambda **kw: created.append(kw) or MagicMock(number=1, html_url="https://x/1")
+        monkeypatch.setattr(rc.publish_mod, "retry_github_call", lambda op, **k: op())
+
+        rc_code = rc.cut(
+            repo, repo_full_name="valkey-io/valkey", source_clone_dir=clone,
+            valkey_clone_dir=clone, source_ref="unstable", version="9.1.0", stage="rc1",
+            urgency="LOW", date="2026-06-25", tag_glob=None, base_ref=None, contrib_base_ref=None,
+            security_fixes=None, token="t", git_env={}, dry_run=False,
+        )
+        assert rc_code == 1                     # aborted
+        assert created == []                    # no PR opened
+        assert not [c for c in calls if c[:1] == ("push",)]  # nothing pushed
 
     def test_uppercase_ga_cuts_minor_line_with_lowercased_names(self, monkeypatch, clone):
         # End-to-end: a dispatch of "GA" must route to the M.m line and emit the
@@ -582,6 +689,10 @@ class TestCutOrchestration:
         assert created[0]["title"] == "Add release notes entry for Valkey 9.1.0 GA"
         # No raw "-GA" leaks into the prep-branch push refspec.
         assert not any("9.1.0-GA" in " ".join(c) for c in calls if c[:1] == ("push",))
+        # The GA rename must delete the old pre-release branch on origin (destructive):
+        # leaving it alongside the new 9.1 line is the inconsistent state the next GA
+        # hard-refuses, so assert the delete fired and targeted exactly that branch.
+        assert ("push", "origin", "--delete", "pre-release-9.1.0") in calls
 
     def test_triage_listed_in_release_pr_body(self, monkeypatch, clone):
         from unittest.mock import MagicMock
@@ -662,11 +773,12 @@ class TestCutOrchestration:
         assert "out of sequence" not in created[0]["body"]
 
     def _cut_body(self, monkeypatch, clone, *, line_exists, cut_kwargs,
-                  bullets=True, triage=(), had_prs=True, duplicate_prs=()):
+                  bullets=True, triage=(), had_prs=True, duplicate_prs=(), uncertain=()):
         """Run cut() with GitHub mocked and return the created PR's body."""
         from unittest.mock import MagicMock
         self._setup(monkeypatch, clone, line_exists=line_exists, bullets=bullets,
-                    triage=triage, had_prs=had_prs, duplicate_prs=duplicate_prs)
+                    triage=triage, had_prs=had_prs, duplicate_prs=duplicate_prs,
+                    uncertain=uncertain)
         repo = MagicMock()
         repo.get_pulls.return_value = []
         created = []
@@ -719,6 +831,18 @@ class TestCutOrchestration:
         assert "noted more than once" in body
         assert "#40" in body
 
+    def test_uncertain_notes_flagged_in_body(self, monkeypatch, clone):
+        from scripts.release_notes.models import UncertainNote
+        body = self._cut_body(
+            monkeypatch, clone, line_exists={}, cut_kwargs={},
+            uncertain=(UncertainNote(pr_number=40, category="Other Changes",
+                                     reason="unclear if user-facing"),),
+        )
+        assert "Notes to double-check" in body
+        assert "#40" in body
+        assert "Other Changes" in body
+        assert "unclear if user-facing" in body
+
     def test_security_dup_warned_in_body(self, monkeypatch, clone):
         # The fixture bullet credits #40; a --security-fix naming #40 lists it twice.
         body = self._cut_body(monkeypatch, clone, line_exists={},
@@ -731,6 +855,134 @@ class TestCutOrchestration:
                               cut_kwargs={"urgency": "SECURITY", "security_fixes": None})
         assert "Security fixes need a look" in body
         assert "no security content" in body
+
+    def _advisory_repo(self, monkeypatch, clone, *, advisories):
+        """A cut() harness whose repo returns *advisories* from the GHSA API.
+
+        Returns ``(repo, created, writes, calls)``: ``created`` accumulates each
+        opened PR's kwargs, ``writes`` maps each written path to the text cut()
+        wrote (so a test asserts on what the cut *produces and commits*, not on a
+        post-cleanup filesystem path), and ``calls`` records the git commands (to
+        assert cleanup fired). Uses the real ``security_mod`` path (only
+        git/publish are mocked), so the advisory fetch, version match, and merge
+        run end to end.
+        """
+        from unittest.mock import MagicMock
+        writes: dict[str, str] = {}
+        calls = self._setup(monkeypatch, clone, line_exists={}, writes=writes)
+        repo = MagicMock()
+        repo.get_pulls.return_value = []
+        repo.get_repository_advisories.return_value = advisories
+        created = []
+        repo.create_pull.side_effect = lambda **kw: created.append(kw) or MagicMock(
+            number=1, html_url="https://x/1")
+        monkeypatch.setattr(rc.publish_mod, "retry_github_call", lambda op, **k: op())
+        return repo, created, writes, calls
+
+    @staticmethod
+    def _written_notes(writes: dict, clone: str) -> str:
+        """Return the 00-RELEASENOTES text cut() wrote to the dest worktree.
+
+        Keyed on the ``.release-dest`` worktree path, not just the filename: the
+        notes must be written into the throwaway worktree that becomes the PR
+        diff, never back into the source clone. A placement regression that wrote
+        to ``clone/00-RELEASENOTES`` would leave the dest path unwritten and fail
+        here rather than silently pass.
+        """
+        dest_notes = os.path.join(clone, ".release-dest", rc.NOTES_FILE)
+        assert dest_notes in writes, (
+            f"cut() wrote no {rc.NOTES_FILE} to the dest worktree; wrote to {list(writes)}"
+        )
+        return writes[dest_notes]
+
+    @staticmethod
+    def _assert_worktree_removed(calls: list, clone: str) -> None:
+        """Assert cut() cleaned up its .release-dest worktree."""
+        dest = os.path.join(clone, ".release-dest")
+        removed = [c for c in calls if c[:2] == ("worktree", "remove") and dest in c]
+        assert removed, f"cut() did not remove the worktree; git calls={calls}"
+        assert not os.path.exists(dest), ".release-dest should be gone after cut()"
+
+    def test_advisory_cve_rendered_into_notes(self, monkeypatch, clone):
+        # A published advisory patched in 9.1.0 lands as a Security Fixes bullet in
+        # the release-branch notes, in the maintainer's "(CVE-...) summary" form.
+        from tests.test_release_notes_security import _advisory, _vuln
+        adv = _advisory(cve_id="CVE-2026-23479", ghsa_id="GHSA-a",
+                        summary="Use-After-Free in unblock client flow",
+                        vulnerabilities=[_vuln(patched="9.1.0")])
+        repo, created, writes, calls = self._advisory_repo(monkeypatch, clone, advisories=[adv])
+        rc.cut(
+            repo, repo_full_name="valkey-io/valkey", source_clone_dir=clone,
+            valkey_clone_dir=clone, source_ref="unstable", version="9.1.0", stage="rc1",
+            urgency="SECURITY", date="2026-06-25", tag_glob=None, base_ref=None,
+            contrib_base_ref=None, security_fixes=None, token="t", git_env={},
+            dry_run=False, security_from_advisories=True,
+        )
+        # Assert on the notes cut() actually wrote to the dest worktree, not a
+        # path left behind by a stubbed cleanup.
+        notes = self._written_notes(writes, clone)
+        assert "### Security Fixes" in notes
+        assert "* (CVE-2026-23479) Use-After-Free in unblock client flow" in notes
+        # SECURITY urgency now HAS content, so the "no security content" warning is gone.
+        assert "no security content" not in created[0]["body"]
+        # The disclaimer to add embargoed CVEs is present.
+        assert "embargoed or draft CVEs" in created[0]["body"]
+        # cut() cleaned up its throwaway worktree (no leak).
+        self._assert_worktree_removed(calls, clone)
+
+    def test_advisory_fetch_failure_disclaimed_in_body(self, monkeypatch, clone):
+        repo, created, _writes, _calls = self._advisory_repo(monkeypatch, clone, advisories=None)
+        repo.get_repository_advisories.side_effect = RuntimeError("no advisory permission")
+        rc.cut(
+            repo, repo_full_name="valkey-io/valkey", source_clone_dir=clone,
+            valkey_clone_dir=clone, source_ref="unstable", version="9.1.0", stage="rc1",
+            urgency="LOW", date="2026-06-25", tag_glob=None, base_ref=None,
+            contrib_base_ref=None, security_fixes=None, token="t", git_env={},
+            dry_run=False, security_from_advisories=True,
+        )
+        body = created[0]["body"]
+        assert "Security advisories could not be read" in body
+        assert "no advisory permission" in body
+
+    def test_unreadable_advisory_flagged_not_reported_as_non_match(self, monkeypatch, clone):
+        # An advisory whose raw_data can't be read is surfaced in the body as
+        # "could not be read ... MAY fix this version", NOT silently as a non-match.
+        from tests.test_release_notes_security import _advisory, _vuln
+        adv = _advisory(cve_id="CVE-2026-9", ghsa_id="GHSA-z", summary="s",
+                        raise_on={"raw_data"}, vulnerabilities=[_vuln(patched="9.1.0")])
+        repo, created, _writes, _calls = self._advisory_repo(monkeypatch, clone, advisories=[adv])
+        rc.cut(
+            repo, repo_full_name="valkey-io/valkey", source_clone_dir=clone,
+            valkey_clone_dir=clone, source_ref="unstable", version="9.1.0", stage="rc1",
+            urgency="LOW", date="2026-06-25", tag_glob=None, base_ref=None,
+            contrib_base_ref=None, security_fixes=None, token="t", git_env={},
+            dry_run=False, security_from_advisories=True,
+        )
+        body = created[0]["body"]
+        assert "could **not** be read" in body
+        assert "CVE-2026-9" in body
+        assert "MAY fix this version" in body
+
+    def test_manual_security_fix_wins_over_advisory(self, monkeypatch, clone):
+        # An advisory and a --security-fix both name CVE-2026-23479: the manual
+        # wording is what ships, and the CVE is listed once.
+        from tests.test_release_notes_security import _advisory, _vuln
+        adv = _advisory(cve_id="CVE-2026-23479", ghsa_id="GHSA-a",
+                        summary="auto-generated wording",
+                        vulnerabilities=[_vuln(patched="9.1.0")])
+        repo, created, writes, calls = self._advisory_repo(monkeypatch, clone, advisories=[adv])
+        rc.cut(
+            repo, repo_full_name="valkey-io/valkey", source_clone_dir=clone,
+            valkey_clone_dir=clone, source_ref="unstable", version="9.1.0", stage="rc1",
+            urgency="SECURITY", date="2026-06-25", tag_glob=None, base_ref=None,
+            contrib_base_ref=None,
+            security_fixes=["CVE-2026-23479: hand-written wording"],
+            token="t", git_env={}, dry_run=False, security_from_advisories=True,
+        )
+        notes = self._written_notes(writes, clone)
+        assert "hand-written wording" in notes
+        assert "auto-generated wording" not in notes
+        self._assert_worktree_removed(calls, clone)
 
     def test_clean_cut_has_no_warning_sections(self, monkeypatch, clone):
         body = self._cut_body(monkeypatch, clone, line_exists={}, cut_kwargs={})
@@ -923,25 +1175,25 @@ class TestDedupAgainstDestination:
         assert rc._credited_pr_numbers(text) == {44}
 
     def test_drop_removes_only_overlapping_bullets(self) -> None:
-        source = (
-            "## Unreleased\n\n"
-            "### Performance and Efficiency Improvements\n"
-            "* already shipped by @a (#44)\n"
-            "### Bug Fixes\n"
-            "* genuinely new by @b (#60)\n"
-        )
-        filtered, dropped = rc._drop_already_credited(source, {44})
+        grouped = {
+            "Performance and Efficiency Improvements": ["* already shipped by @a (#44)"],
+            "Bug Fixes": ["* genuinely new by @b (#60)", "* also new by @c (#61)"],
+        }
+        filtered, dropped = rc._drop_already_credited(grouped, {44})
         assert dropped == [44]
-        assert "(#44)" not in filtered
-        assert "(#60)" in filtered                 # new PR survives
-        assert "### Performance and Efficiency Improvements" in filtered  # empty header kept
-        assert "### Bug Fixes" in filtered
+        all_lines = [line for lines in filtered.values() for line in lines]
+        assert not any("(#44)" in line for line in all_lines)
+        assert any("(#60)" in line for line in all_lines)   # new PRs survive
+        assert any("(#61)" in line for line in all_lines)
+        # The category emptied by the drop is removed; the one with survivors stays.
+        assert "Performance and Efficiency Improvements" not in filtered
+        assert filtered["Bug Fixes"] == ["* genuinely new by @b (#60)", "* also new by @c (#61)"]
 
     def test_drop_is_noop_without_overlap(self) -> None:
-        source = "### Bug Fixes\n* new by @a (#60)\n"
-        filtered, dropped = rc._drop_already_credited(source, set())
+        grouped = {"Bug Fixes": ["* new by @a (#60)"]}
+        filtered, dropped = rc._drop_already_credited(grouped, set())
         assert dropped == []
-        assert filtered == source
+        assert filtered == grouped
 
     def test_ga_after_final_rc_drops_all_and_warns(self, clone, monkeypatch) -> None:
         # End-to-end-ish: dest already credits #44; the source block re-found #44
@@ -953,15 +1205,13 @@ class TestDedupAgainstDestination:
         from scripts.release_notes.pipeline import RegenResult
 
         fmt = render_mod.load_format_module(clone)
-        existing = open(os.path.join(clone, "00-RELEASENOTES"), encoding="utf-8").read()
         bl = [CategorizedBullet(pr_number=44, author="a", category="Bug Fixes", text="fix")]
-        updated = render_mod.apply_to_file(existing, render_mod.group_bullets(bl, fmt), fmt)
+        grouped = render_mod.group_bullets(bl, fmt)
         monkeypatch.setattr(
             pipeline_mod, "regenerate_unreleased",
             lambda *a, **k: RegenResult(
-                base_tag="unstable", existing_text=existing, updated_text=updated,
+                base_tag="unstable", grouped=grouped,
                 included=1, bullet_count=1, skipped=(), triage=(), had_prs=True,
-                wipes_existing=False,
             ),
         )
         # Destination line already credits #44 (carried from rc1).
@@ -983,7 +1233,7 @@ class TestDedupAgainstDestination:
                             else open(os.path.join(clone, "src", "version.h")).read())
 
         def _capture_promote(*a, **k):
-            captured["source_notes"] = k["source_notes_text"]
+            captured["grouped"] = k["grouped"]
             return ("NEWNOTES", "NEWVERSION")
         monkeypatch.setattr(rcmod, "promote_and_bump", _capture_promote)
         monkeypatch.setattr(rcmod, "_print_dry_run",
@@ -996,6 +1246,7 @@ class TestDedupAgainstDestination:
             base_ref=None, contrib_base_ref=None, security_fixes=None,
             token="t", git_env={}, dry_run=True,
         )
-        # #44 was dropped before promote saw the source block.
-        assert "(#44)" not in captured["source_notes"]
+        # #44 was dropped before render saw the grouped bullets.
+        all_lines = [line for lines in captured["grouped"].values() for line in lines]
+        assert not any("(#44)" in line for line in all_lines)
         assert captured["already"] == [44]
