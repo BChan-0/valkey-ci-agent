@@ -113,37 +113,10 @@ jobs:
           persist-credentials: false
           fetch-depth: 1
 
-      - name: Set up Python 3.11
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+      - name: Set up agent (Python deps + Claude Code)
+        uses: ./.github/actions/setup-agent
         with:
-          python-version: "3.11"
-          cache: "pip"
-
-      - name: Install dependencies
-        # This job later holds a write-scoped App token and Bedrock creds, so the
-        # install is integrity-pinned: pip against a hashed lockfile, and the npm
-        # package verified against its registry SRI hash before install. A tampered
-        # or typosquatted dep fails the step instead of executing in that context.
-        run: |
-          set -euo pipefail
-          pip install --require-hashes -r requirements.release-notes.lock
-          # npm's global install takes no --integrity, so verify-then-install:
-          # fetch the exact tarball, check its sha512 against the known SRI hash,
-          # and install from the verified local file (never the network name).
-          CLAUDE_CODE_VERSION=2.1.153
-          CLAUDE_CODE_INTEGRITY="sha512-QzkUc/2mfW9KTrSLULPJYRODexTZ3GPcLjRVivCJtff/495MJYy35597GTqlPBTvYPpGC2FOumy78LluWdphxA=="
-          tarball="$(mktemp --suffix=.tgz)"
-          curl -fsSL -o "${tarball}" \
-            "https://registry.npmjs.org/@anthropic-ai/claude-code/-/claude-code-${CLAUDE_CODE_VERSION}.tgz"
-          actual="sha512-$(openssl dgst -sha512 -binary "${tarball}" | openssl base64 -A)"
-          if [[ "${actual}" != "${CLAUDE_CODE_INTEGRITY}" ]]; then
-            echo "claude-code tarball integrity mismatch" >&2
-            echo "  expected: ${CLAUDE_CODE_INTEGRITY}" >&2
-            echo "  actual:   ${actual}" >&2
-            exit 1
-          fi
-          npm install -g "${tarball}"
-          rm -f "${tarball}"
+          install-claude: "true"
 
       # Two token steps, selected by whether this cut reads advisories, so a
       # normal cut never depends on the advisory grant. repository-advisories:read
