@@ -1161,16 +1161,31 @@ class TestDedupAgainstDestination:
 
     _GA_PLAN = BranchPlan("ga", "9.1", "pre-release-9.1.0", True, "pre-release-9.1.0")
 
+    @staticmethod
+    def _meta(already_credited, noted_bullet_count):
+        # The section reads only these two fields; the rest are placeholders.
+        return rc._NotesMeta(
+            regen=None, already_credited=already_credited,
+            noted_bullet_count=noted_bullet_count, urgency="LOW",
+            security_fixes=None, security_dup_prs=(), baseline_unanchored=False,
+        )
+
     def test_no_new_prs_section_renders_when_all_credited(self) -> None:
         # Every PR in range was already credited on the line, so the dated section
         # is version-bump-only; the body must say so (not read as a generation miss).
-        section = rc._no_new_prs_section([44, 45], self._GA_PLAN)
+        section = rc._no_new_prs_section(self._meta([44, 45], 0), self._GA_PLAN)
         assert "No new release notes" in section
         assert "#44" in section and "#45" in section
         assert "9.1" in section  # names the target line
 
     def test_no_new_prs_section_empty_when_nothing_dropped(self) -> None:
-        assert rc._no_new_prs_section([], self._GA_PLAN) == ""
+        assert rc._no_new_prs_section(self._meta([], 0), self._GA_PLAN) == ""
+
+    def test_no_new_prs_section_silent_when_a_new_note_survives(self) -> None:
+        # Regression (PR #58): a duplicate PR was dropped (#44) but another PR still
+        # produced a bullet, so the dated section carries real content. The section
+        # must stay silent rather than falsely claim "No new release notes".
+        assert rc._no_new_prs_section(self._meta([44], 1), self._GA_PLAN) == ""
 
     def test_credited_reads_trailing_pr_refs(self) -> None:
         text = (

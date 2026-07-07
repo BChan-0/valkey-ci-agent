@@ -106,6 +106,7 @@ class _NotesMeta:
 
     regen: Any                          # pipeline.RegenResult for this cut
     already_credited: Sequence[int]     # PRs dropped as already on the line
+    noted_bullet_count: int             # bullets actually in the dated section (post already-credited drop)
     urgency: str                        # the requested upgrade urgency
     security_fixes: Optional[Sequence[str]]  # sanitized security bullets: manual + advisory-derived (None when empty)
     security_dup_prs: Sequence[int]     # PRs noted both as a security fix and a normal bullet
@@ -758,8 +759,16 @@ def cut(
             security_fixes=security_fixes,
         )
 
+        # Count what survives into the dated section after the already-credited
+        # drop. When some PRs were dropped as duplicates but others remain, this
+        # is > 0 and the cut still ships real notes; only when it is 0 is the cut
+        # version-bump-only. The "No new release notes" section keys on this so a
+        # cut that drops a duplicate yet adds a new note is not mislabelled empty.
+        noted_bullet_count = sum(len(lines) for lines in grouped.values())
+
         notes_meta = _NotesMeta(
-            regen=regen, already_credited=already_credited, urgency=urgency,
+            regen=regen, already_credited=already_credited,
+            noted_bullet_count=noted_bullet_count, urgency=urgency,
             security_fixes=security_fixes, security_dup_prs=security_dup_prs,
             baseline_unanchored=baseline_unanchored, advisories=advisories,
         )
@@ -917,7 +926,7 @@ def _build_pr_body(plan: BranchPlan, version: str, notes_meta: "_NotesMeta") -> 
         + _branch_warning_section(plan)
         + _baseline_warning_section(notes_meta, version)
         + _empty_notes_section(notes_meta, plan)
-        + _no_new_prs_section(notes_meta.already_credited, plan)
+        + _no_new_prs_section(notes_meta, plan)
         + _duplicate_pr_section(regen.duplicate_prs)
         + _skipped_section(regen.skipped)
         + _uncertain_section(regen.uncertain)
@@ -1166,15 +1175,18 @@ def _security_warning_section(notes_meta: "_NotesMeta") -> str:
     )
 
 
-def _no_new_prs_section(already_credited: Sequence[int], plan: BranchPlan) -> str:
+def _no_new_prs_section(notes_meta: "_NotesMeta", plan: BranchPlan) -> str:
     """Warn in the PR body when every PR in range was already credited on the line.
 
-    Returns an empty string unless some PR was dropped as a duplicate. When the
-    drop leaves the dated section with no bullets (the common GA-after-final-RC
-    case), the cut is version-bump-only, and the reader needs to know the empty
-    notes are intentional rather than a generation miss.
+    Returns an empty string unless some PR was dropped as a duplicate AND the drop
+    left the dated section with no surviving bullets (the common GA-after-final-RC
+    case), so the cut is version-bump-only and the reader needs to know the empty
+    notes are intentional rather than a generation miss. When the drop removed some
+    duplicates but other PRs still produced bullets, the cut ships real notes, so
+    this section stays silent (else it would falsely read as "no new notes").
     """
-    if not already_credited:
+    already_credited = notes_meta.already_credited
+    if not already_credited or notes_meta.noted_bullet_count:
         return ""
     refs = ", ".join(f"#{n}" for n in already_credited)
     return (
