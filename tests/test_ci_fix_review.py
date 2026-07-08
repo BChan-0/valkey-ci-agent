@@ -406,7 +406,7 @@ def test_combined_command_groups_semicolon_build_before_verify():
         verify_command="echo should-not-run",
     )
     command = combined_command(proposal)
-    assert command == "{\nexport AR=/tmp/missing-ar; false\n} && {\necho should-not-run\n}"
+    assert command == "(\nexport AR=/tmp/missing-ar; false\n) && (\necho should-not-run\n)"
 
     result = subprocess.run(
         ["/bin/sh", "-c", command],
@@ -416,6 +416,24 @@ def test_combined_command_groups_semicolon_build_before_verify():
     )
     assert result.returncode != 0
     assert "should-not-run" not in result.stdout
+
+
+def test_combined_command_groups_do_not_leak_cd_between_parts():
+    proposal = FixProposal(
+        path=FixPath.AUTHOR, failing_check="t", root_cause="rc", reasoning="why",
+        confidence=0.9,
+        build_command="mkdir -p src/commands && cd src",
+        verify_command="test -d src/commands; rc=$?; exit $rc",
+    )
+    command = combined_command(proposal)
+
+    result = subprocess.run(
+        ["/bin/sh", "-c", command],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0
 
 
 def test_combined_command_leaves_plain_command_ungrouped():

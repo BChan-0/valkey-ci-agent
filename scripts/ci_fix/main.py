@@ -76,6 +76,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--run-url", default="", help="Failing CI run URL")
     parser.add_argument("--commenter", default="", help="Requesting user login")
     parser.add_argument("--hint", default="", help="Optional diagnosis hint")
+    parser.add_argument("--comment-id", type=int, default=env_int("CI_FIX_COMMENT_ID", 0, minimum=0),
+                        help="Triggering comment id, reacted to with the outcome")
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -88,8 +90,10 @@ def main(argv: list[str] | None = None) -> int:
         logger.info("No actionable fix command; nothing to do.")
         return 0
 
-    repo_full_name, pr_number, commenter, command = request
-    return _run_and_comment(args.target_token, repo_full_name, pr_number, commenter, command)
+    repo_full_name, pr_number, commenter, command, comment_id = request
+    return _run_and_comment(
+        args.target_token, repo_full_name, pr_number, commenter, command, comment_id,
+    )
 
 
 def _run_and_comment(
@@ -98,6 +102,7 @@ def _run_and_comment(
     pr_number: int,
     commenter: str,
     command: ParsedCommand,
+    comment_id: int = 0,
 ) -> int:
     gh = Github(auth=Auth.Token(token))
     artifact_client = ArtifactClient(gh, token=token)
@@ -136,35 +141,36 @@ def _run_and_comment(
         _post_comment(gh, repo_full_name, pr_number, render_comment(outcome))
     except Exception:  # noqa: BLE001 - a failed comment must not mask the outcome
         logger.exception("Failed to post outcome comment on #%s", pr_number)
+    _react_outcome(gh, repo_full_name, comment_id, outcome.kind)
     logger.info("ci_fix outcome: %s - %s", outcome.kind.value, outcome.summary)
     return 1 if outcome.kind is OutcomeKind.FAILED else 0
 
 
-def _request_from_event(args: argparse.Namespace) -> tuple[str, int, str, ParsedCommand] | None:
+def _request_from_event(args: argparse.Namespace) -> tuple[str, int, str, ParsedCommand, int] | None:
     if not args.event_path:
         return None
     event = json.loads(Path(args.event_path).read_text(encoding="utf-8"))
     parsed = _parse_event(event)
     if parsed is None:
         return None
-    repo_full_name, pr_number, commenter, body = parsed
+    repo_full_name, pr_number, commenter, body, comment_id = parsed
     command = parse_command(body)
     if command is None:
         return None
-    return repo_full_name, pr_number, commenter, command
+    return repo_full_name, pr_number, commenter, command, comment_id
 
 
-def _request_from_dispatch(args: argparse.Namespace) -> tuple[str, int, str, ParsedCommand] | None:
+def _request_from_dispatch(args: argparse.Namespace) -> tuple[str, int, str, ParsedCommand, int] | None:
     if not (args.repo and args.pr and args.commenter):
         return None
     command = parse_command(f"@valkeyrie-bot fix {args.run_url} {args.hint}".strip())
     if command is None:
         return None
-    return args.repo, args.pr, args.commenter, command
+    return args.repo, args.pr, args.commenter, command, args.comment_id
 
 
-def _parse_event(event: dict) -> tuple[str, int, str, str] | None:
-    """Extract (repo_full_name, pr_number, commenter, body) from the event.
+def _parse_event(event: dict) -> tuple[str, int, str, str, int] | None:
+    """Extract (repo_full_name, pr_number, commenter, body, comment_id) from the event.
 
     Returns None when the event is not a created comment on a pull request.
     """
@@ -176,11 +182,12 @@ def _parse_event(event: dict) -> tuple[str, int, str, str] | None:
     comment = event.get("comment") or {}
     body = comment.get("body") or ""
     commenter = (comment.get("user") or {}).get("login") or ""
+    comment_id = comment.get("id") or 0
     pr_number = issue.get("number")
     repo_full_name = (event.get("repository") or {}).get("full_name") or ""
     if not (body and commenter and isinstance(pr_number, int) and repo_full_name):
         return None
-    return repo_full_name, pr_number, commenter, body
+    return repo_full_name, pr_number, commenter, body, comment_id
 
 
 def _post_comment(gh: Github, repo_full_name: str, pr_number: int, body: str) -> None:
@@ -189,6 +196,48 @@ def _post_comment(gh: Github, repo_full_name: str, pr_number: int, body: str) ->
         issue.create_comment(body)
 
     retry_github_call(_post, retries=3, description=f"comment on #{pr_number}")
+
+
+# Reaction added to the triggering comment once the run is done, on top of the
+# poller's "eyes" claim marker, so the comment shows the verdict at a glance:
+# "+1" when a fix was pushed, "-1" for any non-push outcome (refused, handoff,
+# or internal failure). The eyes marker is left in place - it is the poller's
+# idempotency claim, not a progress indicator.
+_OUTCOME_REACTIONS: dict[OutcomeKind, str] = {
+    OutcomeKind.PUSHED: "+1",
+    OutcomeKind.REFUSED: "-1",
+    OutcomeKind.HANDOFF: "-1",
+    OutcomeKind.FAILED: "-1",
+}
+
+
+def _react_outcome(gh: Github, repo_full_name: str, comment_id: int, kind: OutcomeKind) -> None:
+    """Add the outcome reaction to the triggering comment (best-effort).
+
+    Skips silently when no comment id was supplied (e.g. a manual dispatch that
+    did not forward one). The reaction is issued through the requester against
+    the comment's reactions endpoint - the same path ``comment_poll`` uses for
+    the claim marker - because PyGithub's ``Repository`` exposes no getter for a
+    single issue comment. A failed reaction never masks the outcome: the comment
+    and exit code are the authoritative report.
+    """
+    if not comment_id:
+        return
+
+    def _react() -> None:
+        # A new OutcomeKind without a mapping falls back to "-1": any outcome we
+        # did not explicitly mark as pushed is a non-success. The whole body -
+        # including the repo/requester lookup - is inside the guarded call so a
+        # transient API error here can never escape into the run's exit code.
+        content = _OUTCOME_REACTIONS.get(kind, "-1")
+        url = f"/repos/{repo_full_name}/issues/comments/{comment_id}/reactions"
+        requester = gh.get_repo(repo_full_name)._requester  # noqa: SLF001 - matches workflow_artifacts
+        requester.requestJsonAndCheck("POST", url, input={"content": content})
+
+    try:
+        retry_github_call(_react, retries=2, description=f"react to comment {comment_id}")
+    except Exception:  # noqa: BLE001 - the reaction is a nicety, not the report
+        logger.exception("Failed to react to comment %s", comment_id)
 
 
 if __name__ == "__main__":

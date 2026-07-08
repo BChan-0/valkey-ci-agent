@@ -29,6 +29,10 @@ on:
         description: "Requesting user (honored only when dispatched by the trusted poller App)"
         required: false
         type: string
+      comment_id:
+        description: "Triggering comment id, reacted to with the run outcome"
+        required: false
+        type: string
 
 permissions: {}
 
@@ -122,6 +126,7 @@ jobs:
           # whichever principal is chosen regardless.
           CI_FIX_COMMENTER: ${{ (github.actor == 'valkeyrie-ops[bot]' && inputs.commenter) || github.actor }}
           CI_FIX_HINT: ${{ inputs.hint || '' }}
+          CI_FIX_COMMENT_ID: ${{ inputs.comment_id || '' }}
         run: |
           set -euo pipefail
           if [[ ! "${CI_FIX_REPO}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then

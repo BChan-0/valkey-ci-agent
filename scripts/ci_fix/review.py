@@ -622,7 +622,7 @@ def _needs_shell_grouping(command: str) -> bool:
 
 def _shell_group(command: str) -> str:
     """Group a shell command so its whole exit status participates in ``&&``."""
-    return "{\n" + command.strip() + "\n}"
+    return "(\n" + command.strip() + "\n)"
 
 
 # Trivial shell builtins that carry no build or test signal on their own.

@@ -75,11 +75,12 @@ def test_dispatches_valid_command():
     n, dispatch = _run(gh)
     assert n == 1
     dispatch.assert_called_once()
-    repo, pr, command, commenter = dispatch.call_args.args
+    repo, pr, command, commenter, comment_id = dispatch.call_args.args
     assert repo == "valkey-io/valkey"
     assert pr == 42
     assert command.run_id == 27559908167
     assert commenter == "alice"
+    assert comment_id == 1
 
 
 def test_skips_non_command():
@@ -235,7 +236,7 @@ def test_one_bad_comment_does_not_abort_the_tick():
     n, dispatch = _run(gh, claim=claim)
     assert n == 1
     assert dispatch.call_count == 1
-    _repo, pr, _cmd, _commenter = dispatch.call_args.args
+    _repo, pr, _cmd, _commenter, _comment_id = dispatch.call_args.args
     assert pr == 42
 
 

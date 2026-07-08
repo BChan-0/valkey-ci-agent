@@ -9,8 +9,10 @@ Every command is hardened: it runs with a no-secret environment (process
 basics and CA certs only, never a GitHub token or AWS credentials, since it is
 untrusted PR code), in a working directory locked inside the cloned repo, under
 a timeout, with its output capped to the tail (where the failure summary lives).
-Commands run through ``/bin/sh -c`` because real build+test recipes chain with
-``&&``, ``;``, and pipes.
+Commands run through Bash when available because GitHub-hosted Linux/macOS
+jobs default to Bash and real build+test recipes may use Bash conditionals;
+otherwise they fall back to ``/bin/sh -c``. Docker verification still uses the
+container's ``/bin/sh`` because minimal images may not include Bash.
 """
 
 from __future__ import annotations
@@ -19,6 +21,7 @@ import logging
 import os
 import select
 import shlex
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -54,7 +57,7 @@ def run_verification_command(
     """Run ``command`` in ``repo_dir`` and report its real verdict.
 
     ``command`` is the AI-proposed targeted build+verify recipe (commonly
-    chained with ``&&``), run via ``/bin/sh -c`` with a scrubbed environment,
+    chained with ``&&``), run via the local verification shell with a scrubbed environment,
     locked to a working directory inside the clone. ``passed`` is
     ``exit_code == 0`` - the subprocess decides, not the caller and not the AI.
 
@@ -168,8 +171,9 @@ def _run_capped(
     Returns ``(ran, exit_code, output, timed_out)``. Raises ``OSError`` if the
     process cannot start.
     """
+    shell = _verification_shell()
     proc = subprocess.Popen(
-        ["/bin/sh", "-c", command],
+        [*shell, command],
         cwd=str(cwd),
         env=env,
         stdout=subprocess.PIPE,
@@ -206,3 +210,11 @@ def _run_capped(
             proc.wait()
     return True, proc.returncode if proc.returncode is not None else -1, \
         buf.decode("utf-8", errors="replace"), timed_out
+
+
+def _verification_shell() -> tuple[str, ...]:
+    """Return the local shell used for non-container verification commands."""
+    bash = shutil.which("bash")
+    if bash:
+        return (bash, "-c")
+    return ("/bin/sh", "-c")

@@ -13,21 +13,21 @@ _RUN_URL = "https://github.com/valkey-io/valkey/actions/runs/27559908167"
 
 
 def _event(*, action="created", is_pr=True, body=f"@valkeyrie-bot fix {_RUN_URL}",
-           login="alice", number=3988, repo="valkey-io/valkey"):
+           login="alice", number=3988, repo="valkey-io/valkey", comment_id=7):
     issue: dict = {"number": number}
     if is_pr:
         issue["pull_request"] = {"url": "..."}
     return {
         "action": action,
         "issue": issue,
-        "comment": {"body": body, "user": {"login": login}},
+        "comment": {"id": comment_id, "body": body, "user": {"login": login}},
         "repository": {"full_name": repo},
     }
 
 
 def test_parse_event_happy():
     parsed = _parse_event(_event())
-    assert parsed == ("valkey-io/valkey", 3988, "alice", f"@valkeyrie-bot fix {_RUN_URL}")
+    assert parsed == ("valkey-io/valkey", 3988, "alice", f"@valkeyrie-bot fix {_RUN_URL}", 7)
 
 
 def test_parse_event_ignores_non_pr():
@@ -156,3 +156,58 @@ def test_verify_runs_env_parsing(monkeypatch):
 
     monkeypatch.setenv("CI_FIX_VERIFY_RUNS", "not-a-number")
     assert _verify_runs() == DEFAULT_VERIFY_RUNS
+
+
+def _reaction_gh():
+    requester = MagicMock()
+    gh = MagicMock()
+    gh.get_repo.return_value._requester = requester
+    return gh, requester
+
+
+def test_react_outcome_pushed_adds_plus_one():
+    from scripts.ci_fix.main import _react_outcome
+
+    gh, requester = _reaction_gh()
+    _react_outcome(gh, "valkey-io/valkey", 55, OutcomeKind.PUSHED)
+    requester.requestJsonAndCheck.assert_called_once_with(
+        "POST", "/repos/valkey-io/valkey/issues/comments/55/reactions",
+        input={"content": "+1"},
+    )
+
+
+def test_react_outcome_refused_adds_minus_one():
+    from scripts.ci_fix.main import _react_outcome
+
+    gh, requester = _reaction_gh()
+    _react_outcome(gh, "valkey-io/valkey", 55, OutcomeKind.REFUSED)
+    requester.requestJsonAndCheck.assert_called_once_with(
+        "POST", "/repos/valkey-io/valkey/issues/comments/55/reactions",
+        input={"content": "-1"},
+    )
+
+
+def test_react_outcome_no_comment_id_is_noop():
+    from scripts.ci_fix.main import _react_outcome
+
+    gh, requester = _reaction_gh()
+    _react_outcome(gh, "valkey-io/valkey", 0, OutcomeKind.PUSHED)
+    requester.requestJsonAndCheck.assert_not_called()
+
+
+def test_react_outcome_swallows_failure():
+    """A failed reaction must never raise: the comment is the real report."""
+    from scripts.ci_fix.main import _react_outcome
+
+    gh, requester = _reaction_gh()
+    requester.requestJsonAndCheck.side_effect = RuntimeError("boom")
+    _react_outcome(gh, "valkey-io/valkey", 55, OutcomeKind.PUSHED)
+
+
+def test_react_outcome_swallows_repo_lookup_failure():
+    """A transient failure in the repo lookup must not escape either."""
+    from scripts.ci_fix.main import _react_outcome
+
+    gh = MagicMock()
+    gh.get_repo.side_effect = RuntimeError("transient API error")
+    _react_outcome(gh, "valkey-io/valkey", 55, OutcomeKind.PUSHED)

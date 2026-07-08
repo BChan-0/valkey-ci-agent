@@ -48,8 +48,8 @@ _DEFAULT_LOOKBACK_MINUTES = 180
 # below an hour so a job does not keep sleeping past token expiry.
 _MAX_LOOP_SECONDS = 55 * 60
 
-DispatchFn = Callable[[str, int, ParsedCommand, str], None]
-"""(repo_full_name, pr_number, command, commenter) -> None."""
+DispatchFn = Callable[[str, int, ParsedCommand, str, int], None]
+"""(repo_full_name, pr_number, command, commenter, comment_id) -> None."""
 
 
 def poll_once(
@@ -124,7 +124,7 @@ def _process_comment(
     if not claim(comment):
         # Another concurrent tick won the claim, or the claim call failed.
         return False
-    dispatch(target_repo, pr_number, command, commenter)
+    dispatch(target_repo, pr_number, command, commenter, comment.id)
     logger.info("Dispatched ci-fix for %s#%d (commenter %s)", target_repo, pr_number, commenter)
     return True
 
@@ -227,7 +227,10 @@ def dispatch_ci_fix(
 ) -> DispatchFn:
     """Build a dispatcher that triggers the ci-fix workflow on the agent repo."""
 
-    def _dispatch(repo_full_name: str, pr_number: int, command: ParsedCommand, commenter: str) -> None:
+    def _dispatch(
+        repo_full_name: str, pr_number: int, command: ParsedCommand, commenter: str,
+        comment_id: int = 0,
+    ) -> None:
         run_url = (
             f"https://github.com/{command.run_owner}/{command.run_repo}"
             f"/actions/runs/{command.run_id}"
@@ -239,6 +242,8 @@ def dispatch_ci_fix(
             "hint": command.hint,
             "commenter": commenter,
         }
+        if comment_id:
+            inputs["comment_id"] = str(comment_id)
         wf = gh.get_repo(agent_repo).get_workflow(workflow)
         retry_github_call(
             lambda: wf.create_dispatch(ref, inputs),

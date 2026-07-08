@@ -107,6 +107,15 @@ def test_chained_command_runs_via_shell(tmp_path):
     assert "ok" in result.output_tail
 
 
+def test_local_verification_supports_bash_conditionals(tmp_path):
+    result = run_verification_command(
+        str(tmp_path),
+        'if [[ -n "x" ]]; then echo bash-ok; else exit 1; fi',
+    )
+    assert result.passed is True
+    assert "bash-ok" in result.output_tail
+
+
 def test_docker_image_wraps_command(tmp_path, monkeypatch):
     """When a container image is given, the command runs via docker run."""
     from scripts.ci_fix import runner as runner_mod
