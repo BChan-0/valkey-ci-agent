@@ -78,93 +78,10 @@ The sweep branch is always kept green: a candidate is only kept if the whole bra
 
 See [`examples/repos.yml`](examples/repos.yml) for a multi-module example.
 
-### Installation
+### Setup and Usage
 
-#### Prerequisites
-
-- A GitHub App with:
-  - `contents:write` on each repo in the registry (for pushing branches)
-  - `pull-requests:write` on each repo (for opening PRs)
-  - `issues:write` on each repo (for backport status comments)
-  - `organization_projects:write` on the org (for querying and updating project boards)
-- An AWS account with Bedrock access to `us.anthropic.claude-opus-4-8`
-- An OIDC trust between GitHub Actions and your AWS account
-
-#### Step 1: Configure secrets and variables
-
-On `valkey-io/valkey-ci-agent`:
-
-| Type | Name | Value |
-|------|------|-------|
-| Secret | `AWS_ROLE_ARN` | OIDC role ARN with Bedrock `InvokeModel` permission |
-| Secret | `VALKEYRIE_BOT_APP_ID` | Valkeyrie GitHub App ID |
-| Secret | `VALKEYRIE_BOT_PRIVATE_KEY` | Valkeyrie GitHub App private key |
-| Variable | `AWS_REGION` | e.g., `us-east-1` |
-
-The workflows mint a short-lived installation token with `actions/create-github-app-token` and use that token for registry repository reads, branch pushes, PR creation, status comments, and project-board queries.
-
-#### Step 2: Edit `repos.yml`
-
-Add your repo(s) to the registry. No per-repo config files are needed - everything lives in `repos.yml`.
-
-#### Step 3: Enable the workflows
-
-The scheduled sweep runs automatically.
-
-### Usage
-
-#### Daily sweep (automatic)
-
-Runs daily at 09:00 UTC via cron. The preflight job reads `repos.yml` and fans out one job per `{repo, branch}`. Each produces one PR with up to five successfully applied backports for that branch; skipped or unresolved candidates do not count against that cap.
-
-#### Manual backport (on-demand)
-
-```bash
-gh workflow run manual-backport.yml \
-  --repo valkey-io/valkey-ci-agent \
-  --field pr_url=https://github.com/valkey-io/valkey/pull/3601 \
-  --field target_branch=9.0
-```
-
-Creates one PR named `[Backport 9.0] <original title>`.
-
-#### Mark merged backports done
-
-A scheduled poller reconciles each project board against branch reality and
-flips items from `To be backported` to `Done` once the backport actually lands.
-It starts hourly via `backport-mark-done-poll.yml`, reconciles immediately, and
-reconciles once more 30 minutes later inside the same runner. It covers every
-repo and branch in `repos.yml`. Because it reconciles the whole board on every
-run, it is self-healing: it picks up backports applied by the sweep, by an
-earlier run, or by a manual cherry-pick, without depending on a merge event.
-
-An item is marked `Done` only when the source PR's commit is genuinely on the
-target branch - verified by the cherry-pick's trailing `(#N)` subject, or by the
-PR appearing in a sweep commit's `## Applied` table. A backport PR body that
-merely claims a PR was applied can never mark it `Done` on its own.
-
-Run it manually for a single repo (omit `--target-branch` to reconcile every
-configured branch), and add `--dry-run` to report what would change without
-mutating the board:
-
-```bash
-python -m scripts.backport.mark_done \
-  --repo valkey-io/valkey \
-  --target-branch 9.1 \
-  --target-token "$TOKEN" \
-  --dry-run
-```
-
-#### Filtering the sweep
-
-To run only for a specific repo or branch:
-
-```bash
-gh workflow run backport-sweep.yml \
-  --repo valkey-io/valkey-ci-agent \
-  --field repo=valkey-io/valkey \
-  --field project_number=14
-```
+See [DEVELOPMENT.md](DEVELOPMENT.md) for local setup, local validation commands,
+required GitHub Actions secrets, and manual workflow dispatch examples.
 
 ## Fuzzer Monitor Workflow
 
@@ -360,5 +277,5 @@ verify step. macOS verification runs once on its dedicated runner.
 
 ## Documentation
 
-- [docs/architecture.md](docs/architecture.md) - full system design including planned workflows
-- [CONTRIBUTING.md](CONTRIBUTING.md) - development setup and code structure
+- [docs/architecture.md](docs/architecture.md) — full system design including planned workflows
+- [DEVELOPMENT.md](DEVELOPMENT.md) — local setup, testing, and GitHub Actions usage
