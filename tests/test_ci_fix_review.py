@@ -147,6 +147,79 @@ def test_genuine_test_failure_does_not_hand_off():
     assert "check still failing" in result.detail
 
 
+def test_generated_diff_failure_is_verified_after_temporary_commit(tmp_path):
+    """A generated-file cleanliness check fails until the generated diff is in
+    HEAD; the loop should capture that diff, prove convergence, and approve the
+    full patch instead of retrying source edits."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def git(*args: str) -> str:
+        return subprocess.check_output(["git", *args], cwd=repo, text=True)
+
+    git("init")
+    git("config", "user.name", "Test")
+    git("config", "user.email", "test@example.com")
+    (repo / "source.c").write_text("old source\n")
+    (repo / "generated.h").write_text("old generated\n")
+    git("add", ".")
+    git("commit", "-m", "initial")
+
+    proposal = FixProposal(
+        path=FixPath.AUTHOR,
+        failing_check="validate generated files up to date",
+        root_cause="generated.h is stale after source.c changed",
+        reasoning="regenerate generated.h",
+        confidence=0.9,
+        build_command="make",
+        verify_command="regen && git diff --exit-code",
+    )
+    calls: list[str] = []
+
+    def apply_source_fix(repo_dir: str, _proposal: FixProposal, *, feedback: str = ""):
+        del feedback
+        assert repo_dir == str(repo)
+        (repo / "source.c").write_text("new source\n")
+        return True, ("source.c",)
+
+    def run_command(_repo_dir: str, command: str, **_kwargs) -> RunResult:
+        calls.append(command)
+        if command == "make && regen && git diff --exit-code":
+            return RunResult(True, False, 1, command, "diff --git a/generated.h b/generated.h")
+        if command == "make":
+            return _passed()
+        if command == "regen && git diff --exit-code":
+            if (repo / "generated.h").read_text() != "new generated\n":
+                (repo / "generated.h").write_text("new generated\n")
+                return RunResult(True, False, 1, command, "diff --git a/generated.h b/generated.h")
+            return _passed()
+        raise AssertionError(f"unexpected command: {command}")
+
+    result = run_fix_loop(
+        str(repo),
+        proposal,
+        verify_runs=2,
+        max_attempts=1,
+        apply_func=apply_source_fix,
+        run_command=run_command,
+        review_func=lambda *a, **k: _approved(),
+    )
+
+    assert result.success is True
+    assert result.changed_paths == ("generated.h", "source.c")
+    assert "generated files converged" in result.detail
+    assert (repo / "generated.h").read_text() == "new generated\n"
+    assert git("diff", "--name-only", "HEAD").splitlines() == ["generated.h", "source.c"]
+    assert calls == [
+        "make && regen && git diff --exit-code",
+        "make",
+        "regen && git diff --exit-code",
+        "make",
+        "regen && git diff --exit-code",
+        "regen && git diff --exit-code",
+    ]
+
+
 def test_rejected_review_is_not_handed_off():
     """When verification cannot run but the skeptic rejects the patch, it must
     not be handed off: handoff is gated on review approval, not patch presence."""
