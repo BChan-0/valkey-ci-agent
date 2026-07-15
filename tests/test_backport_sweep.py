@@ -1874,6 +1874,57 @@ def test_adapt_target_missing_tests_stages_branch_native_test(tmp_path):
     assert staged == ["src/networking.c", "tests/unit/networking.tcl"]
 
 
+def test_adapt_target_missing_tests_allows_existing_c_unit_test(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "config", "user.name", "Local Committer")
+    _git(repo, "config", "user.email", "committer@local.invalid")
+    _git(repo, "config", "commit.gpgsign", "false")
+    (repo / "src" / "unit").mkdir(parents=True)
+    (repo / "src" / "networking.c").write_text("int fix = 0;\n", encoding="utf-8")
+    (repo / "src" / "unit" / "test_quicklist.c").write_text(
+        "int quicklist_test(void) { return 0; }\n", encoding="utf-8"
+    )
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "base")
+    (repo / "src" / "networking.c").write_text("int fix = 1;\n", encoding="utf-8")
+    _git(repo, "add", "src/networking.c")
+
+    def fake_run_agent(profile, _prompt, **kwargs):
+        assert profile == "test_adaptation_edit_only"
+        sandbox = Path(kwargs["cwd"])
+        (sandbox / "src" / "unit" / "test_quicklist.c").write_text(
+            "int quicklist_test(void) { return 0; }\n/* ASAN skip coverage */\n",
+            encoding="utf-8",
+        )
+        result = MagicMock()
+        result.returncode = 0
+        result.stdout = '{"type":"result","result":"ported"}\n'
+        result.stderr = ""
+        return result
+
+    result = adapt_target_missing_tests_with_claude(
+        str(repo),
+        ProjectBackportCandidate(
+            source_pr_number=3263,
+            source_pr_title="Fix OOM aborts in large-memory ASAN tests on GitHub Actions",
+            source_pr_url="https://github.com/valkey-io/valkey/pull/3263",
+            target_branch="8.1",
+            merge_commit_sha="c9ce3e0",
+        ),
+        {"src/unit/test_quicklist.cpp": "TEST(...)\n"},
+        language="c",
+        run_agent_func=fake_run_agent,
+    )
+
+    assert result.fatal is False
+    assert result.adapted_paths == ["src/unit/test_quicklist.c"]
+    assert result.summary == "ported target-missing test coverage to: src/unit/test_quicklist.c"
+    staged = _git(repo, "diff", "--cached", "--name-only").stdout.splitlines()
+    assert staged == ["src/networking.c", "src/unit/test_quicklist.c"]
+
+
 def test_missing_test_context_uses_diff_for_modify_delete_conflict(tmp_path):
     calls: list[list[str]] = []
 
@@ -2167,6 +2218,7 @@ def test_is_test_path_rejects_metadata_and_build_files():
     # Recognized test source is still accepted.
     assert is_test_path("tests/unit/type/list.tcl")
     assert is_test_path("tests/integration/repl.tcl")
+    assert is_test_path("src/unit/test_quicklist.c")
     assert is_test_path("src/unit/test_networking.cpp")
     assert not is_test_path("foo/test_helper.py")
     assert not is_test_path("src/test_helper.c")

@@ -403,7 +403,7 @@ def is_test_path(path: str) -> bool:
     parts = [part.lower() for part in normalized.split("/") if part]
     name = parts[-1] if parts else ""
     if len(parts) >= 3 and parts[0] == "src" and parts[1] == "unit":
-        return name.startswith("test_") and name.endswith(".cpp")
+        return name.startswith("test_") and name.endswith((".c", ".cc", ".cpp"))
     return len(parts) >= 2 and parts[0] == "tests" and name.endswith(".tcl")
 
 
