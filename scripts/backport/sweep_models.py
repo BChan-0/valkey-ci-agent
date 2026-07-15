@@ -54,6 +54,9 @@ DETAIL_ALREADY_ON_SWEEP_BRANCH = "already on backport branch"
 # preserve the signal across runs.
 DETAIL_RESOLVED_BY_AI = "conflicts resolved by Claude Code"
 
+DETAIL_DROPPED_TARGET_MISSING_TEST_PREFIX = "dropped target-missing test file(s):"
+DETAIL_PORTED_TARGET_MISSING_TEST_PREFIX = "ported target-missing test coverage to:"
+
 # Detail recorded for a candidate whose cherry-pick (or post-resolution result)
 # contributes no net change to the target branch, e.g. the fix targets code
 # that does not exist on this release branch. Reporting surfaces these as

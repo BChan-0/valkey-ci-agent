@@ -18,6 +18,7 @@ from scripts.ai.claude_code import (
 
 AgentProfileName = Literal[
     "conflict_resolve_edit_only",
+    "test_adaptation_edit_only",
     "validation_repair_edit_only",
     "fuzzer_analysis_readonly",
     "ci_fix_diagnose_readonly",
@@ -66,6 +67,16 @@ AGENT_PROFILES: dict[AgentProfileName, AgentProfile] = {
         writes_allowed=True,
         output_schema="edited-files",
         disallowed_tools="Write",
+    ),
+    "test_adaptation_edit_only": AgentProfile(
+        name="test_adaptation_edit_only",
+        allowed_tools="Read,Edit,MultiEdit,Grep,Glob",
+        timeout=1800,
+        effort="max",
+        max_turns=160,
+        writes_allowed=True,
+        output_schema="edited-files",
+        disallowed_tools="Bash,Write",
     ),
     "validation_repair_edit_only": AgentProfile(
         name="validation_repair_edit_only",
@@ -163,21 +174,12 @@ def _write_evidence(
         target_dir.mkdir(parents=True, exist_ok=True)
         evidence = {
             "profile": asdict(profile),
-            "result": {
-                key: value
-                for key, value in asdict(result).items()
-                if key not in {"stdout", "stderr"}
-            },
-            "stdout_sha256": hashlib.sha256(
-                result.stdout.encode("utf-8")
-            ).hexdigest(),
-            "stderr_sha256": hashlib.sha256(
-                result.stderr.encode("utf-8")
-            ).hexdigest(),
+            "result": {key: value for key, value in asdict(result).items() if key not in {"stdout", "stderr"}},
+            "stdout_sha256": hashlib.sha256(result.stdout.encode("utf-8")).hexdigest(),
+            "stderr_sha256": hashlib.sha256(result.stderr.encode("utf-8")).hexdigest(),
         }
         path = target_dir / (
-            f"{result.started_at.replace(':', '').replace('+', 'Z')}-"
-            f"{result.profile}-{result.prompt_sha256[:12]}.json"
+            f"{result.started_at.replace(':', '').replace('+', 'Z')}-{result.profile}-{result.prompt_sha256[:12]}.json"
         )
         path.write_text(json.dumps(evidence, indent=2, sort_keys=True), encoding="utf-8")
     except OSError:

@@ -62,6 +62,13 @@ def test_validation_repair_profile_denies_shell_and_write_tools() -> None:
     assert profile.disallowed_tools == "Bash,Write"
 
 
+def test_test_adaptation_profile_denies_shell_and_write_tools() -> None:
+    profile = agent_runtime.AGENT_PROFILES["test_adaptation_edit_only"]
+
+    assert profile.allowed_tools == "Read,Edit,MultiEdit,Grep,Glob"
+    assert profile.disallowed_tools == "Bash,Write"
+
+
 def test_fuzzer_profile_is_readonly() -> None:
     profile = agent_runtime.AGENT_PROFILES["fuzzer_analysis_readonly"]
     assert profile.writes_allowed is False
