@@ -1,6 +1,6 @@
 # valkey-ci-agent
 
-An AI-powered CI automation agent for the Valkey project. Uses Claude Code (Anthropic Claude Opus via Bedrock) to perform tasks that require code understanding - conflict resolution, code review, failure analysis, and more.
+An AI-powered CI automation agent for the Valkey project. Uses Claude Code (Anthropic Claude Fable 5 via Bedrock) to perform tasks that require code understanding - conflict resolution, code review, failure analysis, and more.
 
 ## Architecture
 

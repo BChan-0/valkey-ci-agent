@@ -14,9 +14,11 @@ from scripts.common.proc import filter_env
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_CLAUDE_MODEL = "opus"
+_DEFAULT_CLAUDE_MODEL = "fable"
+_DEFAULT_BEDROCK_FABLE_MODEL = "us.anthropic.claude-fable-5"
 _DEFAULT_BEDROCK_OPUS_MODEL = "us.anthropic.claude-opus-4-8"
 _CLAUDE_MODEL_ENV = "CI_AGENT_CLAUDE_MODEL"
+_BEDROCK_FABLE_MODEL_ENV = "CI_AGENT_CLAUDE_BEDROCK_FABLE_MODEL"
 _BEDROCK_OPUS_MODEL_ENV = "CI_AGENT_CLAUDE_BEDROCK_OPUS_MODEL"
 _DEFAULT_TIMEOUT_SECONDS = 60 * 60
 _PASSTHROUGH_ENV_VARS = {
@@ -70,6 +72,7 @@ def run_claude_code(
     # it can capture the resolved value in the audit record - the two
     # calls are idempotent by design (override wins each time).
     resolved_model = _resolve_claude_model(model)
+    env["ANTHROPIC_DEFAULT_FABLE_MODEL"] = _resolve_bedrock_fable_model()
     env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = _resolve_bedrock_opus_model()
     if "AWS_REGION" not in env and "AWS_DEFAULT_REGION" not in env:
         env["AWS_REGION"] = "us-east-1"
@@ -169,6 +172,7 @@ def _build_claude_env(env_allowlist: tuple[str, ...] | None = None) -> dict[str,
     allowed = set(env_allowlist or DEFAULT_CLAUDE_ENV_ALLOWLIST)
     env = filter_env(tuple(allowed))
     env["CLAUDE_CODE_USE_BEDROCK"] = "1"
+    env["ANTHROPIC_DEFAULT_FABLE_MODEL"] = _resolve_bedrock_fable_model()
     env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = _resolve_bedrock_opus_model()
     return env
 
@@ -181,9 +185,20 @@ def _resolve_claude_model(model: str | None) -> str | None:
     return model or _DEFAULT_CLAUDE_MODEL
 
 
+def _resolve_bedrock_fable_model() -> str:
+    """Resolve the Bedrock Fable model/inference profile used by Claude Code."""
+    return (
+        os.environ.get(_BEDROCK_FABLE_MODEL_ENV, "").strip()
+        or _DEFAULT_BEDROCK_FABLE_MODEL
+    )
+
+
 def _resolve_bedrock_opus_model() -> str:
     """Resolve the Bedrock Opus model/inference profile used by Claude Code."""
-    return os.environ.get(_BEDROCK_OPUS_MODEL_ENV, "").strip() or _DEFAULT_BEDROCK_OPUS_MODEL
+    return (
+        os.environ.get(_BEDROCK_OPUS_MODEL_ENV, "").strip()
+        or _DEFAULT_BEDROCK_OPUS_MODEL
+    )
 
 
 def _default_disallowed_tools(allowed_tools: str) -> str:

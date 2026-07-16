@@ -16,10 +16,11 @@ infrastructure — see [docs/architecture.md](docs/architecture.md).
 - A GitHub token for local API-backed runs.
 - AWS credentials with Bedrock access when running workflows that invoke Claude
   Code through Bedrock.
-- Claude Code CLI when running AI-backed backport flows locally:
+- Claude Code CLI 2.1.170 or later when running AI-backed flows locally. The
+  workflows pin 2.1.175 because the default model is Fable 5:
 
 ```bash
-npm install -g @anthropic-ai/claude-code
+npm install -g @anthropic-ai/claude-code@2.1.175
 ```
 
 ## Local Environment
@@ -158,6 +159,12 @@ Operational workflows require these values in the `valkey-ci-agent` repository:
 | Secret | `VALKEYRIE_BOT_APP_ID` | Valkeyrie GitHub App ID |
 | Secret | `VALKEYRIE_BOT_PRIVATE_KEY` | Valkeyrie GitHub App private key |
 | Variable | `AWS_REGION` | AWS region, for example `us-east-1` |
+
+Claude Code defaults to Fable 5 through the `us.anthropic.claude-fable-5`
+Bedrock inference profile. The AWS account must have access to that profile and
+must use Bedrock `provider_data_share` data retention; Fable 5 is not available
+under zero data retention. Set `CI_AGENT_CLAUDE_MODEL=opus` to temporarily fall
+back to the pinned Opus 4.8 profile.
 
 The workflows mint a short-lived GitHub App installation token for repository
 reads, branch pushes, PR creation, status comments, and project-board queries.
