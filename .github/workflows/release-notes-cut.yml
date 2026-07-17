@@ -167,9 +167,8 @@ jobs:
         env:
           # Exactly one token step ran; the others yield "". First non-empty wins.
           RELEASE_NOTES_GITHUB_TOKEN: ${{ steps.generate-token.outputs.token || steps.generate-token-advisories.outputs.token || steps.generate-token-fork.outputs.token }}
-          # Target the valkey repo owned by whoever runs this workflow:
-          # valkey-io/valkey upstream, <fork-owner>/valkey on a fork.
-          RELEASE_NOTES_REPO: ${{ github.repository_owner }}/valkey
+          # Always target upstream valkey for testing. Dry-run only reads.
+          RELEASE_NOTES_REPO: valkey-io/valkey
           RELEASE_NOTES_VERSION: ${{ inputs.version }}
           RELEASE_NOTES_STAGE: ${{ inputs.stage }}
           RELEASE_NOTES_URGENCY: ${{ inputs.urgency }}
