@@ -15,6 +15,7 @@ import subprocess
 from dataclasses import dataclass
 from typing import Any, Optional, Sequence
 
+from scripts.common.git_auth import github_https_url
 from scripts.common.proc import BOT_EMAIL, BOT_NAME, git_output, run_git
 from scripts.release_notes import contributors as gc
 from scripts.release_notes import pipeline as pipeline_mod
@@ -133,6 +134,27 @@ def _remote_branch_exists(repo_dir: str, branch: str) -> bool:
     """True if ``refs/heads/<branch>`` exists on ``origin``."""
     out = git_output(repo_dir, "ls-remote", "--heads", "origin", f"refs/heads/{branch}")
     return bool(out.strip())
+
+
+def _assert_origin_url(repo_dir: str, repo_full_name: str) -> None:
+    """Verify the clone's origin URL matches the expected repository.
+
+    Defense-in-depth against a tampered remote (the primary defense is --safe-mode
+    on Claude subprocess invocations, which prevents hooks from modifying the clone).
+    Skips the check for non-GitHub URLs (local test fixtures).
+    """
+    try:
+        actual = git_output(repo_dir, "remote", "get-url", "origin").strip()
+    except subprocess.CalledProcessError:
+        return  # no origin remote (local test fixture)
+    if not actual.startswith("https://github.com/"):
+        return  # local path or non-GitHub remote (test fixture)
+    expected = github_https_url(repo_full_name)
+    if actual != expected:
+        raise RuntimeError(
+            f"Clone origin URL was modified (expected {expected!r}, got {actual!r}). "
+            "Aborting to prevent credential disclosure to a tampered remote."
+        )
 
 
 def resolve_branch_plan(repo_dir: str, *, version: str, stage: str) -> BranchPlan:
@@ -550,7 +572,13 @@ def cut(
     )
 
     # Discovery range: head is always the M.m branch tip, base from tags.
-    notes_base_ref, notes_tag_glob, notes_head_ref = base_ref, tag_glob, source_ref
+    # Pin the head SHA so discovery, contributors, and worktree all refer to the
+    # same commit. Without pinning, a PR merged during AI generation would enter
+    # the worktree base but be absent from the notes and contributor list.
+    notes_base_ref, notes_tag_glob = base_ref, tag_glob
+    pinned_head_sha = git_output(source_clone_dir, "rev-parse", source_ref).strip()
+    notes_head_ref = pinned_head_sha
+    logger.info("Pinned head for discovery: %s -> %s", source_ref, pinned_head_sha[:12])
 
     if baseline_unanchored and notes_base_ref is None:
         root = _root_commit(source_clone_dir, notes_head_ref)
@@ -577,6 +605,10 @@ def cut(
     #    promoted commit on an agent-namespaced prep branch and PR it into the
     #    release line, so the line only advances when a human merges. The prep
     #    branch starts from origin/<base_ref> so the PR diff is exactly the cut.
+    #    Defense-in-depth: verify origin URL hasn't been tampered with before any
+    #    authenticated fetch/push (the primary defense is --safe-mode on Claude,
+    #    which prevents hooks from modifying the clone).
+    _assert_origin_url(source_clone_dir, repo_full_name)
     run_git(source_clone_dir, "fetch", "origin", plan.base_ref, env=git_env)
     prep_branch = f"{PREP_BRANCH_PREFIX}/{version}-{plan.stage}"
     dest_dir = os.path.join(source_clone_dir, ".release-dest")
@@ -672,6 +704,19 @@ def cut(
 
         _write(dest_notes_path, new_dest_notes)
         _write(os.path.join(dest_dir, VERSION_FILE), new_version)
+
+        # Freshness check: verify the target branch hasn't advanced since we
+        # pinned it for discovery. A new merge during AI generation would be in
+        # the worktree base but absent from the notes and contributor list.
+        run_git(source_clone_dir, "fetch", "--quiet", "origin", plan.target, env=git_env)
+        current_head = git_output(source_clone_dir, "rev-parse", f"origin/{plan.target}").strip()
+        if current_head != pinned_head_sha:
+            raise RuntimeError(
+                f"Target branch {plan.target!r} advanced during generation "
+                f"(pinned {pinned_head_sha[:12]}, now {current_head[:12]}). "
+                "Re-run the cut to include the new commits."
+            )
+
         release_url = _commit_push_release_pr(
             repo, dest_dir, repo_full_name=repo_full_name, plan=plan,
             version=version, prep_branch=prep_branch, notes_meta=notes_meta,
@@ -793,6 +838,23 @@ def _commit_push_release_pr(
     run_git(dest_dir, "commit", "-s", "-m", commit_title(version, plan.stage))
     if not prep_branch.startswith(f"{PREP_BRANCH_PREFIX}/"):
         raise RuntimeError(f"Refusing to push to non-namespaced prep branch: {prep_branch!r}")
+
+    # If an existing PR is open for this prep branch, convert it to draft before
+    # force-pushing. This prevents a window where the PR has new content but
+    # retains its old body and ready-for-merge state (which could auto-merge if
+    # branch protection allows it). The PR is marked ready only after BOTH the
+    # branch push and the body update succeed.
+    hold = bool(_hold_reasons(plan, notes_meta)) and not force_ready
+    title = commit_title(version, plan.stage)
+    body = _build_pr_body(plan, version, notes_meta, force_ready=force_ready)
+    existing = publish_mod.find_existing_pr(
+        repo, base_repo=repo_full_name, push_repo=None, branch=prep_branch,
+        base_branch=plan.target,
+    )
+    if existing is not None and not existing.draft:
+        publish_mod.reconcile_draft(existing, draft=True)
+        logger.info("Converted PR #%s to draft before branch update", existing.number)
+
     # Give --force-with-lease a valid basis. The fresh `git clone --branch <M.m>`
     # never fetched this agent-namespaced prep branch, so its remote-tracking ref is
     # absent and the implicit lease expects "branch absent". A prep branch left by an
@@ -805,16 +867,9 @@ def _commit_push_release_pr(
                 f"+refs/heads/{prep_branch}:refs/remotes/origin/{prep_branch}", env=git_env)
     run_git(dest_dir, "push", "--force-with-lease", "origin", f"HEAD:{prep_branch}", env=git_env)
 
-    # Hold the merge as a draft when the cut raised anything a maintainer should
-    # look at first, unless force_ready overrides. The body leads with a banner
-    # naming the same reasons, so the draft state and the body never disagree.
-    hold = bool(_hold_reasons(plan, notes_meta)) and not force_ready
-    title = commit_title(version, plan.stage)
-    body = _build_pr_body(plan, version, notes_meta, force_ready=force_ready)
-    existing = publish_mod.find_existing_pr(
-        repo, base_repo=repo_full_name, push_repo=None, branch=prep_branch,
-        base_branch=plan.target,
-    )
+    # Now update body and reconcile draft state. If this is a re-cut of an
+    # existing PR, both the content and the metadata are consistent only after
+    # this point.
     return publish_mod.open_or_update_pr(
         repo, base_repo=repo_full_name, push_repo=None, branch=prep_branch,
         base_branch=plan.target, title=title, body=body, existing=existing,
