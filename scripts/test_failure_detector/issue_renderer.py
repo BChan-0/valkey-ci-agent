@@ -1,15 +1,15 @@
 """Render detected test failures into GitHub issue title, body, and comment text.
 
-The rendering is test-failure-specific (test name/file, error trace, the list
-of CI jobs the failure appeared in); the create-or-update machinery lives in
+Supports multiple failure types (assertion, sanitizer, valgrind, timeout,
+exception, startup, memory-leak, unittest) with type-specific titles, labels,
+and fingerprint namespaces. The create-or-update machinery lives in
 :mod:`scripts.common.issue_dedup`.
 
-A test failure's identity is the ``test_name`` + ``test_file`` pair, which is
-the dedup fingerprint. Across recurrences we accumulate the set of failing
-environments (CI jobs) into the issue body; because the dedup publisher's
-``render`` callback can't see the previously published body, that merge is done
-via the publisher's ``body_transform`` hook (see
-:meth:`_FailureRenderer.merge_environments`).
+For failures WITH a test_name (assertions, timeouts, gtest), the identity is
+the (type, test_name, test_file) triple. For failures WITHOUT a test_name
+(sanitizer/valgrind/startup), the identity is (type, normalized_error), so the
+same underlying bug produces one issue regardless of which test file triggered
+the detection.
 """
 
 from __future__ import annotations
@@ -19,69 +19,108 @@ from datetime import datetime, timezone
 
 from scripts.common.incidents import compute_fingerprint
 from scripts.common.issue_dedup import IssueContent
-from scripts.test_failure_detector.parse_failures import UniqueFailure
+from scripts.test_failure_detector.parse_failures import (
+    FailureType,
+    UniqueFailure,
+    normalize_error_identity,
+)
 
 MARKER_NAMESPACE = "valkey-ci-agent:test-failure"
 
 LABEL_NAME = "test-failure"
 
+# Type-specific marker namespaces for fingerprinting and issue search.
+_TYPE_NAMESPACE: dict[FailureType, str] = {
+    FailureType.ASSERTION: "valkey-ci-agent:test-failure",
+    FailureType.SANITIZER: "valkey-ci-agent:sanitizer-error",
+    FailureType.VALGRIND: "valkey-ci-agent:valgrind-error",
+    FailureType.TIMEOUT: "valkey-ci-agent:test-timeout",
+    FailureType.STARTUP: "valkey-ci-agent:startup-failure",
+    FailureType.EXCEPTION: "valkey-ci-agent:test-exception",
+    FailureType.MEMORY_LEAK: "valkey-ci-agent:memory-leak",
+    FailureType.UNITTEST: "valkey-ci-agent:unittest-failure",
+}
+
+# Issue label per failure type.
+_TYPE_LABEL: dict[FailureType, str] = {
+    FailureType.ASSERTION: "test-failure",
+    FailureType.SANITIZER: "sanitizer-error",
+    FailureType.VALGRIND: "valgrind-error",
+    FailureType.TIMEOUT: "test-timeout",
+    FailureType.STARTUP: "startup-failure",
+    FailureType.EXCEPTION: "test-exception",
+    FailureType.MEMORY_LEAK: "memory-leak",
+    FailureType.UNITTEST: "unittest-failure",
+}
+
+# Title prefix per failure type.
+_TYPE_TITLE_PREFIX: dict[FailureType, str] = {
+    FailureType.ASSERTION: "[TEST-FAILURE]",
+    FailureType.SANITIZER: "[SANITIZER]",
+    FailureType.VALGRIND: "[VALGRIND]",
+    FailureType.TIMEOUT: "[TIMEOUT]",
+    FailureType.STARTUP: "[STARTUP-FAILURE]",
+    FailureType.EXCEPTION: "[EXCEPTION]",
+    FailureType.MEMORY_LEAK: "[MEMORY-LEAK]",
+    FailureType.UNITTEST: "[UNITTEST]",
+}
+
+
+def marker_namespace_for(failure: UniqueFailure) -> str:
+    """Return the marker namespace for a failure's type."""
+    return _TYPE_NAMESPACE.get(failure.failure_type, MARKER_NAMESPACE)
+
+
+def label_for(failure: UniqueFailure) -> str:
+    """Return the issue label for a failure's type."""
+    return _TYPE_LABEL.get(failure.failure_type, "test-failure")
+
 
 def fingerprint_for(failure: UniqueFailure) -> str:
-    """Stable dedup key for a failure: a hash of test name + file.
+    """Stable dedup key for a failure.
 
-    The identity is ``test_name`` + ``test_file``, hashed via
-    :func:`scripts.common.incidents.compute_fingerprint` like the fuzzer
-    pipeline, into a fixed-shape hex token safe for the HTML-comment marker.
+    For failures with a test_name: hash of (type_namespace, test_name, test_file).
+    The pair goes in ``namespace`` (joined in order, never normalized) rather
+    than ``shapes``, which keeps digits significant so PSYNC2 and PSYNC3 stay
+    distinct and preserves order so a name/file swap cannot collide.
 
-    The pair is the identity, so it goes in ``namespace`` (joined in order,
-    never normalized) rather than ``shapes``. That keeps digits significant so
-    PSYNC2 and PSYNC3 stay distinct, and preserves order so a name/file swap
-    cannot collide.
+    For failures without a test_name (sanitizer/valgrind/startup): hash of
+    (type_namespace,) with the normalized error as shapes input. This means the
+    same bug detected after different test files produces the same fingerprint.
     """
-    return compute_fingerprint(
-        namespace=(MARKER_NAMESPACE, failure.test_name, failure.test_file),
-        shapes=(),
-    )
+    ns = marker_namespace_for(failure)
+
+    if failure.has_test_identity:
+        return compute_fingerprint(
+            namespace=(ns, failure.test_name, failure.test_file),
+            shapes=(),
+        )
+    else:
+        error_identity = normalize_error_identity(failure.error)
+        return compute_fingerprint(
+            namespace=(ns,),
+            shapes=(error_identity,),
+        )
 
 
 def title_for(failure: UniqueFailure) -> str:
-    """Issue title for a failure.
-
-    Exposed rather than inlined in the renderer so callers can pass the same
-    title to ``IssueDedupPublisher.upsert`` as ``title_fallback`` when
-    migrating issues off the old raw-fingerprint marker.
-    """
+    """Issue title for a failure."""
     return _build_title(failure)
 
 
 def renderer_for(failure: UniqueFailure) -> _FailureRenderer:
     """Return a renderer supplying the ``render`` and ``body_transform`` hooks
     that :class:`IssueDedupPublisher.upsert` expects for one failure.
-
-    The two hooks are coupled so the recurrence comment can name the *newly*
-    failing environments. ``upsert`` runs ``body_transform`` (which diffs the
-    failure's environments against the previously published body) before
-    ``render`` (which builds the comment), so by the time the comment is
-    rendered the renderer already knows which environments were not recorded
-    before. See :meth:`_FailureRenderer.merge_environments`.
     """
     return _FailureRenderer(failure)
 
 
 class _FailureRenderer:
-    """Per-failure ``render``/``body_transform`` pair sharing the set of newly
-    failing environments. Created via :func:`renderer_for`."""
+    """Per-failure render/body_transform pair. Created via :func:`renderer_for`."""
 
     def __init__(self, failure: UniqueFailure) -> None:
         self._failure = failure
-        # Environments failing for the first time on this run, populated by
-        # ``merge_environments`` on the update path. Empty on the create path
-        # (no prior body to diff, and no comment is posted there anyway).
         self._newly_failing: list[str] = []
-        # The latest error trace when it differs (ignoring run-specific noise)
-        # from the one recorded on the issue, populated by ``merge_environments``
-        # on the update path. ``None`` when the trace is unchanged or absent, so
-        # :meth:`render` only calls it out when there is something new to show.
         self._new_error: str | None = None
 
     def render(self, marker: str, occurrences: int) -> IssueContent:
@@ -94,20 +133,13 @@ class _FailureRenderer:
                 newly_failing=self._newly_failing,
                 new_error=self._new_error,
             ),
-            labels=(LABEL_NAME,),
+            labels=(label_for(self._failure),),
         )
 
     def merge_environments(self, existing_body: str) -> str:
         """The ``body_transform`` callback: fold this failure's environments
         into the existing issue body, preserving environments recorded by
-        earlier runs and recording which ones are newly failing so
-        :meth:`render` can call them out in the recurrence comment.
-
-        Also diffs the failure's error trace against the one recorded on the
-        issue and, when it has meaningfully changed, records it so
-        :meth:`render` can surface the new trace in the comment. The body's
-        original trace is left intact — the body is the first-seen record, the
-        comment timeline carries each subsequent change.
+        earlier runs and recording which ones are newly failing.
         """
         self._new_error = self._detect_new_error(existing_body)
         existing_envs = _extract_environments_from_body(existing_body)
@@ -121,19 +153,8 @@ class _FailureRenderer:
         )
 
     def _detect_new_error(self, existing_body: str) -> str | None:
-        """Return the failure's error trace when it differs from the one stored
-        on the issue, else ``None``.
-
-        The comparison is normalized (see :func:`_normalize_trace`) so that
-        run-specific noise — timestamps, ports/PIDs, hex addresses, temp paths —
-        does not flag an unchanged failure as new on every recurrence. An empty
-        new error is never called out.
-
-        Legacy issues predating the Error stack trace section have no stored
-        trace (``_extract_error_from_body`` returns ``""``); with no baseline to
-        diff against, the trace is not called out. Otherwise the body never
-        backfilled with the section would diff against "" and re-post the same
-        "new" trace on every recurrence.
+        """Return the failure's error trace when it meaningfully differs from
+        what is stored on the issue, else None.
         """
         new_error = self._failure.error
         if not new_error.strip():
@@ -146,31 +167,78 @@ class _FailureRenderer:
         return new_error
 
 
+def _error_summary_line(error: str) -> str:
+    """Extract a short (<=60 char) summary from an error for the title."""
+    clean = re.sub(r"\033\[[0-9;]*m", "", error)
+    clean = re.sub(r"==\d+==\s*", "", clean)
+    for line in clean.split("\n"):
+        line = line.strip()
+        if line and not line.startswith("at ") and len(line) > 5:
+            return line[:60]
+    return clean[:60] if clean.strip() else "unknown error"
+
+
 def _build_title(failure: UniqueFailure) -> str:
-    return f"[TEST-FAILURE] {failure.test_name} in {failure.test_file}"
+    prefix = _TYPE_TITLE_PREFIX.get(failure.failure_type, "[TEST-FAILURE]")
+    if failure.has_test_identity:
+        return f"{prefix} {failure.test_name} in {failure.test_file}"
+    elif failure.test_file:
+        summary = _error_summary_line(failure.error)
+        return f"{prefix} {summary} ({failure.test_file})"
+    else:
+        summary = _error_summary_line(failure.error)
+        return f"{prefix} {summary}"
 
 
 def _build_body(failure: UniqueFailure, marker: str, *, occurrences: int) -> str:
     """Build the issue body for a test failure."""
+    ns = marker_namespace_for(failure)
     ci_links = "\n".join(
         f"- `{j.job}`: [CI link]({j.url})" for j in failure.jobs
     )
     env_list = ", ".join(f"`{j.job}`" for j in failure.jobs)
+    type_label = failure.failure_type.value.replace("-", " ").title()
 
-    return "\n".join([
+    lines = [
         marker,
-        f"<!-- {MARKER_NAMESPACE}:occurrences:{occurrences} -->",
+        f"<!-- {ns}:occurrences:{occurrences} -->",
         "",
         "**Summary**",
         "",
-        f"`{failure.test_name}` in `{failure.test_file}` is failing in CI.",
-        "",
-        "**Failing test(s)**",
-        "",
-        f"- Test name: `{failure.test_name}`",
-        f"- Test file: `{failure.test_file}`",
-        "- CI link(s):",
-        ci_links,
+    ]
+
+    if failure.has_test_identity:
+        lines.append(
+            f"`{failure.test_name}` in `{failure.test_file}` is failing in CI."
+        )
+        lines.extend([
+            "",
+            "**Failing test(s)**",
+            "",
+            f"- Test name: `{failure.test_name}`",
+            f"- Test file: `{failure.test_file}`",
+            f"- Failure type: `{type_label}`",
+            "- CI link(s):",
+            ci_links,
+        ])
+    else:
+        lines.append(f"A **{type_label}** error was detected in CI.")
+        if failure.test_file:
+            lines.append(f"Context: running `{failure.test_file}`")
+        lines.extend([
+            "",
+            "**Error details**",
+            "",
+            f"- Failure type: `{type_label}`",
+        ])
+        if failure.test_file:
+            lines.append(f"- Test file context: `{failure.test_file}`")
+        lines.extend([
+            "- CI link(s):",
+            ci_links,
+        ])
+
+    lines.extend([
         "",
         "**Error stack trace**",
         "",
@@ -183,6 +251,7 @@ def _build_body(failure: UniqueFailure, marker: str, *, occurrences: int) -> str
         "---",
         "*Auto-created by Test Failure Detector*",
     ])
+    return "\n".join(lines)
 
 
 def _build_comment(
@@ -191,16 +260,7 @@ def _build_comment(
     newly_failing: list[str],
     new_error: str | None = None,
 ) -> str:
-    """Build a comment for an existing issue that failed again.
-
-    When ``newly_failing`` names environments not recorded on the issue before,
-    the comment calls them out so a triager can spot a regression spreading to
-    new platforms without diffing the body's Environments line.
-
-    When ``new_error`` is set, the failure recurred with a different error trace
-    than the one recorded on the issue; the comment shows the new trace so a
-    triager can notice the failure mode changed without diffing the body.
-    """
+    """Build a comment for an existing issue that failed again."""
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     ci_links = "\n".join(
         f"- `{j.job}`: [CI link]({j.url})" for j in failure.jobs
@@ -223,9 +283,6 @@ def _extract_environments_from_body(body: str) -> list[str]:
     return re.findall(r"`([^`]+)`", env_match.group(1))
 
 
-# The fenced code block holding the trace under the "Error stack trace" header
-# in a body built by :func:`_build_body`. Non-greedy so it stops at the closing
-# fence rather than swallowing later fenced blocks.
 _ERROR_BLOCK_RE = re.compile(
     r"\*\*Error stack trace\*\*\s*```\n(.*?)\n```",
     re.DOTALL,
@@ -233,46 +290,26 @@ _ERROR_BLOCK_RE = re.compile(
 
 
 def _extract_error_from_body(body: str) -> str:
-    """Extract the error trace recorded under the Error stack trace header.
-
-    Returns ``""`` when the body has no such section (e.g. issues created
-    before this section existed), which the caller treats as "unknown" rather
-    than "unchanged".
-    """
+    """Extract the error trace recorded under the Error stack trace header."""
     match = _ERROR_BLOCK_RE.search(body)
     if not match:
         return ""
     return match.group(1).strip()
 
 
-# Run-specific tokens scrubbed before comparing two traces, so an unchanged
-# failure is not reported as new every recurrence. Each match is stripped out,
-# then whitespace is collapsed (see _normalize_trace).
 _TRACE_NOISE_RES = (
-    # ISO-ish timestamps: 2026-06-27 12:34:56 / 2026-06-27T12:34:56
     re.compile(r"\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?"),
-    # Bare clock times: 12:34:56
     re.compile(r"\b\d{2}:\d{2}:\d{2}(?:\.\d+)?\b"),
-    # Hex addresses: 0x7fff1234
     re.compile(r"0x[0-9a-fA-F]+"),
-    # Temp paths: /tmp/foo, /tmp/abc.123
     re.compile(r"/tmp/[^\s:]+"),
-    # PID/port-style annotations: pid 12345, port=6379, port 6379
     re.compile(r"\b(pid|port)[=\s]+\d+", re.IGNORECASE),
 )
 
 
 def _normalize_trace(text: str) -> str:
-    """Normalize a trace for comparison by scrubbing run-specific noise.
-
-    Two traces that differ only in timestamps, ports/PIDs, hex addresses, or
-    temp paths normalize to the same string, so a genuinely unchanged failure
-    is not flagged as a new error trace on every run.
-    """
+    """Normalize a trace for comparison by scrubbing run-specific noise."""
     for noise in _TRACE_NOISE_RES:
         text = noise.sub("", text)
-    # Collapse all remaining whitespace so indentation/line-wrap changes alone
-    # do not count as a difference.
     return " ".join(text.split())
 
 
