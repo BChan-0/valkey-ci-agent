@@ -18,11 +18,17 @@ try:
         _extract_error_from_body,
         _update_environments_in_body,
         fingerprint_for,
+        label_for,
+        marker_namespace_for,
         renderer_for,
         title_for,
     )
     from scripts.test_failure_detector.manage_issues import process_failures
-    from scripts.test_failure_detector.parse_failures import JobReference, UniqueFailure
+    from scripts.test_failure_detector.parse_failures import (
+        FailureType,
+        JobReference,
+        UniqueFailure,
+    )
 
     _SKIP_REASON = None
 except ImportError as _exc:
@@ -342,3 +348,209 @@ class TestRecurrenceCommentNewError:
         # Create path: body_transform never runs, so no spurious callout.
         comment = renderer_for(_make_failure()).render("<!-- m -->", 1).comment
         assert "New error stack trace" not in comment
+
+
+# --- Tests for type-specific fingerprinting and rendering ---
+
+
+class TestTypeSpecificFingerprint:
+    """Fingerprints are scoped by failure type so different categories
+    cannot collide, and nameless errors are fingerprinted by error identity."""
+
+    def test_different_types_different_fingerprints(self) -> None:
+        """Same test name + file, different type => different fingerprint."""
+        assertion = _make_failure()
+        timeout = UniqueFailure(
+            test_name="PSYNC2 test",
+            test_file="tests/integration/replication-psync.tcl",
+            failure_type=FailureType.TIMEOUT,
+            error="Test timed out",
+            jobs=[JobReference(job="j", suite="s", url="u")],
+        )
+        assert fingerprint_for(assertion) != fingerprint_for(timeout)
+
+    def test_sanitizer_fingerprint_ignores_pid(self) -> None:
+        """Same sanitizer error with different PIDs => same fingerprint."""
+        f1 = UniqueFailure(
+            test_name="", test_file="",
+            failure_type=FailureType.SANITIZER,
+            error="==111== ERROR: AddressSanitizer: heap-buffer-overflow\n==111==    at 0xAAA: dictResize (dict.c:100)",
+        )
+        f2 = UniqueFailure(
+            test_name="", test_file="",
+            failure_type=FailureType.SANITIZER,
+            error="==222== ERROR: AddressSanitizer: heap-buffer-overflow\n==222==    at 0xBBB: dictResize (dict.c:100)",
+        )
+        assert fingerprint_for(f1) == fingerprint_for(f2)
+
+    def test_valgrind_cross_file_same_fingerprint(self) -> None:
+        """Same valgrind error in different test files => same fingerprint.
+        The test_file is intentionally excluded from the nameless fingerprint."""
+        f1 = UniqueFailure(
+            test_name="", test_file="tests/unit/expire.tcl",
+            failure_type=FailureType.VALGRIND,
+            error="==1== Invalid read of size 4\n==1==    at 0xA: dictResize (dict.c:100)",
+        )
+        f2 = UniqueFailure(
+            test_name="", test_file="tests/unit/cluster.tcl",
+            failure_type=FailureType.VALGRIND,
+            error="==2== Invalid read of size 4\n==2==    at 0xB: dictResize (dict.c:100)",
+        )
+        assert fingerprint_for(f1) == fingerprint_for(f2)
+
+    def test_different_sanitizer_bugs_different_fingerprints(self) -> None:
+        f1 = UniqueFailure(
+            test_name="", test_file="",
+            failure_type=FailureType.SANITIZER,
+            error="==1== ERROR: AddressSanitizer: heap-buffer-overflow\n==1==    at 0xA: dictResize (dict.c:100)",
+        )
+        f2 = UniqueFailure(
+            test_name="", test_file="",
+            failure_type=FailureType.SANITIZER,
+            error="==1== ERROR: AddressSanitizer: use-after-free\n==1==    at 0xA: listRelease (adlist.c:50)",
+        )
+        assert fingerprint_for(f1) != fingerprint_for(f2)
+
+    def test_unittest_has_named_fingerprint(self) -> None:
+        """gtest failures have test_name, so they use the named path."""
+        f = UniqueFailure(
+            test_name="DictTest.BasicOps",
+            test_file="src/unit/valkey-unit-gtests",
+            failure_type=FailureType.UNITTEST,
+        )
+        assert f.has_test_identity
+        fp = fingerprint_for(f)
+        assert re.fullmatch(r"[0-9a-f]{20}", fp)
+
+    def test_assertion_fingerprint_unchanged_from_legacy(self) -> None:
+        """Assertion-type fingerprint uses the same namespace as before
+        so existing issues are still matched."""
+        f = _make_failure()
+        ns = marker_namespace_for(f)
+        assert ns == MARKER_NAMESPACE
+
+
+class TestTypeSpecificRendering:
+    """Type-specific title prefixes, labels, and body format."""
+
+    def test_sanitizer_title_prefix(self) -> None:
+        f = UniqueFailure(
+            test_name="", test_file="tests/unit/expire.tcl",
+            failure_type=FailureType.SANITIZER,
+            error="Sanitizer error: heap-buffer-overflow in dictResize",
+            jobs=[JobReference(job="j", suite="s", url="u")],
+        )
+        title = title_for(f)
+        assert title.startswith("[SANITIZER]")
+
+    def test_valgrind_title_prefix(self) -> None:
+        f = UniqueFailure(
+            test_name="", test_file="tests/unit/expire.tcl",
+            failure_type=FailureType.VALGRIND,
+            error="Valgrind error: Invalid read of size 4",
+            jobs=[JobReference(job="j", suite="s", url="u")],
+        )
+        assert title_for(f).startswith("[VALGRIND]")
+
+    def test_timeout_title_with_test_name(self) -> None:
+        f = UniqueFailure(
+            test_name="PSYNC2 test",
+            test_file="tests/integration/replication-psync.tcl",
+            failure_type=FailureType.TIMEOUT,
+            error="Test timed out",
+            jobs=[JobReference(job="j", suite="s", url="u")],
+        )
+        title = title_for(f)
+        assert title.startswith("[TIMEOUT]")
+        assert "PSYNC2 test" in title
+
+    def test_unittest_title(self) -> None:
+        f = UniqueFailure(
+            test_name="DictTest.BasicOps",
+            test_file="src/unit/valkey-unit-gtests",
+            failure_type=FailureType.UNITTEST,
+            error="gtest FAIL",
+            jobs=[JobReference(job="j", suite="s", url="u")],
+        )
+        title = title_for(f)
+        assert title.startswith("[UNITTEST]")
+        assert "DictTest.BasicOps" in title
+
+    def test_startup_title_without_test_name(self) -> None:
+        f = UniqueFailure(
+            test_name="", test_file="tests/unit/cluster.tcl",
+            failure_type=FailureType.STARTUP,
+            error="Can't start /path/to/valkey-server",
+            jobs=[JobReference(job="j", suite="s", url="u")],
+        )
+        title = title_for(f)
+        assert title.startswith("[STARTUP-FAILURE]")
+        assert "cluster.tcl" in title
+
+    def test_type_specific_labels(self) -> None:
+        cases = [
+            (FailureType.ASSERTION, "test-failure"),
+            (FailureType.SANITIZER, "sanitizer-error"),
+            (FailureType.VALGRIND, "valgrind-error"),
+            (FailureType.TIMEOUT, "test-timeout"),
+            (FailureType.STARTUP, "startup-failure"),
+            (FailureType.EXCEPTION, "test-exception"),
+            (FailureType.MEMORY_LEAK, "memory-leak"),
+            (FailureType.UNITTEST, "unittest-failure"),
+        ]
+        for ftype, expected_label in cases:
+            f = UniqueFailure(
+                test_name="t" if ftype in (FailureType.ASSERTION, FailureType.TIMEOUT, FailureType.UNITTEST) else "",
+                test_file="f.tcl",
+                failure_type=ftype,
+                error="some error",
+                jobs=[JobReference(job="j", suite="s", url="u")],
+            )
+            assert label_for(f) == expected_label
+
+    def test_renderer_uses_type_specific_label(self) -> None:
+        f = UniqueFailure(
+            test_name="DictTest.Ops",
+            test_file="src/unit/valkey-unit-gtests",
+            failure_type=FailureType.UNITTEST,
+            error="gtest FAIL",
+            jobs=[JobReference(job="j", suite="s", url="u")],
+        )
+        content = renderer_for(f).render("<!-- m -->", 1)
+        assert content.labels == ("unittest-failure",)
+
+    def test_nameless_body_has_error_details_section(self) -> None:
+        """Nameless failures get 'Error details' instead of 'Failing test(s)'."""
+        f = UniqueFailure(
+            test_name="", test_file="tests/unit/expire.tcl",
+            failure_type=FailureType.SANITIZER,
+            error="Sanitizer error: heap-buffer-overflow",
+            jobs=[JobReference(job="j", suite="s", url="u")],
+        )
+        body = _build_body(f, marker="<!-- m -->", occurrences=1)
+        assert "**Error details**" in body
+        assert "Sanitizer" in body
+        assert "expire.tcl" in body
+
+    def test_named_body_has_failure_type_field(self) -> None:
+        """Named failures include a Failure type line in the body."""
+        f = UniqueFailure(
+            test_name="PSYNC2 test",
+            test_file="tests/integration/replication-psync.tcl",
+            failure_type=FailureType.TIMEOUT,
+            error="Test timed out",
+            jobs=[JobReference(job="j", suite="s", url="u")],
+        )
+        body = _build_body(f, marker="<!-- m -->", occurrences=1)
+        assert "Failure type: `Timeout`" in body
+
+    def test_type_specific_namespace_in_body(self) -> None:
+        """Body uses type-specific namespace for the occurrences marker."""
+        f = UniqueFailure(
+            test_name="", test_file="",
+            failure_type=FailureType.VALGRIND,
+            error="Valgrind error: Invalid read",
+            jobs=[JobReference(job="j", suite="s", url="u")],
+        )
+        body = _build_body(f, marker="<!-- m -->", occurrences=3)
+        assert "valkey-ci-agent:valgrind-error:occurrences:3" in body

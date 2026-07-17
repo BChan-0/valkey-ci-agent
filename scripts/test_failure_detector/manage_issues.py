@@ -39,7 +39,6 @@ def process_failures(
     issue could not be processed; they are logged and skipped so one bad
     failure cannot abort the rest of the batch.
     """
-    publisher = IssueDedupPublisher(gh, marker_namespace=issue_renderer.MARKER_NAMESPACE)
     idempotency_key = str(run_id) if run_id is not None else None
 
     summary = {"created": 0, "updated": 0, "skipped": 0, "errors": 0}
@@ -50,6 +49,11 @@ def process_failures(
         # loop and silently drop every remaining failure. Log it, count it, and
         # move on so the rest of the batch is still processed.
         try:
+            # Use the type-specific marker namespace so different failure types
+            # get distinct issue search scopes and cannot collide.
+            ns = issue_renderer.marker_namespace_for(failure)
+            publisher = IssueDedupPublisher(gh, marker_namespace=ns)
+
             # The render and body_transform hooks are coupled (they share the
             # set of newly failing environments), so they come from one renderer.
             renderer = issue_renderer.renderer_for(failure)
@@ -59,9 +63,6 @@ def process_failures(
                 render=renderer.render,
                 idempotency_key=idempotency_key,
                 body_transform=renderer.merge_environments,
-                # The title is unchanged by the switch to hashed fingerprints, so
-                # an exact title match adopts issues from the old raw-fingerprint
-                # scheme and re-stamps them instead of creating duplicates.
                 title_fallback=issue_renderer.title_for(failure),
             )
             if action == "created":
