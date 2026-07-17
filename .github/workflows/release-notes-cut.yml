@@ -119,47 +119,41 @@ jobs:
         with:
           install-claude: "true"
 
-      # Two token steps, selected by whether this cut reads advisories, so a
-      # normal cut never depends on the advisory grant. repository-advisories:read
-      # is only requested when --security-from-advisories is on; create-github-app-token
-      # fails if the App installation lacks a requested permission, so requesting it
-      # unconditionally would break EVERY cut (including ones that never touch
-      # advisories) whenever the grant is absent. Exactly one step runs; the token
-      # is read as (default || advisory) below, and a skipped step yields "".
+      # Three token steps: one for upstream (no advisories), one for upstream (with
+      # advisories), one for forks (PAT). Exactly one runs; the token is read as the
+      # first non-empty output below. Forks use a TARGET_PAT secret (a fine-grained
+      # PAT with contents:write + pull-requests:write on the fork's valkey).
       - name: Generate GitHub App token
         id: generate-token
-        if: ${{ !inputs.security_from_advisories }}
+        if: ${{ github.repository_owner == 'valkey-io' && !inputs.security_from_advisories }}
         uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
         with:
           app-id: ${{ secrets.VALKEYRIE_BOT_APP_ID }}
           private-key: ${{ secrets.VALKEYRIE_BOT_PRIVATE_KEY }}
           owner: valkey-io
           repositories: valkey
-          # contents:write to push the prep branch and create/delete release lines;
-          # pull-requests:write to open the release PR; metadata:read is always required.
           permission-contents: write
           permission-pull-requests: write
           permission-metadata: read
 
       - name: Generate GitHub App token (with advisories)
         id: generate-token-advisories
-        if: ${{ inputs.security_from_advisories }}
+        if: ${{ github.repository_owner == 'valkey-io' && inputs.security_from_advisories }}
         uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
         with:
           app-id: ${{ secrets.VALKEYRIE_BOT_APP_ID }}
           private-key: ${{ secrets.VALKEYRIE_BOT_PRIVATE_KEY }}
           owner: valkey-io
           repositories: valkey
-          # Same as above plus repository-advisories:read, which --security-from-advisories
-          # needs to list published advisories. This step only runs for an advisory
-          # cut, so a plain cut is never blocked when the App lacks this grant. The
-          # App installation must still hold repository-advisories:read for an
-          # advisory cut to work. (Published advisories on a public repo are broadly
-          # readable, but the explicit grant guarantees the token sees them.)
           permission-contents: write
           permission-pull-requests: write
           permission-metadata: read
           permission-repository-advisories: read
+
+      - name: Use TARGET_PAT (fork)
+        id: generate-token-fork
+        if: ${{ github.repository_owner != 'valkey-io' }}
+        run: echo "token=${{ secrets.TARGET_PAT }}" >> "$GITHUB_OUTPUT"
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
@@ -171,10 +165,11 @@ jobs:
       - name: Cut release notes
         shell: bash
         env:
-          # Exactly one token step ran (gated by security_from_advisories); the
-          # skipped one yields "", so this resolves to whichever produced a token.
-          RELEASE_NOTES_GITHUB_TOKEN: ${{ steps.generate-token.outputs.token || steps.generate-token-advisories.outputs.token }}
-          RELEASE_NOTES_REPO: valkey-io/valkey
+          # Exactly one token step ran; the others yield "". First non-empty wins.
+          RELEASE_NOTES_GITHUB_TOKEN: ${{ steps.generate-token.outputs.token || steps.generate-token-advisories.outputs.token || steps.generate-token-fork.outputs.token }}
+          # Target the valkey repo owned by whoever runs this workflow:
+          # valkey-io/valkey upstream, <fork-owner>/valkey on a fork.
+          RELEASE_NOTES_REPO: ${{ github.repository_owner }}/valkey
           RELEASE_NOTES_VERSION: ${{ inputs.version }}
           RELEASE_NOTES_STAGE: ${{ inputs.stage }}
           RELEASE_NOTES_URGENCY: ${{ inputs.urgency }}

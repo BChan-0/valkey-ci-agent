@@ -21,11 +21,9 @@ from enum import Enum
 class PRDisposition(str, Enum):
     """Label-derived disposition for a discovered PR.
 
-    The ``no-release-notes`` label is no longer a gate: only ``release-notes``
-    hard-includes. Everything else is a CANDIDATE that AI triage judges (see
-    :mod:`scripts.release_notes.triage`), so an author who forgot the label, or one
-    who applied ``no-release-notes`` to a change that turns out to be user-facing,
-    is caught rather than silently dropped.
+    Only ``release-notes`` hard-includes. Everything else is a CANDIDATE that AI
+    triage judges (see :mod:`scripts.release_notes.triage`), so a change whose
+    author forgot the label is caught rather than silently dropped.
     """
 
     INCLUDE = "include"      # has 'release-notes' (other labels ignored)

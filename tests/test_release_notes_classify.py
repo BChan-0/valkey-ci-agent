@@ -1,7 +1,7 @@
 """Tests for release-notes label disposition (pure).
 
-The gate is now single-label: only ``release-notes`` hard-includes. Everything
-else (no label, or ``no-release-notes``) is a CANDIDATE that AI triage judges.
+The gate is single-label: only ``release-notes`` hard-includes. Everything else
+(no label, or any other label) is a CANDIDATE that AI triage judges.
 """
 
 from __future__ import annotations
@@ -18,19 +18,11 @@ class TestDispositionFor:
     def test_release_notes_only_includes(self) -> None:
         assert disposition_for(("release-notes",)) is PRDisposition.INCLUDE
 
-    def test_no_release_notes_is_a_candidate(self) -> None:
-        # no-release-notes is no longer a hard exclude: AI triage re-examines it.
-        assert disposition_for(("no-release-notes",)) is PRDisposition.CANDIDATE
-
-    def test_neither_label_is_a_candidate(self) -> None:
+    def test_arbitrary_labels_are_candidates(self) -> None:
         assert disposition_for(("bug", "area/cluster")) is PRDisposition.CANDIDATE
 
     def test_empty_is_a_candidate(self) -> None:
         assert disposition_for(()) is PRDisposition.CANDIDATE
-
-    def test_both_labels_still_include(self) -> None:
-        # release-notes present wins; the no-release-notes hint does not veto it.
-        assert disposition_for(("release-notes", "no-release-notes")) is PRDisposition.INCLUDE
 
     def test_release_notes_with_other_labels_includes(self) -> None:
         assert disposition_for(("release-notes", "bug")) is PRDisposition.INCLUDE
@@ -40,9 +32,9 @@ class TestClassify:
     def test_partitions_and_restamps(self) -> None:
         prs = [
             _pr(1, ("release-notes",)),
-            _pr(2, ("no-release-notes",)),
+            _pr(2, ("bug",)),
             _pr(3, ()),
-            _pr(4, ("release-notes", "no-release-notes")),
+            _pr(4, ("release-notes", "enhancement")),
         ]
         include, candidates = classify(prs)
         assert [p.number for p in include] == [1, 4]

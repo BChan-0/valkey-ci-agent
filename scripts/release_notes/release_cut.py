@@ -1157,7 +1157,7 @@ def _advisory_section(notes_meta: "_NotesMeta") -> str:
     """Explain the auto-generated Security Fixes and disclaim what could be missed.
 
     Only rendered when ``--security-from-advisories`` ran (``advisories`` is set).
-    Because only *published* advisories are visible to the token and the version
+    Because only published advisories are visible to the token and the version
     match is against author-typed metadata, this always tells a maintainer to
     confirm and to add any embargoed/draft CVEs by hand. When the fetch failed
     (most often a missing advisory-read permission), it says so explicitly rather
@@ -1439,7 +1439,7 @@ def _unresolved_backports_section(unresolved_backports: Sequence[Any]) -> str:
     range commit resolved to a PR that is itself a backport, and discovery could
     not walk it back to the original (no ``## Applied`` table, ``-x`` trailer,
     ``## Backport Summary`` row, recoverable PR-commit ``(#N)``, or
-    ``backport/<n>-to-<branch>`` head). The change *is* noted, but credited to the
+    ``backport/<n>-to-<branch>`` head). The change is noted, but credited to the
     backport PR, not the change's author, and the note reads normally, so nothing
     else in the PR would tip off a reviewer. List it here so a maintainer can find
     the original PR and correct the credit (author and ``(#N)``) before merging.
@@ -1474,7 +1474,7 @@ def _unresolved_cherry_picks_section(unresolved_cherry_picks: Sequence[Any]) -> 
     SHAs resolved through the API (the source commit is not in this repo, a
     hand-applied pick from a fork or history predating PR association), so the note
     was credited from the commit's subject ``(#N)`` or the commit->PR API instead.
-    For a *rewritten* pick that names the PR that landed the change on this line,
+    For a rewritten pick that names the PR that landed the change on this line,
     not the change's author; for a preserved-message pick it is correct. The source
     is unreachable, so the two cannot be told apart, and the credited PR carries no
     backport markers, so nothing else in the PR flags it. List it here with the
@@ -1510,7 +1510,7 @@ def _collided_section(collided: Sequence[Any]) -> str:
     """Flag distinct commits dropped because another commit reused their ``(#N)``.
 
     Each entry is a :class:`~scripts.release_notes.models.CollidedCommit`: two
-    *different* changes resolved to one PR number via the ambiguous subject
+    different changes resolved to one PR number via the ambiguous subject
     ``(#N)`` tier (a backport reused a source PR's ``(#N)`` on an unrelated
     follow-up commit), so discovery kept the first and dropped this one. The
     dropped commit resolved to a number, so it is absent from the notes and from

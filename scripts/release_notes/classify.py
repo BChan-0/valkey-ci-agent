@@ -1,11 +1,10 @@
 """Classify PRs into include vs. triage-candidate buckets from the release label.
 
-Only the ``release-notes`` label hard-includes a PR. Everything else (including a
-PR carrying ``no-release-notes``) is a *candidate* that AI triage judges, so a
-change that is user-facing despite a missing or wrong label is still caught. This
-is a deliberate departure from valkey's label-only ``check_release_notes`` gate:
-the gate only asks "is one of the two labels present"; we additionally ask "is the
-change actually user-facing" for everything the author did not explicitly opt in.
+Only the ``release-notes`` label hard-includes a PR. Everything else is a
+candidate that AI triage judges, so a change that is user-facing despite a missing
+label is still caught. Unlike valkey's label-only ``check_release_notes`` gate
+(which only asks "is the label present"), we additionally ask "is the change
+actually user-facing" for everything the author did not explicitly opt in.
 """
 
 from __future__ import annotations
@@ -23,8 +22,7 @@ def disposition_for(labels: Sequence[str]) -> PRDisposition:
     """Map a PR's labels to a disposition.
 
     ``release-notes`` present -> INCLUDE. Anything else -> CANDIDATE (AI triage
-    decides). ``no-release-notes`` is intentionally not honored as an exclude: an
-    author's opt-out is treated as a hint for triage, not a hard gate.
+    decides).
     """
     if RELEASE_LABEL in labels:
         return PRDisposition.INCLUDE

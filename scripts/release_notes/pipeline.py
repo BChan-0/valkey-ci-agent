@@ -87,7 +87,9 @@ def regenerate_unreleased(
 
     # Labelled PRs are included directly; the rest are candidates AI triage judges.
     labelled, candidates = classify(discovery.prs)
-    triage_result = triage_mod.triage(candidates, repo_dir=clone_dir)
+    triage_result = triage_mod.triage(
+        candidates, repo_dir=clone_dir, base_ref=discovery.base_tag
+    )
 
     # Join each verdict back to its PR facts for the body, and collect the PRs the
     # model judged user-facing so they flow into generation with the labelled ones.

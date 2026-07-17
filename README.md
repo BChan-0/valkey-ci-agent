@@ -376,9 +376,7 @@ human merges.
    tag (e.g. `9.2.0-rc1`), and for a patch GA it is the previous patch tag (e.g.
    `9.1.8`). Tags are created by maintainers before dispatch.
 3. **Classify** (code) - split PRs by the `release-notes` label: labelled PRs are
-   included directly, everything else is a triage candidate. Unlike valkey's
-   label-only `check_release_notes` gate, `no-release-notes` is not a hard exclude
-   here; it is just a hint for the triage step.
+   included directly, everything else is a triage candidate.
 4. **Triage** (AI) - Claude decides, per label-less candidate, whether the change
    is user-facing enough to note (include) or purely internal (exclude), with a
    short reason for each. Included candidates join the labelled PRs; the model's
@@ -472,5 +470,5 @@ App installation lacks it. The App installation must hold
 
 ## Documentation
 
-- [docs/architecture.md](docs/architecture.md) — full system design including planned workflows
-- [DEVELOPMENT.md](DEVELOPMENT.md) — local setup, testing, and GitHub Actions usage
+- [docs/architecture.md](docs/architecture.md) - full system design including planned workflows
+- [DEVELOPMENT.md](DEVELOPMENT.md) - local setup, testing, and GitHub Actions usage
