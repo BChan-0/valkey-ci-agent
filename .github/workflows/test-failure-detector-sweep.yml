@@ -6,10 +6,10 @@ on:
   workflow_dispatch:
     inputs:
       repo:
-        description: "Repository to scan (default: valkey-io/valkey)"
+        description: "Repository to scan (default: BChan-0/valkey)"
         required: false
         type: string
-        default: "valkey-io/valkey"
+        default: "BChan-0/valkey"
       run_id:
         description: "Specific workflow run ID to analyze (empty = latest completed Daily run)"
         required: false
@@ -18,17 +18,17 @@ on:
       dry_run:
         description: "Parse and report only — don't create/update issues"
         required: false
-        default: false
+        default: true
         type: boolean
 
-permissions: {}
+permissions:
+  contents: read
+  issues: write
+  actions: read
 
 jobs:
   detect-failures:
     name: "Detect test failures"
-    if: >
-      (github.event_name == 'workflow_dispatch' ||
-      github.repository == 'valkey-io/valkey-ci-agent')
     runs-on: ubuntu-latest
     steps:
       - name: Check out agent repository
@@ -40,22 +40,10 @@ jobs:
       - name: Set up agent dependencies
         uses: ./.github/actions/setup-agent
 
-      - name: Generate GitHub App token
-        id: generate-token
-        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
-        with:
-          app-id: ${{ secrets.VALKEYRIE_BOT_APP_ID }}
-          private-key: ${{ secrets.VALKEYRIE_BOT_PRIVATE_KEY }}
-          owner: valkey-io
-          repositories: valkey
-          permission-actions: read
-          permission-issues: write
-          permission-metadata: read
-
       - name: Run test failure detector
         env:
-          TARGET_TOKEN: ${{ steps.generate-token.outputs.token }}
-          TARGET_REPO: ${{ inputs.repo || 'valkey-io/valkey' }}
+          TARGET_TOKEN: ${{ secrets.TARGET_PAT }}
+          TARGET_REPO: ${{ inputs.repo || 'BChan-0/valkey' }}
           RUN_ID: ${{ inputs.run_id || '' }}
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run == true && 'true' || 'false' }}
         run: |
