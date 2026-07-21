@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+from dataclasses import dataclass
 
 from github import Github
 from github.WorkflowRun import WorkflowRun
@@ -124,15 +125,25 @@ def download_all_test_failures(
     logger.info("Extracted %s from artifact zip", _FAILURES_JSON_NAME)
     return content
 
-def get_job_urls(
+@dataclass(frozen=True)
+class JobInfo:
+    """URL map and failed-job names derived from a workflow run's job list."""
+
+    urls: dict[str, str]
+    failed: set[str]
+
+
+def get_job_info(
     gh: Github,
     repo_full_name: str,
     run_id: int,
-) -> dict[str, str]:
-    """Get a mapping of job name -> HTML URL for all jobs in a workflow run.
+) -> JobInfo:
+    """Fetch job metadata for a workflow run in a single API call.
 
-    Also includes normalized variants (parentheses replaced with dashes,
-    spaces replaced with dashes) for fuzzy matching.
+    Returns a :class:`JobInfo` containing:
+    - ``urls``: job name -> HTML URL (includes normalized aliases for fuzzy
+      matching against artifact names).
+    - ``failed``: names of jobs whose conclusion indicates failure.
     """
 
     repo = retry_github_call(
@@ -153,22 +164,35 @@ def get_job_urls(
         description=f"list jobs for run {run_id}",
     )
 
-    # Materialize once: jobs may be a lazy paginated list, and we iterate twice.
     job_list = list(jobs)
 
-    # First pass: exact job names. These are authoritative, so they take
-    # precedence over any normalized alias.
     job_url_map: dict[str, str] = {job.name: job.html_url for job in job_list}
+    failed_jobs: set[str] = set()
 
-    # Second pass: normalized variants for fuzzy matching against artifact
-    # names. Only add an alias when it does not collide with an exact job name,
-    # so a normalized alias of one job can never overwrite another job's exact
-    # mapping and attach the wrong CI URL.
     for job in job_list:
+        if job.conclusion == "failure":
+            failed_jobs.add(job.name)
+
         normalized = re.sub(r"\s*\(([^)]+)\)", r"-\1", job.name)
         normalized = re.sub(r"\s+", "-", normalized)
         if normalized != job.name and normalized not in job_url_map:
             job_url_map[normalized] = job.html_url
 
-    logger.info("Found %d job URL mappings for run %d", len(job_url_map), run_id)
-    return job_url_map
+    logger.info(
+        "Found %d job URL mappings (%d failed) for run %d",
+        len(job_url_map), len(failed_jobs), run_id,
+    )
+    return JobInfo(urls=job_url_map, failed=failed_jobs)
+
+
+def get_job_urls(
+    gh: Github,
+    repo_full_name: str,
+    run_id: int,
+) -> dict[str, str]:
+    """Get a mapping of job name -> HTML URL for all jobs in a workflow run.
+
+    Also includes normalized variants (parentheses replaced with dashes,
+    spaces replaced with dashes) for fuzzy matching.
+    """
+    return get_job_info(gh, repo_full_name, run_id).urls
