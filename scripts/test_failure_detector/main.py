@@ -13,11 +13,16 @@ from scripts.common.job_summary import emit_job_summary
 from scripts.common.workflow_artifacts import ArtifactClient
 from scripts.test_failure_detector.download import (
     download_all_test_failures,
-    get_job_urls,
+    get_job_info,
     get_latest_daily_run,
 )
 from scripts.test_failure_detector.manage_issues import process_failures
-from scripts.test_failure_detector.parse_failures import parse_and_deduplicate
+from scripts.test_failure_detector.parse_failures import (
+    FailureType,
+    UniqueFailure,
+    parse_and_deduplicate,
+)
+from scripts.test_failure_detector.timeout_recovery import recover_timeouts
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +49,38 @@ def _build_job_summary(
         "",
     ]
     return "\n".join(lines)
+
+def _merge_timeout_recoveries(
+    unique_failures: list[UniqueFailure],
+    timeout_failures: list[UniqueFailure],
+) -> list[UniqueFailure]:
+    """Merge log-recovered timeouts into the artifact-derived failure list.
+
+    If the same test already appears as a TIMEOUT from the artifact (because
+    the updated test_helper.tcl captured it), fold the recovered job references
+    into the existing entry rather than creating a duplicate.
+    """
+    if not timeout_failures:
+        return unique_failures
+
+    existing_timeouts: dict[tuple[str, str], UniqueFailure] = {}
+    for f in unique_failures:
+        if f.failure_type == FailureType.TIMEOUT and f.test_name:
+            existing_timeouts[(f.test_name, f.test_file)] = f
+
+    for recovered in timeout_failures:
+        key = (recovered.test_name, recovered.test_file)
+        if key in existing_timeouts:
+            existing = existing_timeouts[key]
+            for job_ref in recovered.jobs:
+                if not any(j.job == job_ref.job for j in existing.jobs):
+                    existing.jobs.append(job_ref)
+        else:
+            unique_failures.append(recovered)
+            existing_timeouts[key] = recovered
+
+    return unique_failures
+
 
 def run(
     *,
@@ -132,13 +169,22 @@ def run(
         return 1
     logger.info("Loaded failures from %d job(s)", len(all_failures))
 
-    # Step 3: Get job URLs for CI links
-    logger.info("Fetching job URLs...")
-    job_urls = get_job_urls(gh, repo_full_name, run_id)
+    # Step 3: Get job metadata (URLs + failed job names)
+    logger.info("Fetching job metadata...")
+    job_info = get_job_info(gh, repo_full_name, run_id)
 
-    # Step 4: Parse and deduplicate
+    # Step 4: Recover timeout failures from logs
+    # The Tcl test runner's watchdog may kill the process before
+    # write_test_failures executes, leaving empty artifact entries for jobs
+    # that actually timed out. Scan their console logs to recover the failures.
+    timeout_failures = recover_timeouts(
+        all_failures, job_info, artifact_client, repo_full_name, run_id,
+    )
+
+    # Step 5: Parse and deduplicate
     logger.info("Parsing and deduplicating failures...")
-    unique_failures = parse_and_deduplicate(all_failures, job_urls)
+    unique_failures = parse_and_deduplicate(all_failures, job_info.urls)
+    unique_failures = _merge_timeout_recoveries(unique_failures, timeout_failures)
 
     if not unique_failures:
         logger.info("No test failures to report.")
@@ -155,7 +201,7 @@ def run(
         emit_job_summary(_build_job_summary(run_id, repo_full_name, len(unique_failures), {}))
         return 0
 
-    # Step 5: Create or update issues
+    # Step 6: Create or update issues
     logger.info("Processing issues on %s...", repo_full_name)
     result = process_failures(gh, repo_full_name, unique_failures, run_id=run_id)
 
