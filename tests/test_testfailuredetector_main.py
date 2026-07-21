@@ -61,14 +61,14 @@ class TestRunArtifactJSONGuard:
         assert "unexpected format" in mock_emit.call_args.args[0]
 
     @patch("scripts.test_failure_detector.main.parse_and_deduplicate")
-    @patch("scripts.test_failure_detector.main.get_job_urls")
+    @patch("scripts.test_failure_detector.main.get_job_info")
     @patch("scripts.test_failure_detector.main.emit_job_summary")
     @patch("scripts.test_failure_detector.main.download_all_test_failures")
     @patch("scripts.test_failure_detector.main.ArtifactClient")
     @patch("scripts.test_failure_detector.main.Github")
     def test_list_json_artifact_returns_nonzero_and_reports(
         self, _mock_gh, _mock_client, mock_download, mock_emit,
-        mock_job_urls, mock_parse,
+        mock_job_info, mock_parse,
     ) -> None:
         # A top-level list parses fine but is the wrong shape: without the guard
         # it slips past parse_and_deduplicate as "no failures" and exits 0.
@@ -91,16 +91,18 @@ class TestRunProcessingErrorsExitCode:
 
     @patch("scripts.test_failure_detector.main.process_failures")
     @patch("scripts.test_failure_detector.main.parse_and_deduplicate")
-    @patch("scripts.test_failure_detector.main.get_job_urls")
+    @patch("scripts.test_failure_detector.main.recover_timeouts")
+    @patch("scripts.test_failure_detector.main.get_job_info")
     @patch("scripts.test_failure_detector.main.emit_job_summary")
     @patch("scripts.test_failure_detector.main.download_all_test_failures")
     @patch("scripts.test_failure_detector.main.ArtifactClient")
     @patch("scripts.test_failure_detector.main.Github")
     def test_returns_nonzero_when_process_failures_reports_errors(
         self, _mock_gh, _mock_client, mock_download, mock_emit,
-        mock_job_urls, mock_parse, mock_process,
+        mock_job_info, mock_recover, mock_parse, mock_process,
     ) -> None:
         mock_download.return_value = b'{"job": {"suite": []}}'
+        mock_recover.return_value = []
         mock_parse.return_value = [MagicMock(display_name="t", jobs=[])]
         mock_process.return_value = {
             "created": 1, "updated": 0, "skipped": 0, "errors": 1,
@@ -116,16 +118,18 @@ class TestRunProcessingErrorsExitCode:
 
     @patch("scripts.test_failure_detector.main.process_failures")
     @patch("scripts.test_failure_detector.main.parse_and_deduplicate")
-    @patch("scripts.test_failure_detector.main.get_job_urls")
+    @patch("scripts.test_failure_detector.main.recover_timeouts")
+    @patch("scripts.test_failure_detector.main.get_job_info")
     @patch("scripts.test_failure_detector.main.emit_job_summary")
     @patch("scripts.test_failure_detector.main.download_all_test_failures")
     @patch("scripts.test_failure_detector.main.ArtifactClient")
     @patch("scripts.test_failure_detector.main.Github")
     def test_returns_zero_when_no_processing_errors(
         self, _mock_gh, _mock_client, mock_download, mock_emit,
-        mock_job_urls, mock_parse, mock_process,
+        mock_job_info, mock_recover, mock_parse, mock_process,
     ) -> None:
         mock_download.return_value = b'{"job": {"suite": []}}'
+        mock_recover.return_value = []
         mock_parse.return_value = [MagicMock(display_name="t", jobs=[])]
         mock_process.return_value = {
             "created": 1, "updated": 1, "skipped": 0, "errors": 0,
