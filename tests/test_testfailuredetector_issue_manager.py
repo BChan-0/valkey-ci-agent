@@ -487,18 +487,8 @@ class TestTypeSpecificRendering:
         assert title.startswith("[STARTUP-FAILURE]")
         assert "cluster.tcl" in title
 
-    def test_type_specific_labels(self) -> None:
-        cases = [
-            (FailureType.ASSERTION, "test-failure"),
-            (FailureType.SANITIZER, "sanitizer-error"),
-            (FailureType.VALGRIND, "valgrind-error"),
-            (FailureType.TIMEOUT, "test-timeout"),
-            (FailureType.STARTUP, "startup-failure"),
-            (FailureType.EXCEPTION, "test-exception"),
-            (FailureType.MEMORY_LEAK, "memory-leak"),
-            (FailureType.UNITTEST, "unittest-failure"),
-        ]
-        for ftype, expected_label in cases:
+    def test_all_types_use_test_failure_label(self) -> None:
+        for ftype in FailureType:
             f = UniqueFailure(
                 test_name="t" if ftype in (FailureType.ASSERTION, FailureType.TIMEOUT, FailureType.UNITTEST) else "",
                 test_file="f.tcl",
@@ -506,9 +496,9 @@ class TestTypeSpecificRendering:
                 error="some error",
                 jobs=[JobReference(job="j", suite="s", url="u")],
             )
-            assert label_for(f) == expected_label
+            assert label_for(f) == "test-failure"
 
-    def test_renderer_uses_type_specific_label(self) -> None:
+    def test_renderer_uses_test_failure_label(self) -> None:
         f = UniqueFailure(
             test_name="DictTest.Ops",
             test_file="src/unit/valkey-unit-gtests",
@@ -517,7 +507,7 @@ class TestTypeSpecificRendering:
             jobs=[JobReference(job="j", suite="s", url="u")],
         )
         content = renderer_for(f).render("<!-- m -->", 1)
-        assert content.labels == ("unittest-failure",)
+        assert content.labels == ("test-failure",)
 
     def test_nameless_body_has_error_details_section(self) -> None:
         """Nameless failures get 'Error details' instead of 'Failing test(s)'."""

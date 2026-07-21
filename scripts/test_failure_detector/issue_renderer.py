@@ -39,17 +39,7 @@ _TYPE_NAMESPACE: dict[FailureType, str] = {
     FailureType.UNITTEST: "valkey-ci-agent:unittest-failure",
 }
 
-# Issue label per failure type.
-_TYPE_LABEL: dict[FailureType, str] = {
-    FailureType.ASSERTION: "test-failure",
-    FailureType.SANITIZER: "sanitizer-error",
-    FailureType.VALGRIND: "valgrind-error",
-    FailureType.TIMEOUT: "test-timeout",
-    FailureType.STARTUP: "startup-failure",
-    FailureType.EXCEPTION: "test-exception",
-    FailureType.MEMORY_LEAK: "memory-leak",
-    FailureType.UNITTEST: "unittest-failure",
-}
+_LABEL_NAME = "test-failure"
 
 # Title prefix per failure type.
 _TYPE_TITLE_PREFIX: dict[FailureType, str] = {
@@ -70,8 +60,8 @@ def marker_namespace_for(failure: UniqueFailure) -> str:
 
 
 def label_for(failure: UniqueFailure) -> str:
-    """Return the issue label for a failure's type."""
-    return _TYPE_LABEL.get(failure.failure_type, "test-failure")
+    """Return the issue label. All failure types use the same label."""
+    return _LABEL_NAME
 
 
 def fingerprint_for(failure: UniqueFailure) -> str:
