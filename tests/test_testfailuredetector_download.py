@@ -138,12 +138,12 @@ class TestGetLatestDailyRun:
         assert result is None
 
     @patch("scripts.test_failure_detector.download.retry_github_call")
-    def test_filters_to_scheduled_runs_only(self, mock_retry) -> None:
-        """Run selection must restrict to event='schedule'.
+    def test_accepts_scheduled_and_dispatched_runs(self, mock_retry) -> None:
+        """Run selection must NOT filter by event.
 
-        The Daily workflow also runs on pull_request, and those PR runs are
-        more recent than the nightly. Without the event filter the detector
-        picks a PR run (which has no test artifacts) instead of the nightly.
+        Manually dispatched Daily runs (workflow_dispatch) are as valid as
+        scheduled ones; PR runs are excluded by their conclusion/branch, not
+        by an event filter.
         """
         scheduled_run = _make_mock_run(12, 199, "failure")
 
@@ -162,7 +162,7 @@ class TestGetLatestDailyRun:
         result = get_latest_daily_run(mock_gh, "owner/repo")
         assert result == scheduled_run
         mock_workflow.get_runs.assert_called_once_with(
-            branch="unstable", status="completed", event="schedule",
+            branch="unstable", status="completed",
         )
 
     @patch("scripts.test_failure_detector.download.retry_github_call")

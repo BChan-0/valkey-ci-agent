@@ -28,6 +28,7 @@ from scripts.test_failure_detector.parse_failures import (
     FailureType,
     JobReference,
     UniqueFailure,
+    _VOLATILE_TEST_NAME_RE,
 )
 
 logger = logging.getLogger(__name__)
@@ -96,6 +97,10 @@ def parse_timeouts_from_log(
         test_file = match.group(2).strip()
         if not test_name or not test_file:
             continue
+
+        # Volatile names (bare PIDs, "hang") carry no stable test identity.
+        if _VOLATILE_TEST_NAME_RE.fullmatch(test_name):
+            test_name = ""
 
         key = (test_name, test_file)
         if key in seen:

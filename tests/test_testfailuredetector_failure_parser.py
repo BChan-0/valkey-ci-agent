@@ -428,10 +428,10 @@ class TestParseWithTypes:
         assert len(results) == 1
         assert results[0].failure_type == FailureType.EXCEPTION
 
-    def test_unknown_type_defaults_to_assertion(self) -> None:
+    def test_unknown_type_classified_as_exception(self) -> None:
         data = {"job": {"s": [{"test_name": "t", "test_file": "f.tcl", "type": "bogus", "error": "x"}]}}
         results = parse_and_deduplicate(data, {})
-        assert results[0].failure_type == FailureType.ASSERTION
+        assert results[0].failure_type == FailureType.EXCEPTION
 
     def test_entry_with_no_test_name_and_no_error_is_skipped(self) -> None:
         data = {"job": {"s": [{"test_name": "", "test_file": "f.tcl", "type": "sanitizer", "error": ""}]}}
@@ -463,3 +463,161 @@ class TestParseWithTypes:
         assert len(results) == 3
         types = {f.failure_type for f in results}
         assert types == {FailureType.ASSERTION, FailureType.VALGRIND, FailureType.TIMEOUT}
+
+
+class TestVolatileTestNameDemotion:
+    """Volatile test names (pid:NNN, hang) are runner-state artifacts, not real
+    test identities. They must be demoted to nameless so every run with a
+    different PID does not mint a new issue (#82, #86)."""
+
+    def test_pid_colon_number_demoted(self) -> None:
+        data = {
+            "job": {
+                "valkey": [{
+                    "test_name": "pid:92663",
+                    "test_file": "tests/integration/replication.tcl",
+                    "type": "timeout",
+                    "error": "Test timed out",
+                }]
+            }
+        }
+        results = parse_and_deduplicate(data, {})
+        assert len(results) == 1
+        assert results[0].test_name == ""
+        assert results[0].test_file == "tests/integration/replication.tcl"
+
+    def test_hang_demoted(self) -> None:
+        data = {
+            "job": {
+                "valkey": [{
+                    "test_name": "hang",
+                    "test_file": "tests/unit/cluster.tcl",
+                    "type": "timeout",
+                    "error": "Test timed out",
+                }]
+            }
+        }
+        results = parse_and_deduplicate(data, {})
+        assert len(results) == 1
+        assert results[0].test_name == ""
+
+    def test_different_pids_same_file_produce_one_failure(self) -> None:
+        """Two entries with different volatile PIDs in the same file should
+        collapse into one failure, not two."""
+        data = {
+            "job-a": {
+                "valkey": [{
+                    "test_name": "pid:111",
+                    "test_file": "tests/integration/replication.tcl",
+                    "type": "timeout",
+                    "error": "Test timed out",
+                }]
+            },
+            "job-b": {
+                "valkey": [{
+                    "test_name": "pid:222",
+                    "test_file": "tests/integration/replication.tcl",
+                    "type": "timeout",
+                    "error": "Test timed out",
+                }]
+            },
+        }
+        results = parse_and_deduplicate(data, {})
+        assert len(results) == 1
+        assert len(results[0].jobs) == 2
+
+    def test_real_test_name_not_demoted(self) -> None:
+        """Real test names that happen to contain 'pid' are not demoted."""
+        data = {
+            "job": {
+                "valkey": [{
+                    "test_name": "PSYNC2 test repid change",
+                    "test_file": "tests/integration/replication.tcl",
+                    "type": "timeout",
+                    "error": "Test timed out",
+                }]
+            }
+        }
+        results = parse_and_deduplicate(data, {})
+        assert results[0].test_name == "PSYNC2 test repid change"
+
+    def test_nameless_timeouts_in_different_files_stay_separate(self) -> None:
+        """After demotion, timeouts in different files must remain distinct
+        issues, not collapse into one."""
+        data = {
+            "job": {
+                "valkey": [
+                    {
+                        "test_name": "pid:111",
+                        "test_file": "tests/integration/replication.tcl",
+                        "type": "timeout",
+                        "error": "Test timed out",
+                    },
+                    {
+                        "test_name": "pid:222",
+                        "test_file": "tests/unit/cluster.tcl",
+                        "type": "timeout",
+                        "error": "Test timed out",
+                    },
+                ]
+            }
+        }
+        results = parse_and_deduplicate(data, {})
+        assert len(results) == 2
+        files = {f.test_file for f in results}
+        assert files == {
+            "tests/integration/replication.tcl",
+            "tests/unit/cluster.tcl",
+        }
+
+
+# Real-shaped Memcheck leak report (issue #91): runner wrapper prefix, tool
+# banner, heap summary, then the loss record with its allocation stack.
+_MEMCHECK_LEAK = """ Valgrind error: ==6554== Memcheck, a memory error detector
+==6554== Copyright (C) 2002-2022, and GNU GPL'd, by Julian Seward et al.
+==6554== Command: /path/to/valkey-server ./tests/tmp/valkey.conf.6549.2
+==6554== HEAP SUMMARY:
+==6554==     in use at exit: 1,080,661 bytes in 13,544 blocks
+==6554== 49 bytes in 1 blocks are definitely lost in loss record 900 of 1,109
+==6554==    at 0x4846828: malloc (in /usr/libexec/valgrind/vgpreload_memcheck-amd64-linux.so)
+==6554==    by 0x3189FB: ztrymalloc_usable_internal (zmalloc.c:172)
+==6554==    by 0x29072A: sdsdup (sds.c:190)
+==6554==    by 0x1E8076: debugCommand (debug.c:569)
+==6554==    by 0x2AD78C: call (server.c:3942)
+"""
+
+
+class TestValgrindLeakIdentity:
+    """Memcheck leak fingerprints must anchor on the allocation stack, not on
+    banner boilerplate or heap-layout coordinates that drift between runs."""
+
+    def test_identity_excludes_banner_and_heap_summary(self) -> None:
+        identity = normalize_error_identity(_MEMCHECK_LEAK)
+        assert "Memcheck, a memory error detector" not in identity
+        assert "HEAP SUMMARY" not in identity
+
+    def test_identity_excludes_loss_record_and_sizes(self) -> None:
+        identity = normalize_error_identity(_MEMCHECK_LEAK)
+        assert "loss record" not in identity
+        assert "49" not in identity
+
+    def test_identity_includes_allocation_stack(self) -> None:
+        identity = normalize_error_identity(_MEMCHECK_LEAK)
+        assert "debugCommand" in identity
+
+    def test_same_leak_across_runs_same_identity(self) -> None:
+        # Next run: new PID, drifted size, moved loss record.
+        rerun = (
+            _MEMCHECK_LEAK.replace("6554", "7801")
+            .replace("49 bytes in 1 blocks", "52 bytes in 1 blocks")
+            .replace("loss record 900 of 1,109", "loss record 903 of 1,214")
+            .replace("1,080,661 bytes in 13,544 blocks", "1,093,102 bytes in 13,671 blocks")
+        )
+        assert normalize_error_identity(_MEMCHECK_LEAK) == normalize_error_identity(rerun)
+
+    def test_different_allocation_stack_different_identity(self) -> None:
+        # Same report shape; the only difference is where the leak was allocated.
+        other = _MEMCHECK_LEAK.replace(
+            "debugCommand (debug.c:569)", "clusterCommand (cluster.c:123)",
+        )
+        assert normalize_error_identity(_MEMCHECK_LEAK) != normalize_error_identity(other)

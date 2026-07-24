@@ -26,6 +26,7 @@ try:
     )
     from scripts.test_failure_detector.manage_issues import (
         CLOSED_ISSUE_LOOKBACK,
+        _merge_same_fingerprint_failures,
         process_failures,
     )
     from scripts.test_failure_detector.parse_failures import (
@@ -278,6 +279,79 @@ class TestProcessFailures:
         assert content.title.startswith("[TEST-FAILURE]")
 
 
+def _make_valgrind_failure(size: str, job: str) -> UniqueFailure:
+    """A nameless valgrind leak whose byte count varies run to run.
+
+    The parser keeps the two size variants as distinct UniqueFailures while
+    the fingerprint normalizes digits away, so the pair collides on one
+    fingerprint. `Invalid read of size N` is used because the count scrubber
+    only strips bytes/blocks phrases, leaving the digit for the fingerprint
+    normalizer to collapse.
+    """
+    return UniqueFailure(
+        test_name="", test_file="tests/unit/dummy.tcl",
+        failure_type=FailureType.VALGRIND,
+        error=(
+            f"==1== Invalid read of size {size}\n"
+            "==1==    at 0xA: dictResize (dict.c:100)"
+        ),
+        jobs=[JobReference(job=job, suite="s", url=f"https://ci/{job}")],
+    )
+
+
+class TestMergeSameFingerprintFailures:
+    """Same-run failures that hash to one fingerprint must publish as one
+    issue carrying every job, not race for it (the run-id idempotency key
+    rejects the loser and its environments/CI links silently vanish, which is
+    why issue #91 listed one environment though both valgrind jobs failed)."""
+
+    def test_same_fingerprint_failures_merge_jobs(self) -> None:
+        f1 = _make_valgrind_failure("4", "valgrind-ubuntu")
+        f2 = _make_valgrind_failure("8", "valgrind-arm64")
+        assert fingerprint_for(f1) == fingerprint_for(f2)
+
+        merged = _merge_same_fingerprint_failures([f1, f2])
+
+        assert len(merged) == 1
+        assert {j.job for j in merged[0].jobs} == {"valgrind-ubuntu", "valgrind-arm64"}
+
+    def test_merge_does_not_duplicate_shared_job(self) -> None:
+        f1 = _make_valgrind_failure("4", "valgrind-ubuntu")
+        f2 = _make_valgrind_failure("8", "valgrind-ubuntu")
+
+        merged = _merge_same_fingerprint_failures([f1, f2])
+
+        assert len(merged) == 1
+        assert [j.job for j in merged[0].jobs] == ["valgrind-ubuntu"]
+
+    def test_distinct_fingerprints_stay_separate(self) -> None:
+        failures = [
+            _make_failure(test_name="a"),
+            _make_failure(test_name="b"),
+        ]
+        assert _merge_same_fingerprint_failures(failures) == failures
+
+    @patch("scripts.test_failure_detector.manage_issues.IssueDedupPublisher")
+    def test_process_failures_publishes_colliding_pair_once(self, mock_publisher_cls) -> None:
+        """End to end: the colliding pair reaches upsert as ONE failure whose
+        render carries both environments, instead of a second upsert that the
+        idempotency key would reject."""
+        publisher = mock_publisher_cls.return_value
+        publisher.upsert.return_value = ("created", "https://x/issues/91")
+
+        f1 = _make_valgrind_failure("4", "valgrind-ubuntu")
+        f2 = _make_valgrind_failure("8", "valgrind-arm64")
+        result = process_failures(
+            MagicMock(), "valkey-io/valkey", [f1, f2], run_id=29944432899,
+        )
+
+        assert result == {"created": 1, "updated": 0, "skipped": 0, "errors": 0}
+        assert publisher.upsert.call_count == 1
+        body = publisher.upsert.call_args.kwargs["render"]("<!-- m -->", 1).body
+        assert "`valgrind-ubuntu`" in body
+        assert "`valgrind-arm64`" in body
+
+
 class TestRecurrenceCommentNewlyFailing:
     """The recurrence comment calls out environments failing for the first time
     on this run (PR #24 review r3431750542)."""
@@ -477,6 +551,72 @@ class TestTypeSpecificRendering:
         )
         assert title_for(f).startswith("[VALGRIND]")
 
+    def test_valgrind_leak_title_format(self) -> None:
+        # Issue #91/#93: the Memcheck banner is the first line of every
+        # valgrind report, so a first-line title gives all valgrind issues
+        # the same name. A leak title leads with the leak kind, then the
+        # size and the first non-plumbing source frame:
+        # "Definitely lost: 49 bytes in debugCommand (debug.c:569)".
+        error = (
+            " Valgrind error: ==6554== Memcheck, a memory error detector\n"
+            "==6554== Copyright (C) 2002-2022, and GNU GPL'd, by Julian Seward et al.\n"
+            "==6554== HEAP SUMMARY:\n"
+            "==6554== 49 bytes in 1 blocks are definitely lost in loss record 900 of 1,109\n"
+            "==6554==    at 0x4846828: malloc (in /usr/libexec/valgrind/vgpreload_memcheck-amd64-linux.so)\n"
+            "==6554==    by 0x3189FB: ztrymalloc_usable_internal (zmalloc.c:172)\n"
+            "==6554==    by 0x2902DE: _sdsnewlen (sds.c:102)\n"
+            "==6554==    by 0x1E8076: debugCommand (debug.c:569)\n"
+        )
+        f = UniqueFailure(
+            test_name="", test_file="tests/unit/dummy-memory.tcl",
+            failure_type=FailureType.VALGRIND,
+            error=error,
+            jobs=[JobReference(job="j", suite="s", url="u")],
+        )
+        title = title_for(f)
+        assert title == (
+            "[VALGRIND] Definitely lost: 49 bytes in debugCommand (debug.c:569)"
+            " (tests/unit/dummy-memory.tcl)"
+        )
+
+    def test_valgrind_leak_title_ignores_loss_record_and_pid_drift(self) -> None:
+        # Loss-record coordinates and PIDs drift between runs of the same
+        # leak and must not affect the title. The size is shown as-is (the
+        # publisher refreshes the title on recurrence; dedup is owned by the
+        # fingerprint, which scrubs sizes).
+        def leak(record: str, pid: str) -> UniqueFailure:
+            error = (
+                f" Valgrind error: =={pid}== Memcheck, a memory error detector\n"
+                f"=={pid}== 49 bytes in 1 blocks are definitely lost in {record}\n"
+                f"=={pid}==    by 0x1E8076: debugCommand (debug.c:569)\n"
+            )
+            return UniqueFailure(
+                test_name="", test_file="tests/unit/dummy-memory.tcl",
+                failure_type=FailureType.VALGRIND, error=error,
+                jobs=[JobReference(job="j", suite="s", url="u")],
+            )
+        t1 = title_for(leak("loss record 900 of 1,109", "6554"))
+        t2 = title_for(leak("loss record 903 of 1,214", "7801"))
+        assert t1 == t2
+        assert "loss record" not in t1
+        assert "6554" not in t1
+
+    def test_valgrind_titles_distinguish_different_leak_sites(self) -> None:
+        def leak(site: str) -> UniqueFailure:
+            error = (
+                " Valgrind error: ==1== Memcheck, a memory error detector\n"
+                "==1== 49 bytes in 1 blocks are definitely lost in loss record 900 of 1,109\n"
+                f"==1==    by 0x1E8076: {site}\n"
+            )
+            return UniqueFailure(
+                test_name="", test_file="tests/unit/dummy-memory.tcl",
+                failure_type=FailureType.VALGRIND, error=error,
+                jobs=[JobReference(job="j", suite="s", url="u")],
+            )
+        t_debug = title_for(leak("debugCommand (debug.c:569)"))
+        t_cluster = title_for(leak("clusterCommand (cluster.c:123)"))
+        assert t_debug != t_cluster
+
     def test_timeout_title_with_test_name(self) -> None:
         f = UniqueFailure(
             test_name="PSYNC2 test",
@@ -569,3 +709,136 @@ class TestTypeSpecificRendering:
         )
         body = _build_body(f, marker="<!-- m -->", occurrences=3)
         assert "valkey-ci-agent:valgrind-error:occurrences:3" in body
+
+
+class TestVolatileTimeoutFingerprint:
+    """Nameless timeouts (volatile PID demoted) must have a stable fingerprint
+    keyed by file, not by the generic error text (#82, #86)."""
+
+    def test_nameless_timeout_fingerprint_stable_across_pids(self) -> None:
+        f1 = UniqueFailure(
+            test_name="", test_file="tests/integration/replication.tcl",
+            failure_type=FailureType.TIMEOUT, error="Test timed out",
+        )
+        f2 = UniqueFailure(
+            test_name="", test_file="tests/integration/replication.tcl",
+            failure_type=FailureType.TIMEOUT, error="Test timed out",
+        )
+        assert fingerprint_for(f1) == fingerprint_for(f2)
+
+    def test_nameless_timeouts_in_different_files_differ(self) -> None:
+        f1 = UniqueFailure(
+            test_name="", test_file="tests/integration/replication.tcl",
+            failure_type=FailureType.TIMEOUT, error="Test timed out",
+        )
+        f2 = UniqueFailure(
+            test_name="", test_file="tests/unit/cluster.tcl",
+            failure_type=FailureType.TIMEOUT, error="Test timed out",
+        )
+        assert fingerprint_for(f1) != fingerprint_for(f2)
+
+    def test_nameless_timeout_title_uses_file_not_pid(self) -> None:
+        f = UniqueFailure(
+            test_name="", test_file="tests/integration/replication.tcl",
+            failure_type=FailureType.TIMEOUT, error="Test timed out",
+            jobs=[JobReference(job="j", suite="s", url="u")],
+        )
+        title = title_for(f)
+        assert "pid" not in title.lower()
+        assert "replication.tcl" in title
+
+
+class TestValgrindBannerTitle:
+    """The valgrind runner prepends a banner ('Valgrind error: Memcheck, a
+    memory error detector') that every valgrind issue would share. The title
+    must surface the real diagnostic line instead (#91)."""
+
+    def test_title_uses_diagnostic_not_banner(self) -> None:
+        error = (
+            " Valgrind error: ==6554== Memcheck, a memory error detector\n"
+            "==6554== Copyright (C) 2002-2022\n"
+            "==6554== \n"
+            "==6554== HEAP SUMMARY:\n"
+            "==6554== 49 bytes in 1 blocks are definitely lost in loss record 900\n"
+            "==6554==    at 0x4846828: malloc (...)\n"
+        )
+        f = UniqueFailure(
+            test_name="", test_file="tests/unit/dummy-memory.tcl",
+            failure_type=FailureType.VALGRIND, error=error,
+            jobs=[JobReference(job="j", suite="s", url="u")],
+        )
+        title = title_for(f)
+        assert "Memcheck" not in title
+        # No source frame in this trace (only the malloc interceptor), so the
+        # title is kind + size without a site.
+        assert "Definitely lost: 49 bytes" in title
+        assert "dummy-memory.tcl" in title
+
+    def test_sanitizer_banner_stripped(self) -> None:
+        error = (
+            " Sanitizer error: \n"
+            "==12617==ERROR: LeakSanitizer: detected memory leaks\n"
+            "Direct leak of 41 byte(s)\n"
+        )
+        f = UniqueFailure(
+            test_name="", test_file="tests/unit/foo.tcl",
+            failure_type=FailureType.SANITIZER, error=error,
+            jobs=[JobReference(job="j", suite="s", url="u")],
+        )
+        title = title_for(f)
+        assert "Sanitizer error:" not in title
+        assert "detected memory leaks" in title
+
+
+def _macos_leaks_error(pid: int, leaks: int, leaked_bytes: int, address: str) -> str:
+    """A macOS /usr/bin/leaks failure blob as recorded in the artifact
+    (real shape from valkey-io Daily run 29461435670, test-macos-latest)."""
+    return (
+        f" Check for memory leaks (pid {pid}) in tests/unit/multi.tcl\n"
+        f"Expected '*0 leaks*' to equal or match 'Process:         valkey-server [{pid}]\n"
+        "Path:            /Users/USER/*/valkey-server\n"
+        "Load Address:    0x102610000\n"
+        "Platform:        macOS\n"
+        "Analysis Tool:   /usr/bin/leaks\n"
+        "----\n"
+        "leaks Report Version: 4.0\n"
+        f"Process {pid}: 14810 nodes malloced for 1403 KB\n"
+        f"Process {pid}: {leaks} leak for {leaked_bytes} total leaked bytes.\n"
+        "\n"
+        f"    {leaks} ({leaked_bytes} bytes) ROOT LEAK: {address} [{leaked_bytes}]\n"
+        "\n"
+        "child process exited abnormally'\n"
+    )
+
+
+class TestMacosLeaksTitle:
+    """macOS /usr/bin/leaks failures (the memory-leak type). Their first line
+    is the Tcl test name with a volatile PID; the title must surface the
+    report's totals line instead (#92)."""
+
+    def _failure(self, error: str) -> UniqueFailure:
+        return UniqueFailure(
+            test_name="", test_file="tests/unit/multi.tcl",
+            failure_type=FailureType.MEMORY_LEAK, error=error,
+            jobs=[JobReference(job="test-macos-latest", suite="valkey", url="u")],
+        )
+
+    def test_title_uses_leaks_totals_line(self) -> None:
+        f = self._failure(_macos_leaks_error(9443, 1, 48, "0x953074d20"))
+        title = title_for(f)
+        assert title == (
+            "[MEMORY-LEAK] 1 leak for 48 total leaked bytes"
+            " (tests/unit/multi.tcl)"
+        )
+
+    def test_title_stable_across_pids_and_addresses(self) -> None:
+        t1 = title_for(self._failure(_macos_leaks_error(9443, 1, 48, "0x953074d20")))
+        t2 = title_for(self._failure(_macos_leaks_error(7211, 1, 48, "0x9dd024100")))
+        assert t1 == t2
+        assert "9443" not in t1
+        assert "pid" not in t1.lower()
+
+    def test_titles_distinguish_leak_magnitudes(self) -> None:
+        t1 = title_for(self._failure(_macos_leaks_error(9443, 1, 48, "0x953074d20")))
+        t2 = title_for(self._failure(_macos_leaks_error(9443, 12, 4096, "0x953074d20")))
+        assert t1 != t2

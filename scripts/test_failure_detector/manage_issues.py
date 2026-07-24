@@ -27,6 +27,47 @@ logger = logging.getLogger(__name__)
 CLOSED_ISSUE_LOOKBACK = timedelta(days=1)
 
 
+def _merge_same_fingerprint_failures(
+    failures: list[UniqueFailure],
+) -> list[UniqueFailure]:
+    """Merge failures that share a dedup fingerprint so they publish as one.
+
+    The parser groups by normalized error text, which keeps small run-specific
+    numbers distinct (41- vs 49-byte variants of one leak), while the
+    fingerprint normalizes digits away. Same-run failures that hash to one
+    fingerprint would otherwise race for one issue: the first upsert creates it
+    and stamps the run id, the second is rejected by the idempotency key and
+    its jobs (environments, CI links) silently vanish. Merging by the
+    published identity keeps every job reference on the surviving failure.
+    """
+    merged: dict[str, UniqueFailure] = {}
+    unmergeable: list[UniqueFailure] = []
+    for failure in failures:
+        try:
+            fingerprint = issue_renderer.fingerprint_for(failure)
+        except Exception:
+            # Merging is best-effort and must not abort the batch; pass the
+            # failure through so the publish loop reports it as an error.
+            logger.warning(
+                "Could not fingerprint %s for same-run merging; passing it through",
+                failure.display_name, exc_info=True,
+            )
+            unmergeable.append(failure)
+            continue
+        existing = merged.get(fingerprint)
+        if existing is None:
+            merged[fingerprint] = failure
+            continue
+        logger.info(
+            "Merging %s into %s: both hash to fingerprint %s",
+            failure.display_name, existing.display_name, fingerprint,
+        )
+        for job_ref in failure.jobs:
+            if not any(j.job == job_ref.job for j in existing.jobs):
+                existing.jobs.append(job_ref)
+    return list(merged.values()) + unmergeable
+
+
 def process_failures(
     gh: Github,
     repo_full_name: str,
@@ -35,6 +76,10 @@ def process_failures(
     run_id: int | None = None,
 ) -> dict[str, int]:
     """Create or update GitHub issues for each unique failure.
+
+    Failures whose dedup fingerprints collide are merged into one upsert
+    before publishing (see :func:`_merge_same_fingerprint_failures`), so the
+    issue records every failing job instead of dropping all but the first.
 
     ``run_id``, when supplied, is used as the dedup idempotency key so a
     re-triggered cron analyzing the same CI run does not inflate the
@@ -47,17 +92,11 @@ def process_failures(
     processed; they are logged and skipped so one bad failure cannot abort the
     rest of the batch.
     """
-    publisher = IssueDedupPublisher(
-        gh,
-        marker_namespace=issue_renderer.MARKER_NAMESPACE,
-        # Opt in to recently-closed suppression: the detector lags the Daily CI,
-        # so an already-fixed failure must not be re-filed.
-        closed_lookback=CLOSED_ISSUE_LOOKBACK,
-        filter_label=issue_renderer.LABEL_NAME,
-    )
     idempotency_key = str(run_id) if run_id is not None else None
 
     summary = {"created": 0, "updated": 0, "skipped": 0, "skipped_closed": 0, "errors": 0}
+
+    failures = _merge_same_fingerprint_failures(failures)
 
     for failure in failures:
         # Isolate each failure: a raised exception (e.g. a GitHub API error that
@@ -66,9 +105,15 @@ def process_failures(
         # move on so the rest of the batch is still processed.
         try:
             # Use the type-specific marker namespace so different failure types
-            # get distinct issue search scopes and cannot collide.
-            ns = issue_renderer.marker_namespace_for(failure)
-            publisher = IssueDedupPublisher(gh, marker_namespace=ns)
+            # get distinct issue search scopes and cannot collide. The
+            # recently-closed suppression must be carried over here too, or a
+            # failure fixed since the Daily run would be re-filed.
+            publisher = IssueDedupPublisher(
+                gh,
+                marker_namespace=issue_renderer.marker_namespace_for(failure),
+                closed_lookback=CLOSED_ISSUE_LOOKBACK,
+                filter_label=issue_renderer.label_for(failure),
+            )
 
             # The render and body_transform hooks are coupled (they share the
             # set of newly failing environments), so they come from one renderer.

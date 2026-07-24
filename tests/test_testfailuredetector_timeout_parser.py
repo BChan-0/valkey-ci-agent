@@ -129,6 +129,27 @@ class TestParseTimeoutsFromLog:
         results = parse_timeouts_from_log(b"\x00\xff\xfe" * 100, "job")
         assert results == []
 
+    def test_volatile_pid_name_demoted(self) -> None:
+        """Log-recovered timeout with a volatile PID name gets demoted to
+        nameless so it produces a stable fingerprint (#82, #86)."""
+        log = b"[TIMEOUT]: pid:92663 in tests/integration/replication.tcl\n"
+        results = parse_timeouts_from_log(log, "job")
+        assert len(results) == 1
+        assert results[0].test_name == ""
+        assert results[0].test_file == "tests/integration/replication.tcl"
+
+    def test_volatile_hang_name_demoted(self) -> None:
+        log = b"[TIMEOUT]: hang in tests/unit/cluster.tcl\n"
+        results = parse_timeouts_from_log(log, "job")
+        assert len(results) == 1
+        assert results[0].test_name == ""
+
+    def test_real_name_not_demoted(self) -> None:
+        log = b"[TIMEOUT]: PSYNC2 test in tests/integration/replication-psync.tcl\n"
+        results = parse_timeouts_from_log(log, "job")
+        assert len(results) == 1
+        assert results[0].test_name == "PSYNC2 test"
+
 
 # --- find_job_log ---
 

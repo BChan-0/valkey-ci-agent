@@ -56,6 +56,68 @@ _SIGNIFICANT_KEYWORDS = (
     "definitely lost", "LEAK SUMMARY",
 )
 
+# Report boilerplate that matches a significance keyword but is identical in
+# every valgrind run, so it carries no bug identity. The "error:" keyword
+# would otherwise match the tool banner via the runner's wrapper prefix
+# ("Valgrind error: ==123== Memcheck, ...").
+_BOILERPLATE_SUBSTRINGS = (
+    "Memcheck, a memory error detector",
+    "HEAP SUMMARY:",
+    "LEAK SUMMARY:",
+)
+
+# Heap-layout coordinates and allocation sizes: the same leak moves between
+# loss records and can vary in size run to run, so these must not feed the
+# fingerprint identity.
+_VOLATILE_COUNT_PATTERNS = (
+    re.compile(r"\bin loss record \d[\d,]* of \d[\d,]*"),
+    re.compile(r"\b\d[\d,]*\s+(?:bytes?|blocks?)\b"),
+    # Any remaining thousands-separated number is a count/size.
+    re.compile(r"\b\d{1,3}(?:,\d{3})+\b"),
+)
+
+# A valgrind stack frame after volatile stripping: "at : malloc (...)" or
+# "by : sdsdup (sds.c:190)". The function names are the stable identity
+# anchor for a leak; addresses, sizes, and loss records around them are not.
+_STACK_FRAME_RE = re.compile(r"^(?:at|by)\s*:\s*(?P<func>[^\s(]+)")
+
+
+def _extract_stack_anchor(lines: list[str]) -> str:
+    """Function-name chain of the first stack block in a valgrind report.
+
+    Distinguishes two different leaks whose report lines are otherwise
+    identical after count scrubbing (e.g. same "definitely lost" shape but
+    allocated from debugCommand vs clusterCommand). Returns "" when the
+    error has no at/by frames (assertions, startup failures).
+    """
+    frames: list[str] = []
+    in_stack = False
+    for line in lines:
+        match = _STACK_FRAME_RE.match(line)
+        if match:
+            in_stack = True
+            frames.append(match.group("func"))
+            if len(frames) >= 8:
+                break
+        elif in_stack:
+            # First stack block ended; a second block would belong to a
+            # different loss record and make the identity order-sensitive.
+            break
+    if not frames:
+        return ""
+    return "stack: " + " > ".join(frames)
+
+# Test names that carry no real test identity: they're volatile artifacts of
+# whatever the runner happened to be doing when it timed out (spawning a
+# server, between tests). Using them as identity would mint a fresh
+# fingerprint (and a fresh issue) every run.
+_VOLATILE_TEST_NAME_RE = re.compile(
+    r"^(?:"
+    r"pid:\d+"           # server PID annotation: "pid:92663"
+    r"|hang"             # generic "hang in <file> (last state: ...)"
+    r")$"
+)
+
 
 def normalize_error_identity(error: str) -> str:
     """Extract a stable identity from an error message for fingerprinting.
@@ -70,19 +132,29 @@ def normalize_error_identity(error: str) -> str:
     text = error
     for pattern in _VOLATILE_PATTERNS:
         text = pattern.sub("", text)
+    for pattern in _VOLATILE_COUNT_PATTERNS:
+        text = pattern.sub("", text)
 
     lines = [line.strip() for line in text.split("\n") if line.strip()]
 
-    # Extract up to 3 significant lines for the identity
+    # Extract up to 3 significant lines for the identity, skipping tool
+    # boilerplate that is identical in every run of every bug.
     significant: list[str] = []
     for line in lines[:30]:
+        if any(bp in line for bp in _BOILERPLATE_SUBSTRINGS):
+            continue
         if any(kw in line for kw in _SIGNIFICANT_KEYWORDS):
             significant.append(line)
             if len(significant) >= 3:
                 break
 
+    # The stack frames pin the identity to the code path (two leaks with
+    # identical report lines but different allocation sites stay distinct).
+    stack_anchor = _extract_stack_anchor(lines)
     if significant:
-        return "\n".join(significant)
+        return "\n".join([*significant, stack_anchor] if stack_anchor else significant)
+    if stack_anchor:
+        return stack_anchor
     # Fall back to first 3 non-empty lines
     return "\n".join(lines[:3])
 
@@ -176,12 +248,35 @@ def parse_and_deduplicate(
                 try:
                     failure_type = FailureType(raw_type)
                 except ValueError:
-                    logger.debug("Unknown failure type %r, defaulting to assertion", raw_type)
-                    failure_type = FailureType.ASSERTION
+                    # The producer emits a type this enum doesn't know yet.
+                    # Exception is the catch-all for non-assertion errors;
+                    # warn so producer/consumer drift is visible in run logs.
+                    logger.warning(
+                        "Unknown failure type %r, classifying as exception", raw_type
+                    )
+                    failure_type = FailureType.EXCEPTION
+
+                # Volatile test names (bare PIDs, "hang") are transient
+                # runner state, not real test identity. Demote them so the
+                # grouping key is stable across runs.
+                if test_name and _VOLATILE_TEST_NAME_RE.fullmatch(test_name):
+                    logger.info(
+                        "Demoted volatile test name %r to nameless "
+                        "(type=%s, file=%s, job=%s)",
+                        test_name, failure_type.value, test_file, job_name,
+                    )
+                    test_name = ""
 
                 # Determine grouping key
                 if test_name:
                     key: tuple = (failure_type, test_name, test_file)
+                elif failure_type == FailureType.TIMEOUT and test_file:
+                    # Nameless timeouts (volatile PID/hang demoted above, or
+                    # captured without a test body running) group by file:
+                    # the error text is generic ("Test timed out") across all
+                    # timeouts, so without the file every timeout in the run
+                    # would collapse into one issue.
+                    key = (failure_type, test_file)
                 elif error:
                     identity = normalize_error_identity(error)
                     key = (failure_type, identity)

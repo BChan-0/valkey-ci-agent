@@ -74,7 +74,11 @@ def fingerprint_for(failure: UniqueFailure) -> str:
     than ``shapes``, which keeps digits significant so PSYNC2 and PSYNC3 stay
     distinct and preserves order so a name/file swap cannot collide.
 
-    For failures without a test_name (sanitizer/valgrind/startup): hash of
+    For nameless timeouts: hash of (type_namespace, test_file). The error text
+    is always a generic "Test timed out" shared by all timeouts, so including
+    it would collapse unrelated timeouts in different files into one issue.
+
+    For other nameless failures (sanitizer/valgrind/startup): hash of
     (type_namespace,) with the normalized error as shapes input. This means the
     same bug detected after different test files produces the same fingerprint.
     """
@@ -83,6 +87,11 @@ def fingerprint_for(failure: UniqueFailure) -> str:
     if failure.has_test_identity:
         return compute_fingerprint(
             namespace=(ns, failure.test_name, failure.test_file),
+            shapes=(),
+        )
+    elif failure.failure_type == FailureType.TIMEOUT and failure.test_file:
+        return compute_fingerprint(
+            namespace=(ns, failure.test_file),
             shapes=(),
         )
     else:
@@ -157,15 +166,147 @@ class _FailureRenderer:
         return new_error
 
 
+# Keywords that mark a line as carrying diagnostic content rather than
+# boilerplate. Used by _error_summary_line to prefer the real payload over
+# the generic runner prefix/banner.
+_TITLE_KEYWORDS = (
+    "Invalid", "definitely lost", "indirectly lost",
+    "heap-buffer-overflow", "heap-use-after-free",
+    "stack-buffer-overflow", "use-after-poison",
+    "uninitialized", "runtime error",
+    "detected memory leaks", "LEAK SUMMARY",
+    "fishy", "overlap", "Mismatched",
+)
+
+
+# Heap-layout coordinates in a diagnostic line ("in loss record 900 of
+# 1,109") shift between runs of the same bug. The fingerprint already
+# scrubs them; the title must too, or each recurrence rewrites the title
+# of the same issue.
+_LOSS_RECORD_RE = re.compile(r"\s*\bin loss record \d[\d,]* of \d[\d,]*")
+
+# Allocation sizes drift run to run for the same leak ("49 bytes" vs
+# "52 bytes"), so titles show them as N: "N bytes in N blocks are
+# definitely lost".
+_COUNT_RE = re.compile(r"\b\d[\d,]*(\s+(?:bytes?|blocks?|byte\(s\)|object\(s\)))\b")
+
+# Stack frame naming a source location: "by 0x1E8076: debugCommand
+# (debug.c:569)". Frames in tool preload libraries (malloc interceptors)
+# name no source file:line, so they never match.
+_SOURCE_FRAME_RE = re.compile(
+    r"^\s*(?:at|by)\s+0x[0-9a-fA-F]+:\s*(?P<func>\S+)\s+\((?P<file>[^():]+):(?P<line>\d+)\)"
+)
+
+# A valgrind leak record: "49 bytes in 1 blocks are definitely lost ...".
+# The title reformats it as "Definitely lost: 49 bytes in <site>". Unlike the
+# fingerprint (which scrubs sizes as volatile), the title shows the real
+# size: maintainers triage leaks by magnitude, and the publisher refreshes
+# the title on each recurrence, so drift just keeps it current.
+_LEAK_RECORD_RE = re.compile(
+    r"(?P<size>\d[\d,]*\s+bytes?)\s+in\s+\d[\d,]*\s+blocks?\s+are\s+"
+    r"(?P<kind>definitely|indirectly|possibly)\s+lost"
+)
+
+# The totals line of a macOS /usr/bin/leaks report: "Process 9443: 1 leak for
+# 48 total leaked bytes." This is the memory-leak type's payload. The type is
+# NOT redundant with valgrind/sanitizer: it is the only leak detector on the
+# macos jobs (valgrind has no Apple Silicon port; the CI matrix builds ASan
+# only on Linux), it inspects the live server after each test file rather
+# than at exit, and Daily run 29461435670 caught a real 32-byte leak with it
+# that the same run's four Linux valgrind/ASan jobs all missed.
+_LEAKS_TOTAL_RE = re.compile(
+    r"Process\s+\d+:\s*"
+    r"(?P<phrase>\d[\d,]*\s+leaks?\s+for\s+\d[\d,]*\s+total\s+leaked\s+bytes)"
+)
+
+# Allocation plumbing every valkey heap operation passes through. Frames in
+# these files say nothing about which code path leaked; the distinctive
+# frame is their first caller outside this set.
+_ALLOC_WRAPPER_FILES = frozenset({"zmalloc.c", "sds.c"})
+
+
+def _leak_site(error: str) -> str:
+    """Distinctive "func (file:line)" in the report's first stack, or "".
+
+    Skips allocator-wrapper frames so the site names the code path that
+    leaked (debugCommand (debug.c:569)), not the shared plumbing
+    (ztrymalloc_usable). Falls back to the first source frame when the
+    whole stack is wrappers.
+    """
+    first_source_site = ""
+    for line in error.split("\n"):
+        line = re.sub(r"==\d+==\s*", "", line).strip()
+        match = _SOURCE_FRAME_RE.match(line)
+        if not match:
+            continue
+        source_file = match.group("file").rsplit("/", 1)[-1]
+        site = f"{match.group('func')} ({source_file}:{match.group('line')})"
+        if not first_source_site:
+            first_source_site = site
+        if source_file not in _ALLOC_WRAPPER_FILES:
+            return site
+    return first_source_site
+
+
 def _error_summary_line(error: str) -> str:
-    """Extract a short (<=60 char) summary from an error for the title."""
+    """Extract a short (<=60 char) summary from an error for the title.
+
+    Strips ANSI codes and valgrind PID annotations, then drops the runner's
+    wrapper prefix ("Valgrind error: ...", "Sanitizer error: ...") which is
+    always the same across issues. Prefers lines containing diagnostic
+    keywords over generic banners so different bugs get distinct titles,
+    and names the first user-code stack frame so two bugs with the same
+    diagnostic line stay tellable apart in an issue list.
+    """
+    # A macOS leaks report's first line is the Tcl test name with a volatile
+    # PID ("Check for memory leaks (pid 9443) in ..."); the payload is the
+    # totals line. The leaked-bytes figure is shown as-is for the same
+    # reason valgrind sizes are (title refreshes on recurrence).
+    leaks_total = _LEAKS_TOTAL_RE.search(error)
+    if leaks_total:
+        return leaks_total.group("phrase")[:60]
+
     clean = re.sub(r"\033\[[0-9;]*m", "", error)
     clean = re.sub(r"==\d+==\s*", "", clean)
+    # The test runner prepends "Valgrind error: <valgrind banner>" or
+    # "Sanitizer error: ..." on the first line. Strip it so the summary
+    # comes from the actual report, not the wrapper.
+    clean = re.sub(
+        r"^\s*(?:Valgrind|Sanitizer)\s+error:\s*", "", clean, count=1,
+    )
+
+    candidates = []
     for line in clean.split("\n"):
         line = line.strip()
         if line and not line.startswith("at ") and len(line) > 5:
-            return line[:60]
-    return clean[:60] if clean.strip() else "unknown error"
+            candidates.append(line)
+
+    # Prefer a line carrying a diagnostic keyword over the first non-empty
+    # line (which is often a generic banner like "Memcheck, a memory error
+    # detector" that every valgrind issue would share).
+    for line in candidates:
+        if any(kw in line for kw in _TITLE_KEYWORDS):
+            leak = _LEAK_RECORD_RE.search(line)
+            if leak:
+                # Lead with the leak kind, then size and site: "Definitely
+                # lost: 49 bytes in debugCommand (debug.c:569)".
+                summary = f"{leak.group('kind').capitalize()} lost: {leak.group('size')}"
+                site = _leak_site(error)
+                if site:
+                    summary = f"{summary} in {site}"
+                # 80 instead of the generic 60: the site is the
+                # distinguishing token and must survive truncation.
+                return summary[:80]
+            summary = _LOSS_RECORD_RE.sub("", line)
+            summary = _COUNT_RE.sub(r"N\1", summary)
+            site = _leak_site(error)
+            if site and site not in summary:
+                summary = f"{summary} in {site}"
+            return summary[:60]
+
+    if candidates:
+        return candidates[0][:60]
+    return clean.strip()[:60] if clean.strip() else "unknown error"
 
 
 def _build_title(failure: UniqueFailure) -> str:
