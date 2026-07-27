@@ -57,9 +57,9 @@ def _merge_timeout_recoveries(
 ) -> list[UniqueFailure]:
     """Merge log-recovered timeouts into the artifact-derived failure list.
 
-    If the same test already appears as a TIMEOUT from the artifact (because
-    the updated test_helper.tcl captured it), fold the recovered job references
-    into the existing entry rather than creating a duplicate.
+    If the same test already appears as a TIMEOUT from the artifact (the
+    runner captured it before the watchdog fired), fold the recovered job
+    references into the existing entry rather than creating a duplicate.
     """
     if not timeout_failures:
         return unique_failures

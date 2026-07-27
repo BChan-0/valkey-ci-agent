@@ -9,7 +9,9 @@ For failures WITH a test_name (assertions, timeouts, gtest), the identity is
 the (type, test_name, test_file) triple. For failures WITHOUT a test_name
 (sanitizer/valgrind/startup), the identity is (type, normalized_error), so the
 same underlying bug produces one issue regardless of which test file triggered
-the detection.
+the detection. Titles follow the identity: the test file appears only for types
+whose fingerprint keys on it, so a title is not rewritten when the same bug is
+detected under a different file.
 """
 
 from __future__ import annotations
@@ -190,11 +192,25 @@ _LOSS_RECORD_RE = re.compile(r"\s*\bin loss record \d[\d,]* of \d[\d,]*")
 # definitely lost".
 _COUNT_RE = re.compile(r"\b\d[\d,]*(\s+(?:bytes?|blocks?|byte\(s\)|object\(s\)))\b")
 
-# Stack frame naming a source location: "by 0x1E8076: debugCommand
+# An AddressSanitizer diagnostic line ends in a volatile address dump
+# ("heap-use-after-free on address 0x60... at pc 0x... bp 0x... sp 0x..."). The
+# address and registers change every run of the same bug; the fingerprint
+# scrubs them, so the title must too or it is rewritten on each recurrence.
+_ASAN_ADDR_NOISE_RE = re.compile(r"\s+on address 0x[0-9a-fA-F]+.*$")
+
+# Valgrind stack frame naming a source location: "by 0x1E8076: debugCommand
 # (debug.c:569)". Frames in tool preload libraries (malloc interceptors)
 # name no source file:line, so they never match.
 _SOURCE_FRAME_RE = re.compile(
     r"^\s*(?:at|by)\s+0x[0-9a-fA-F]+:\s*(?P<func>\S+)\s+\((?P<file>[^():]+):(?P<line>\d+)\)"
+)
+
+# Sanitizer stack frame naming a source location: "#4 0x55ba... in debugCommand
+# /home/runner/.../src/debug.c:569:9". The malloc interceptor frame carries a
+# parenthesized binary offset ("in malloc (.../valkey-server+0x20de33)") rather
+# than a file:line, so it never matches.
+_SAN_SOURCE_FRAME_RE = re.compile(
+    r"^#\d+\s+0x[0-9a-fA-F]+\s+in\s+(?P<func>\S+)\s+(?P<file>\S+?):(?P<line>\d+)(?::\d+)?\b"
 )
 
 # A valgrind leak record: "49 bytes in 1 blocks are definitely lost ...".
@@ -207,9 +223,17 @@ _LEAK_RECORD_RE = re.compile(
     r"(?P<kind>definitely|indirectly|possibly)\s+lost"
 )
 
+# The AddressSanitizer/LeakSanitizer summary line: "SUMMARY: AddressSanitizer:
+# 41 byte(s) leaked in 1 allocation(s)." The banner ("detected memory leaks")
+# names no magnitude; this line does. The leaked-byte figure is shown as-is for
+# the same reason valgrind sizes are (the title refreshes on recurrence).
+_SANITIZER_LEAK_RE = re.compile(
+    r"(?P<size>\d[\d,]*\s+byte\(s\))\s+leaked\s+in\s+\d[\d,]*\s+allocation\(s\)"
+)
+
 # The totals line of a macOS /usr/bin/leaks report: "Process 9443: 1 leak for
 # 48 total leaked bytes." This is the memory-leak type's payload. The type is
-# NOT redundant with valgrind/sanitizer: it is the only leak detector on the
+# Not redundant with valgrind/sanitizer: it is the only leak detector on the
 # macos jobs (valgrind has no Apple Silicon port; the CI matrix builds ASan
 # only on Linux), it inspects the live server after each test file rather
 # than at exit, and Daily run 29461435670 caught a real 32-byte leak with it
@@ -236,7 +260,7 @@ def _leak_site(error: str) -> str:
     first_source_site = ""
     for line in error.split("\n"):
         line = re.sub(r"==\d+==\s*", "", line).strip()
-        match = _SOURCE_FRAME_RE.match(line)
+        match = _SOURCE_FRAME_RE.match(line) or _SAN_SOURCE_FRAME_RE.match(line)
         if not match:
             continue
         source_file = match.group("file").rsplit("/", 1)[-1]
@@ -249,7 +273,7 @@ def _leak_site(error: str) -> str:
 
 
 def _error_summary_line(error: str) -> str:
-    """Extract a short (<=60 char) summary from an error for the title.
+    """Extract a short summary from an error for the title.
 
     Strips ANSI codes and valgrind PID annotations, then drops the runner's
     wrapper prefix ("Valgrind error: ...", "Sanitizer error: ...") which is
@@ -266,18 +290,35 @@ def _error_summary_line(error: str) -> str:
     if leaks_total:
         return leaks_total.group("phrase")[:60]
 
+    # A LeakSanitizer report's diagnostic banner ("detected memory leaks") names
+    # no magnitude; its "SUMMARY: AddressSanitizer: N byte(s) leaked" line does.
+    # Lead with the size, then the leaking code path, so two sanitizer leaks
+    # stay distinct in a title list.
+    sanitizer_leak = _SANITIZER_LEAK_RE.search(error)
+    if sanitizer_leak:
+        summary = f"Leaked {sanitizer_leak.group('size')}"
+        site = _leak_site(error)
+        if site:
+            summary = f"{summary} in {site}"
+        return summary[:80]
+
     clean = re.sub(r"\033\[[0-9;]*m", "", error)
     clean = re.sub(r"==\d+==\s*", "", clean)
-    # The test runner prepends "Valgrind error: <valgrind banner>" or
-    # "Sanitizer error: ..." on the first line. Strip it so the summary
-    # comes from the actual report, not the wrapper.
+    # The test runner prepends a wrapper on the first line: "Valgrind error: ...",
+    # "Sanitizer error: ...", or "Executing test client: <message>" for an
+    # uncaught exception. Strip it so the summary comes from the actual message,
+    # not the wrapper.
     clean = re.sub(
-        r"^\s*(?:Valgrind|Sanitizer)\s+error:\s*", "", clean, count=1,
+        r"^\s*(?:Valgrind\s+error:|Sanitizer\s+error:|Executing\s+test\s+client:)\s*",
+        "", clean, count=1,
     )
 
     candidates = []
     for line in clean.split("\n"):
         line = line.strip()
+        # Drop a leading "ERROR:" severity tag so the tool name behind it
+        # ("LeakSanitizer: ...") leads the title instead of the empty tag.
+        line = re.sub(r"^ERROR:\s*", "", line)
         if line and not line.startswith("at ") and len(line) > 5:
             candidates.append(line)
 
@@ -299,6 +340,7 @@ def _error_summary_line(error: str) -> str:
                 return summary[:80]
             summary = _LOSS_RECORD_RE.sub("", line)
             summary = _COUNT_RE.sub(r"N\1", summary)
+            summary = _ASAN_ADDR_NOISE_RE.sub("", summary)
             site = _leak_site(error)
             if site and site not in summary:
                 summary = f"{summary} in {site}"
@@ -309,16 +351,23 @@ def _error_summary_line(error: str) -> str:
     return clean.strip()[:60] if clean.strip() else "unknown error"
 
 
+# Nameless failure types whose fingerprint keys on test_file, so the file is
+# stable identity and belongs in the title. TIMEOUT keys on the file directly;
+# MEMORY_LEAK keys on the report text, which carries the file. For the other
+# nameless types (sanitizer, valgrind, startup, exception) the file is the
+# volatile detection context the fingerprint discards, so putting it in the
+# title would rewrite the title of one issue on every recurrence.
+_TITLE_SHOWS_FILE = frozenset({FailureType.TIMEOUT, FailureType.MEMORY_LEAK})
+
+
 def _build_title(failure: UniqueFailure) -> str:
     prefix = _TYPE_TITLE_PREFIX.get(failure.failure_type, "[TEST-FAILURE]")
     if failure.has_test_identity:
         return f"{prefix} {failure.test_name} in {failure.test_file}"
-    elif failure.test_file:
-        summary = _error_summary_line(failure.error)
-        return f"{prefix} {summary} ({failure.test_file})"
-    else:
-        summary = _error_summary_line(failure.error)
-        return f"{prefix} {summary}"
+    summary = _error_summary_line(failure.error)
+    if failure.test_file and failure.failure_type in _TITLE_SHOWS_FILE:
+        return f"{prefix} {summary} in {failure.test_file}"
+    return f"{prefix} {summary}"
 
 
 def _build_body(failure: UniqueFailure, marker: str, *, occurrences: int) -> str:

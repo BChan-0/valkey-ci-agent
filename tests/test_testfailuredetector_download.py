@@ -139,7 +139,7 @@ class TestGetLatestDailyRun:
 
     @patch("scripts.test_failure_detector.download.retry_github_call")
     def test_accepts_scheduled_and_dispatched_runs(self, mock_retry) -> None:
-        """Run selection must NOT filter by event.
+        """Run selection must not filter by event.
 
         Manually dispatched Daily runs (workflow_dispatch) are as valid as
         scheduled ones; PR runs are excluded by their conclusion/branch, not

@@ -56,14 +56,19 @@ _SIGNIFICANT_KEYWORDS = (
     "definitely lost", "LEAK SUMMARY",
 )
 
-# Report boilerplate that matches a significance keyword but is identical in
-# every valgrind run, so it carries no bug identity. The "error:" keyword
-# would otherwise match the tool banner via the runner's wrapper prefix
-# ("Valgrind error: ==123== Memcheck, ...").
+# Report boilerplate that matches a significance keyword but carries no bug
+# identity. The "error:" keyword would otherwise match the tool banner via the
+# runner's wrapper prefix ("Valgrind error: ==123== Memcheck, ..."). Valgrind's
+# "ERROR SUMMARY: N errors from N contexts" matches "SUMMARY:" but its count
+# varies run to run and its position drifts, so it must not reach the identity
+# (two runs of one leak whose summary lands inside vs outside the line window
+# would otherwise fingerprint differently). The sanitizer's meaningful summary
+# is "SUMMARY: AddressSanitizer: ...", which has no "ERROR" prefix and survives.
 _BOILERPLATE_SUBSTRINGS = (
     "Memcheck, a memory error detector",
     "HEAP SUMMARY:",
     "LEAK SUMMARY:",
+    "ERROR SUMMARY:",
 )
 
 # Heap-layout coordinates and allocation sizes: the same leak moves between
@@ -76,19 +81,25 @@ _VOLATILE_COUNT_PATTERNS = (
     re.compile(r"\b\d{1,3}(?:,\d{3})+\b"),
 )
 
-# A valgrind stack frame after volatile stripping: "at : malloc (...)" or
-# "by : sdsdup (sds.c:190)". The function names are the stable identity
-# anchor for a leak; addresses, sizes, and loss records around them are not.
-_STACK_FRAME_RE = re.compile(r"^(?:at|by)\s*:\s*(?P<func>[^\s(]+)")
+# A stack frame after volatile stripping. Valgrind: "at : malloc (...)" or
+# "by : sdsdup (sds.c:190)". Sanitizer: "#1  in ztrymalloc_usable_internal
+# /.../zmalloc.c:172" (the "#N 0xADDR in func" shape with the address
+# scrubbed). The function names are the stable identity anchor; addresses,
+# sizes, and loss records around them are not.
+_STACK_FRAME_RE = re.compile(
+    r"^(?:at|by)\s*:\s*(?P<func>[^\s(]+)"
+    r"|^#\d+\s+in\s+(?P<san_func>\S+)"
+)
 
 
 def _extract_stack_anchor(lines: list[str]) -> str:
-    """Function-name chain of the first stack block in a valgrind report.
+    """Function-name chain of the first stack block in a valgrind or
+    sanitizer report.
 
     Distinguishes two different leaks whose report lines are otherwise
     identical after count scrubbing (e.g. same "definitely lost" shape but
     allocated from debugCommand vs clusterCommand). Returns "" when the
-    error has no at/by frames (assertions, startup failures).
+    error has no stack frames (assertions, startup failures).
     """
     frames: list[str] = []
     in_stack = False
@@ -96,7 +107,7 @@ def _extract_stack_anchor(lines: list[str]) -> str:
         match = _STACK_FRAME_RE.match(line)
         if match:
             in_stack = True
-            frames.append(match.group("func"))
+            frames.append(match.group("func") or match.group("san_func"))
             if len(frames) >= 8:
                 break
         elif in_stack:
@@ -144,6 +155,12 @@ def normalize_error_identity(error: str) -> str:
         if any(bp in line for bp in _BOILERPLATE_SUBSTRINGS):
             continue
         if any(kw in line for kw in _SIGNIFICANT_KEYWORDS):
+            if line == "ERROR:" and lines[-1] != line:
+                # A bare "ERROR:" header (startup blob's stderr separator)
+                # matches the keyword but names no bug; the fatal reason is
+                # the blob's last line ("Unable to bind unix socket: ...").
+                # Without it, every startup failure collapses into one issue.
+                line = f"ERROR: {lines[-1]}"
             significant.append(line)
             if len(significant) >= 3:
                 break
@@ -307,7 +324,7 @@ def parse_and_deduplicate(
 
     unique_failures = list(grouped.values())
     if unique_failures:
-        type_counts = {}
+        type_counts: dict[str, int] = {}
         for f in unique_failures:
             type_counts[f.failure_type.value] = type_counts.get(f.failure_type.value, 0) + 1
         logger.info("Total unique failures: %d (by type: %s)", len(unique_failures), type_counts)

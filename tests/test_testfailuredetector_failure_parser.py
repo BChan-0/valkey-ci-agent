@@ -233,6 +233,84 @@ class TestNormalizeErrorIdentity:
         e2 = "==1== Invalid write of size 8\n==1==    at 0xA: hashExpand (hash.c:99)"
         assert normalize_error_identity(e1) != normalize_error_identity(e2)
 
+    def test_sanitizer_frames_distinguish_allocation_sites(self) -> None:
+        """Two LSan leaks identical except for the allocation site must not
+        collapse: sanitizer '#N 0xADDR in func' frames feed the identity."""
+        template = (
+            "==1==ERROR: LeakSanitizer: detected memory leaks\n"
+            "Direct leak of 128 byte(s) in 4 object(s) allocated from:\n"
+            "    #0 0x7fc342efd9c7 in malloc asan_malloc_linux.cpp:69\n"
+            "    #1 0x5623ea63298d in ztrymalloc_usable_internal src/zmalloc.c:172\n"
+            "    #2 0x5623ea64f111 in {site}\n"
+            "\n"
+            "SUMMARY: AddressSanitizer: 128 byte(s) leaked in 4 allocation(s)."
+        )
+        e1 = template.format(site="kvstoreInit src/kvstore.c:88")
+        e2 = template.format(site="clusterInit src/cluster.c:1042")
+        assert normalize_error_identity(e1) != normalize_error_identity(e2)
+
+    def test_sanitizer_frames_stable_across_reruns(self) -> None:
+        """Same leak with different PIDs/addresses/sizes keeps one identity."""
+        e1 = (
+            "==107611==ERROR: LeakSanitizer: detected memory leaks\n"
+            "Direct leak of 128 byte(s) in 4 object(s) allocated from:\n"
+            "    #1 0x5623ea63298d in kvstoreInit src/kvstore.c:88\n"
+            "SUMMARY: AddressSanitizer: 128 byte(s) leaked in 4 allocation(s)."
+        )
+        e2 = (
+            "==209344==ERROR: LeakSanitizer: detected memory leaks\n"
+            "Direct leak of 96 byte(s) in 4 object(s) allocated from:\n"
+            "    #1 0x559911aa22bb in kvstoreInit src/kvstore.c:88\n"
+            "SUMMARY: AddressSanitizer: 96 byte(s) leaked in 4 allocation(s)."
+        )
+        assert normalize_error_identity(e1) == normalize_error_identity(e2)
+
+    def test_valgrind_error_summary_excluded_from_identity(self) -> None:
+        """One leak reported by two runs must keep one identity even when
+        valgrind's "ERROR SUMMARY: N errors from N contexts" line lands inside
+        the identity window for one run and past it for the other. The count
+        varies run to run, so the line must not reach the identity at all.
+        """
+        stack = (
+            "==1== 41 bytes in 1 blocks are definitely lost in loss record 900 of 1,111\n"
+            "==1==    at 0x4846828: malloc (vgpreload_memcheck.so)\n"
+            "==1==    by 0x318A40: ztrymalloc_usable_internal (zmalloc.c:172)\n"
+            "==1==    by 0x1E80D6: debugCommand (debug.c:569)\n"
+        )
+        with_summary = stack + "==1== ERROR SUMMARY: 36 errors from 36 contexts (suppressed: 0 from 0)"
+        without_summary = stack + "==1== \n==1== extra reachable-block line\n==1== another line"
+        assert normalize_error_identity(with_summary) == normalize_error_identity(without_summary)
+
+    def test_startup_reason_line_distinguishes_failures(self) -> None:
+        """Startup blobs share the 'Can't start' header and a bare 'ERROR:'
+        separator; the fatal reason on the last line must split them."""
+        template = (
+            "Can't start src/valkey-server\n"
+            "CONFIGURATION:\n"
+            "dir ./tests/tmp/server.31337.5\n"
+            "port 21111\n"
+            "ERROR:\n"
+            "*** FATAL CONFIG FILE ERROR (Version 255.255.255) ***\n"
+            "{reason}"
+        )
+        e1 = template.format(reason="Unable to bind unix socket: Address already in use")
+        e2 = template.format(reason="argument couldn't be parsed into an integer")
+        assert normalize_error_identity(e1) != normalize_error_identity(e2)
+
+    def test_startup_identity_stable_across_reruns(self) -> None:
+        """Same startup failure with different temp dirs/ports deduplicates."""
+        template = (
+            "Can't start src/valkey-server\n"
+            "CONFIGURATION:\n"
+            "dir ./tests/tmp/server.{run}\n"
+            "port {port}\n"
+            "ERROR:\n"
+            "Unable to bind unix socket: Address already in use"
+        )
+        e1 = template.format(run="31337.5", port=21111)
+        e2 = template.format(run="40021.9", port=21987)
+        assert normalize_error_identity(e1) == normalize_error_identity(e2)
+
     def test_strips_temp_paths(self) -> None:
         error = "ERROR: can't open /tmp/valkey-test-abc123/config\nSanitizer error"
         result = normalize_error_identity(error)

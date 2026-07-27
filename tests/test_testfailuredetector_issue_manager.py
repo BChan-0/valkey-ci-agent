@@ -333,7 +333,7 @@ class TestMergeSameFingerprintFailures:
 
     @patch("scripts.test_failure_detector.manage_issues.IssueDedupPublisher")
     def test_process_failures_publishes_colliding_pair_once(self, mock_publisher_cls) -> None:
-        """End to end: the colliding pair reaches upsert as ONE failure whose
+        """End to end: the colliding pair reaches upsert as one failure whose
         render carries both environments, instead of a second upsert that the
         idempotency key would reject."""
         publisher = mock_publisher_cls.return_value
@@ -497,6 +497,31 @@ class TestTypeSpecificFingerprint:
         )
         assert fingerprint_for(f1) == fingerprint_for(f2)
 
+    def test_valgrind_same_leak_two_jobs_one_fingerprint(self) -> None:
+        """The real #114/#115 case: one leak from debugCommand, reported by two
+        valgrind jobs, differs only in the leaked size and whether the trailing
+        "ERROR SUMMARY" line falls inside the identity window. Both must produce
+        one fingerprint so the pair collapses into a single issue."""
+        def report(size: int, extra_tail: str) -> UniqueFailure:
+            error = (
+                " Valgrind error: ==1== Memcheck, a memory error detector\n"
+                "==1== HEAP SUMMARY:\n"
+                f"==1== {size} bytes in 1 blocks are definitely lost in loss record 900 of 1,111\n"
+                "==1==    at 0x4846828: malloc (vgpreload_memcheck.so)\n"
+                "==1==    by 0x318A40: ztrymalloc_usable_internal (zmalloc.c:172)\n"
+                "==1==    by 0x29078A: sdsdup (sds.c:190)\n"
+                "==1==    by 0x1E80D6: debugCommand (debug.c:569)\n"
+                f"{extra_tail}"
+            )
+            return UniqueFailure(
+                test_name="", test_file="tests/unit/dummy-memory.tcl",
+                failure_type=FailureType.VALGRIND, error=error,
+                jobs=[JobReference(job="j", suite="s", url="u")],
+            )
+        f114 = report(49, "==1== ERROR SUMMARY: 36 errors from 36 contexts (suppressed: 0 from 0)")
+        f115 = report(41, "==1== still reachable: 931,751 bytes in 12,710 blocks\n==1== suppressed: 0 bytes")
+        assert fingerprint_for(f114) == fingerprint_for(f115)
+
     def test_different_sanitizer_bugs_different_fingerprints(self) -> None:
         f1 = UniqueFailure(
             test_name="", test_file="",
@@ -573,10 +598,11 @@ class TestTypeSpecificRendering:
             error=error,
             jobs=[JobReference(job="j", suite="s", url="u")],
         )
+        # The test file is the volatile detection context (valgrind keys its
+        # fingerprint on the error, not the file), so it is not in the title.
         title = title_for(f)
         assert title == (
             "[VALGRIND] Definitely lost: 49 bytes in debugCommand (debug.c:569)"
-            " (tests/unit/dummy-memory.tcl)"
         )
 
     def test_valgrind_leak_title_ignores_loss_record_and_pid_drift(self) -> None:
@@ -642,15 +668,20 @@ class TestTypeSpecificRendering:
         assert "DictTest.BasicOps" in title
 
     def test_startup_title_without_test_name(self) -> None:
-        f = UniqueFailure(
-            test_name="", test_file="tests/unit/cluster.tcl",
-            failure_type=FailureType.STARTUP,
-            error="Can't start /path/to/valkey-server",
-            jobs=[JobReference(job="j", suite="s", url="u")],
-        )
-        title = title_for(f)
+        # Startup keys its fingerprint on the error, not the file, so the file
+        # is left out of the title and the same failure keeps one title across
+        # the different files it is detected under.
+        def startup(test_file: str) -> UniqueFailure:
+            return UniqueFailure(
+                test_name="", test_file=test_file,
+                failure_type=FailureType.STARTUP,
+                error="Can't start /path/to/valkey-server",
+                jobs=[JobReference(job="j", suite="s", url="u")],
+            )
+        title = title_for(startup("tests/unit/cluster.tcl"))
         assert title.startswith("[STARTUP-FAILURE]")
-        assert "cluster.tcl" in title
+        assert "cluster.tcl" not in title
+        assert title == title_for(startup("tests/unit/expire.tcl"))
 
     def test_all_types_use_test_failure_label(self) -> None:
         for ftype in FailureType:
@@ -772,7 +803,6 @@ class TestValgrindBannerTitle:
         # No source frame in this trace (only the malloc interceptor), so the
         # title is kind + size without a site.
         assert "Definitely lost: 49 bytes" in title
-        assert "dummy-memory.tcl" in title
 
     def test_sanitizer_banner_stripped(self) -> None:
         error = (
@@ -788,6 +818,126 @@ class TestValgrindBannerTitle:
         title = title_for(f)
         assert "Sanitizer error:" not in title
         assert "detected memory leaks" in title
+
+    def test_sanitizer_title_stable_across_test_file(self) -> None:
+        """One sanitizer bug detected under different test files across runs
+        keeps one title, matching its file-independent fingerprint."""
+        error = (
+            "==1==ERROR: AddressSanitizer: heap-use-after-free\n"
+            "    #1 0x55 in freeStringObject object.c:400\n"
+        )
+        def san(test_file: str) -> UniqueFailure:
+            return UniqueFailure(
+                test_name="", test_file=test_file,
+                failure_type=FailureType.SANITIZER, error=error,
+                jobs=[JobReference(job="j", suite="s", url="u")],
+            )
+        first = san("tests/unit/type/string.tcl")
+        second = san("tests/unit/expire.tcl")
+        assert fingerprint_for(first) == fingerprint_for(second)
+        assert title_for(first) == title_for(second)
+
+    def test_sanitizer_title_scrubs_volatile_address(self) -> None:
+        """The address and registers in an AddressSanitizer diagnostic line
+        drift every run; the title drops them so it does not change while the
+        fingerprint stays stable."""
+        def san(address: str, pc: str) -> UniqueFailure:
+            error = (
+                f"==1==ERROR: AddressSanitizer: heap-use-after-free on address "
+                f"{address} at pc {pc} bp 0x7ffd sp 0x7ffd\n"
+                "    #1 0x55 in freeStringObject object.c:400\n"
+            )
+            return UniqueFailure(
+                test_name="", test_file="tests/unit/expire.tcl",
+                failure_type=FailureType.SANITIZER, error=error,
+                jobs=[JobReference(job="j", suite="s", url="u")],
+            )
+        title = title_for(san("0x60200000eff0", "0x000000abcdef"))
+        assert "0x" not in title
+        assert "heap-use-after-free" in title
+        assert title == title_for(san("0x602000001234", "0x000000fedcba"))
+
+    def test_error_severity_tag_stripped_tool_name_kept(self) -> None:
+        """The 'ERROR:' tag is dropped from titles (it says nothing) but the
+        tool name after it stays so maintainers see which detector fired."""
+        error = (
+            "==107611==ERROR: LeakSanitizer: detected memory leaks\n"
+            "Direct leak of 128 byte(s) in 4 object(s) allocated from:\n"
+        )
+        f = UniqueFailure(
+            test_name="", test_file="tests/unit/fuzzer.tcl",
+            failure_type=FailureType.SANITIZER, error=error,
+            jobs=[JobReference(job="j", suite="s", url="u")],
+        )
+        title = title_for(f)
+        assert "ERROR:" not in title
+        assert "LeakSanitizer: detected memory leaks" in title
+
+    def test_sanitizer_leak_title_shows_size_and_site(self) -> None:
+        """When the report has the "SUMMARY: AddressSanitizer: N byte(s) leaked"
+        line, the title leads with the size and names the leaking code path
+        instead of the magnitude-free "detected memory leaks" banner."""
+        error = (
+            " Sanitizer error: \n"
+            "==6366==ERROR: LeakSanitizer: detected memory leaks\n"
+            "Direct leak of 41 byte(s) in 1 object(s) allocated from:\n"
+            "    #0 0x55ba0d2fbe33 in malloc (src/valkey-server+0x20de33)\n"
+            "    #1 0x55ba0d702bb3 in ztrymalloc_usable_internal src/zmalloc.c:172:17\n"
+            "    #2 0x55ba0d5f5c07 in _sdsnewlen src/sds.c:102:22\n"
+            "    #3 0x55ba0d435e7f in debugCommand src/debug.c:569:9\n"
+            "SUMMARY: AddressSanitizer: 41 byte(s) leaked in 1 allocation(s).\n"
+        )
+        f = UniqueFailure(
+            test_name="", test_file="tests/unit/dummy-memory.tcl",
+            failure_type=FailureType.SANITIZER, error=error,
+            jobs=[JobReference(job="j", suite="s", url="u")],
+        )
+        title = title_for(f)
+        assert "detected memory leaks" not in title
+        assert "Leaked 41 byte(s)" in title
+        # The site skips the allocator wrappers (zmalloc.c/sds.c) and names the
+        # code path that leaked.
+        assert "debugCommand (debug.c:569)" in title
+
+    def test_sanitizer_leak_title_survives_missing_frames(self) -> None:
+        """A summary line with no source frames still yields a size-based
+        title rather than falling back to the banner."""
+        error = (
+            "==1==ERROR: LeakSanitizer: detected memory leaks\n"
+            "Direct leak of 96 byte(s) in 2 object(s) allocated from:\n"
+            "    #0 0x1 in malloc (src/valkey-server+0x1)\n"
+            "SUMMARY: AddressSanitizer: 96 byte(s) leaked in 2 allocation(s).\n"
+        )
+        f = UniqueFailure(
+            test_name="", test_file="tests/unit/foo.tcl",
+            failure_type=FailureType.SANITIZER, error=error,
+            jobs=[JobReference(job="j", suite="s", url="u")],
+        )
+        assert "Leaked 96 byte(s)" in title_for(f)
+
+
+class TestExceptionTitle:
+    """Uncaught test-client exceptions arrive wrapped in the runner's
+    "Executing test client: <message>" prefix. The title must surface the
+    message, not the wrapper (#116)."""
+
+    def _failure(self, error: str) -> UniqueFailure:
+        return UniqueFailure(
+            test_name="", test_file="tests/unit/dummy-exception.tcl",
+            failure_type=FailureType.EXCEPTION, error=error,
+            jobs=[JobReference(job="j", suite="s", url="u")],
+        )
+
+    def test_strips_executing_test_client_prefix(self) -> None:
+        error = (
+            " Executing test client: Intentional runtime exception for detector testing.\n"
+            " in error at tests/unit/dummy-exception.tcl:12\n"
+            " in test at tests/support/test.tcl:262\n"
+        )
+        title = title_for(self._failure(error))
+        assert "Executing test client:" not in title
+        assert "Intentional runtime exception for detector testing." in title
+        assert title.startswith("[EXCEPTION] ")
 
 
 def _macos_leaks_error(pid: int, leaks: int, leaked_bytes: int, address: str) -> str:
@@ -828,7 +978,7 @@ class TestMacosLeaksTitle:
         title = title_for(f)
         assert title == (
             "[MEMORY-LEAK] 1 leak for 48 total leaked bytes"
-            " (tests/unit/multi.tcl)"
+            " in tests/unit/multi.tcl"
         )
 
     def test_title_stable_across_pids_and_addresses(self) -> None:

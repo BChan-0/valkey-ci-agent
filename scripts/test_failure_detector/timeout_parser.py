@@ -25,10 +25,10 @@ import re
 from typing import Any
 
 from scripts.test_failure_detector.parse_failures import (
+    _VOLATILE_TEST_NAME_RE,
     FailureType,
     JobReference,
     UniqueFailure,
-    _VOLATILE_TEST_NAME_RE,
 )
 
 logger = logging.getLogger(__name__)
