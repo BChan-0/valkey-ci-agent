@@ -721,6 +721,64 @@ class TestValgrindLeakIdentity:
         assert normalize_error_identity(_MEMCHECK_LEAK) != normalize_error_identity(other)
 
 
+def _asan_leak(frames: str) -> str:
+    return (
+        " Sanitizer error: \n"
+        "=================================================================\n"
+        "==6349==ERROR: LeakSanitizer: detected memory leaks\n\n"
+        "Direct leak of 41 byte(s) in 1 object(s) allocated from:\n"
+        f"{frames}"
+        "SUMMARY: AddressSanitizer: 41 byte(s) leaked in 1 allocation(s).\n"
+    )
+
+
+class TestSanitizerLeakIdentityAcrossToolchains:
+    """The same leak reported by different compilers differs only in which
+    allocation-plumbing frames were inlined away. Keeping those frames in the
+    identity files one issue per compiler for a single bug."""
+
+    # clang inlines sdsnewlen/sdsdup into their caller and reports the malloc
+    # interceptor as a binary offset.
+    _CLANG = _asan_leak(
+        "    #0 0x55f in malloc (/home/runner/work/valkey/valkey/src/valkey-server+0x20de33)\n"
+        "    #1 0x571 in ztrymalloc_usable_internal /home/runner/work/valkey/valkey/src/zmalloc.c:172:17\n"
+        "    #2 0x571 in zmalloc_usable /home/runner/work/valkey/valkey/src/zmalloc.c:268:17\n"
+        "    #3 0x464 in _sdsnewlen /home/runner/work/valkey/valkey/src/sds.c:102:22\n"
+        "    #4 0x2a4 in debugCommand /home/runner/work/valkey/valkey/src/debug.c:569:9\n"
+        "    #5 0x4b2 in call /home/runner/work/valkey/valkey/src/server.c:3942:5\n"
+    )
+
+    # gcc keeps sdsnewlen/sdsdup as frames and resolves malloc into the
+    # sanitizer's own sources.
+    _GCC = _asan_leak(
+        "    #0 0x7f1 in malloc ../../../../src/libsanitizer/asan/asan_malloc_linux.cpp:69\n"
+        "    #1 0x55d in ztrymalloc_usable_internal /home/runner/work/valkey/valkey/src/zmalloc.c:172\n"
+        "    #2 0x55d in zmalloc_usable /home/runner/work/valkey/valkey/src/zmalloc.c:268\n"
+        "    #3 0x55d in _sdsnewlen /home/runner/work/valkey/valkey/src/sds.c:102\n"
+        "    #4 0x55d in sdsnewlen /home/runner/work/valkey/valkey/src/sds.c:169\n"
+        "    #5 0x55d in sdsdup /home/runner/work/valkey/valkey/src/sds.c:190\n"
+        "    #6 0x55d in debugCommand /home/runner/work/valkey/valkey/src/debug.c:569\n"
+        "    #7 0x552 in call /home/runner/work/valkey/valkey/src/server.c:3942\n"
+    )
+
+    def test_same_leak_across_compilers_same_identity(self) -> None:
+        assert normalize_error_identity(self._CLANG) == normalize_error_identity(self._GCC)
+
+    def test_identity_keeps_the_leaking_code_path(self) -> None:
+        identity = normalize_error_identity(self._CLANG)
+        assert "debugCommand" in identity
+        assert "zmalloc" not in identity
+        assert "sds" not in identity
+        assert "malloc" not in identity
+
+    def test_different_leak_sites_still_distinct(self) -> None:
+        other = self._GCC.replace(
+            "debugCommand /home/runner/work/valkey/valkey/src/debug.c:569",
+            "clusterCommand /home/runner/work/valkey/valkey/src/cluster.c:120",
+        )
+        assert normalize_error_identity(self._GCC) != normalize_error_identity(other)
+
+
 def _startup_blob(reason: str) -> str:
     """A start_server_error blob: exe, full config dump, then the reason.
 

@@ -33,6 +33,7 @@ try:
         FailureType,
         JobReference,
         UniqueFailure,
+        normalize_error_identity,
     )
 
     _SKIP_REASON = None
@@ -991,6 +992,53 @@ class TestStartupFailureTitle:
             jobs=[JobReference(job="j", suite="s", url="u")],
         )
         assert "Can't start" in title_for(f)
+
+    def test_title_survives_runner_status_tag_whitespace(self) -> None:
+        """The runner's "[err]: " tag is stripped upstream and leaves a leading
+        space. Without tolerating it the startup branch never fires and the
+        title becomes the executable path truncated mid-word."""
+        f = self._failure("Bad directive or wrong number of arguments")
+        f.error = f" {f.error}"
+        title = title_for(f)
+        assert "Bad directive" in title
+        assert "valkey-serve" not in title
+
+    def test_title_skips_progress_and_position_lines(self) -> None:
+        """The harness's "###" marker and the config loader's position/echo
+        lines precede the reason but name no cause."""
+        title = title_for(self._failure(
+            "### Starting server for test \n\n"
+            "*** FATAL CONFIG FILE ERROR (Version 9.0.0) ***\n"
+            "Reading the configuration file, at line 30\n"
+            ">>> 'invalid-config-key-that-does-not-exist bogus'\n"
+            "Bad directive or wrong number of arguments"
+        ))
+        assert "Bad directive or wrong number of arguments" in title
+        assert "###" not in title
+        assert "at line" not in title
+
+    def test_valgrind_wrapped_startup_matches_plain_startup(self) -> None:
+        """Under valgrind the capture opens with the tool's own banner and
+        interleaves ==PID== markers. It is the same config error, so it must
+        not mint a second issue."""
+        plain = self._failure(
+            "*** FATAL CONFIG FILE ERROR (Version 9.0.0) ***\n"
+            "Reading the configuration file, at line 30\n"
+            "Bad directive or wrong number of arguments"
+        )
+        under_valgrind = self._failure(
+            "### Starting server for test \n"
+            "==6688== Memcheck, a memory error detector\n"
+            "==6688== Using Valgrind-3.22.0 and LibVEX\n\n"
+            "*** FATAL CONFIG FILE ERROR (Version 9.0.0) ***\n"
+            "Reading the configuration file, at line 30\n"
+            "Bad directive or wrong number of arguments\n"
+            "==6688== HEAP SUMMARY:\n"
+        )
+        assert title_for(plain) == title_for(under_valgrind)
+        assert normalize_error_identity(plain.error) == normalize_error_identity(
+            under_valgrind.error
+        )
 
 
 class TestValgrindRecurrenceStaysQuiet:

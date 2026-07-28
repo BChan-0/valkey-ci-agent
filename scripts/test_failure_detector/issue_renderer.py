@@ -25,6 +25,7 @@ from scripts.test_failure_detector.parse_failures import (
     FailureType,
     UniqueFailure,
     normalize_error_identity,
+    startup_reason_from_lines,
 )
 
 MARKER_NAMESPACE = "valkey-ci-agent:test-failure"
@@ -314,22 +315,19 @@ def _leak_site(error: str) -> str:
 
 # A startup blob: "Can't start <exe>\nCONFIGURATION:\n<config>\nERROR:\n
 # <reason>". The exe path is identical for every startup failure; the reason
-# is what tells two causes apart, so the title must carry it. "***" banner
-# lines ("*** FATAL CONFIG FILE ERROR ... ***") are shared across causes and
-# skipped, mirroring the identity extraction in normalize_error_identity.
+# is what tells two causes apart, so the title must carry it. Progress and
+# banner lines before the reason are skipped, mirroring the identity
+# extraction in normalize_error_identity.
 _STARTUP_REASON_RE = re.compile(r"\nERROR:\n(?P<tail>.+)", re.DOTALL)
 
 
 def _startup_reason(error: str) -> str:
-    """First non-banner line after the startup blob's ERROR: header, or ""."""
+    """The fatal reason after the startup blob's ERROR: header, or ""."""
     match = _STARTUP_REASON_RE.search(error)
     if not match:
         return ""
-    for line in match.group("tail").split("\n"):
-        line = line.strip()
-        if line and not line.startswith("***"):
-            return line
-    return ""
+    tail = _scrub_volatile_title_tokens(match.group("tail"))
+    return startup_reason_from_lines([line.strip() for line in tail.split("\n")])
 
 
 def _error_summary_line(error: str) -> str:
@@ -342,6 +340,12 @@ def _error_summary_line(error: str) -> str:
     and names the first user-code stack frame so two bugs with the same
     diagnostic line stay tellable apart in an issue list.
     """
+    # The runner emits the message behind a "[err]: " status tag whose removal
+    # leaves a leading space, so match on the stripped text rather than the raw
+    # field; otherwise a startup blob falls through to generic truncation and
+    # the title becomes the runner's absolute exe path cut mid-word.
+    error = error.strip()
+
     if error.startswith("Can't start"):
         reason = _startup_reason(error)
         if reason:

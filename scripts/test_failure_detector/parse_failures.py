@@ -97,15 +97,94 @@ _STARTUP_CONFIG_SECTION_RE = re.compile(
     r"\nCONFIGURATION:\n.*?\nERROR:\n", re.DOTALL
 )
 
+# The startup blob's captured stderr is prefixed with runner and server
+# progress lines that carry no cause: the harness's "### Starting server for
+# test" marker, the "*** FATAL CONFIG FILE ERROR ***" banner (identical for
+# every config error), and the ">>> '<directive>'" echo of the offending line.
+# Skipping these reaches the fatal reason itself ("Bad directive or wrong
+# number of arguments"), which is what tells two startup causes apart.
+_STARTUP_NOISE_PREFIXES = ("***", "###", ">>>")
+
+# The server's config loader prints the fatal reason last, behind a fixed
+# banner and -- only when it knows the offending line -- a position line and an
+# echo of that line. The banner is identical across causes and the position
+# moves whenever the config file changes, so neither can be the identity; the
+# reason after them is. Nothing before the banner qualifies either: under
+# valgrind the capture opens with the tool's own startup banner.
+_FATAL_CONFIG_BANNER_PREFIX = "*** FATAL CONFIG FILE ERROR"
+_CONFIG_POSITION_PREFIX = "Reading the configuration file, at line"
+
+
+def startup_reason_from_lines(lines: list[str]) -> str:
+    """The fatal reason from a startup blob's stderr lines, or "".
+
+    Expects lines already scrubbed of volatile tokens and stripped of
+    surrounding whitespace.
+    """
+    for index, line in enumerate(lines):
+        if not line.startswith(_FATAL_CONFIG_BANNER_PREFIX):
+            continue
+        for following in lines[index + 1 :]:
+            if not following or following.startswith(
+                (_CONFIG_POSITION_PREFIX, ">>>")
+            ):
+                continue
+            return following
+        return ""
+
+    # No config-file diagnostic: the reason is the first line that is neither
+    # blank nor progress/banner noise (e.g. the harness's own summary message).
+    for line in lines:
+        if line and not line.startswith(_STARTUP_NOISE_PREFIXES):
+            return line
+    return ""
+
+
 # A stack frame after volatile stripping. Valgrind: "at : malloc (...)" or
 # "by : sdsdup (sds.c:190)". Sanitizer: "#1  in ztrymalloc_usable_internal
 # /.../zmalloc.c:172" (the "#N 0xADDR in func" shape with the address
 # scrubbed). The function names are the stable identity anchor; addresses,
 # sizes, and loss records around them are not.
 _STACK_FRAME_RE = re.compile(
-    r"^(?:at|by)\s*:\s*(?P<func>[^\s(]+)"
-    r"|^#\d+\s+in\s+(?P<san_func>\S+)"
+    r"^(?:at|by)\s*:\s*(?P<func>[^\s(]+)\s*(?:\((?P<file>[^():]+):)?"
+    r"|^#\d+\s+in\s+(?P<san_func>\S+)(?:\s+(?P<san_file>\S+?):\d+)?"
 )
+
+# Allocation plumbing and sanitizer interceptors that every heap operation
+# passes through. Which of these frames appear depends on the toolchain, not on
+# the bug: clang inlines sdsnewlen/sdsdup into their caller while gcc emits them
+# as separate frames, so a stack anchor that keeps them makes one leak look like
+# two distinct bugs across compilers. Dropping them leaves the frames that
+# actually identify the leaking code path. Mirrors the title-side skip in
+# issue_renderer._leak_site.
+_PLUMBING_FRAME_FILES = frozenset({"zmalloc.c", "sds.c"})
+_SANITIZER_RUNTIME_PATH_RE = re.compile(
+    r"libsanitizer|sanitizer_common|/(?:asan|lsan|ubsan|tsan|msan)[_/]"
+)
+
+# The allocator entry point is the top frame of every heap report, so it never
+# distinguishes two leaks. It is matched by name because the frame's location
+# is not reliably a source path: gcc resolves the interceptor into the
+# sanitizer's own sources, while clang reports a binary offset
+# ("malloc (/path/to/valkey-server+0x20de33)") that no file check can catch.
+_ALLOCATOR_FRAME_FUNCS = frozenset(
+    {"malloc", "calloc", "realloc", "valloc", "operator new", "_Znwm", "_Znam"}
+)
+
+
+def _is_plumbing_frame(func: str, source_path: str) -> bool:
+    """Whether a stack frame is shared allocation/interceptor plumbing.
+
+    These frames are present or absent depending on the toolchain's inlining
+    rather than on the bug, so they must not reach the identity.
+    """
+    if func in _ALLOCATOR_FRAME_FUNCS:
+        return True
+    if not source_path:
+        return False
+    if _SANITIZER_RUNTIME_PATH_RE.search(source_path):
+        return True
+    return source_path.rsplit("/", 1)[-1] in _PLUMBING_FRAME_FILES
 
 
 def _extract_root_leak_anchor(lines: list[str]) -> str:
@@ -145,9 +224,12 @@ def _extract_stack_anchor(lines: list[str]) -> str:
         match = _STACK_FRAME_RE.match(line)
         if match:
             in_stack = True
-            frames.append(match.group("func") or match.group("san_func"))
-            if len(frames) >= 8:
-                break
+            func = match.group("func") or match.group("san_func")
+            source_path = match.group("file") or match.group("san_file") or ""
+            if not _is_plumbing_frame(func, source_path):
+                frames.append(func)
+                if len(frames) >= 8:
+                    break
         elif in_stack:
             # First stack block ended; a second block would belong to a
             # different loss record and make the identity order-sensitive.
@@ -196,19 +278,11 @@ def normalize_error_identity(error: str) -> str:
             if line == "ERROR:" and index + 1 < len(lines):
                 # A bare "ERROR:" header (startup blob's stderr separator)
                 # matches the keyword but names no bug; the fatal reason
-                # follows it, possibly behind a "*** FATAL ... ***" banner
-                # that is identical across causes. Take the first non-banner
-                # line after the header, not the blob's last line: a trailing
-                # server-log tail would bind the identity to volatile text
-                # and mint a fresh issue per run.
-                reason = next(
-                    (
-                        following
-                        for following in lines[index + 1 :]
-                        if not following.startswith("***")
-                    ),
-                    "",
-                )
+                # follows it, behind progress and banner lines that are
+                # identical across causes. Take the reason, not the blob's
+                # last line: a trailing server-log tail would bind the
+                # identity to volatile text and mint a fresh issue per run.
+                reason = startup_reason_from_lines(lines[index + 1 :])
                 if reason:
                     line = f"ERROR: {reason}"
             significant.append(line)
