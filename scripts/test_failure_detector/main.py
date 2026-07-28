@@ -175,9 +175,9 @@ def run(
     job_info = get_job_info(gh, repo_full_name, run_id)
 
     # Step 4: Recover timeout failures from logs
-    # The Tcl test runner's watchdog may kill the process before
-    # write_test_failures executes, leaving empty artifact entries for jobs
-    # that actually timed out. Scan their console logs to recover the failures.
+    # The Tcl test runner excludes timeouts from the artifact (and its
+    # watchdog may kill the process before write_test_failures runs at all),
+    # so scan the console logs of failed jobs that captured no timeout entry.
     timeout_failures = recover_timeouts(
         all_failures, job_info, artifact_client, repo_full_name, run_id,
     )

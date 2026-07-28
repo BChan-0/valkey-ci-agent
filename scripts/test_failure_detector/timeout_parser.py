@@ -46,31 +46,31 @@ def jobs_needing_log_scan(
     all_failures: dict[str, Any],
     failed_job_names: set[str],
 ) -> set[str]:
-    """Identify failed jobs whose artifact entries contain no test failures.
+    """Identify failed jobs whose artifact captured no timeout entry.
 
-    These are candidates for timeout recovery: the job failed (exit code 1)
-    but the structured artifact has only empty lists, which happens when the
-    test runner's watchdog killed the run and ``write_test_failures`` skipped
-    the timeout entries.
+    These are candidates for timeout recovery. The runner's
+    ``write_test_failures`` excludes timeouts from the artifact, so captured
+    assertions or other failures say nothing about whether the job also timed
+    out; only an explicit timeout-type entry (from a runner that does capture
+    them) makes log scanning redundant for that job.
 
-    Jobs that have at least one captured failure in the artifact already have
-    their failure represented and don't need log scanning for timeouts.
+    The run-logs archive is downloaded once per run, so scanning extra jobs
+    costs only regex passes, not API calls.
     """
     needs_scan: set[str] = set()
     for job_name in failed_job_names:
         suites = all_failures.get(job_name)
-        if suites is None:
-            # Job not in artifact at all (upload step may have been skipped)
-            needs_scan.add(job_name)
-            continue
         if not isinstance(suites, dict):
+            # Job absent from the artifact (upload skipped) or malformed.
             needs_scan.add(job_name)
             continue
-        has_entries = any(
-            isinstance(entries, list) and len(entries) > 0
+        has_timeout_entry = any(
+            isinstance(entry, dict) and entry.get("type") == "timeout"
             for entries in suites.values()
+            if isinstance(entries, list)
+            for entry in entries
         )
-        if not has_entries:
+        if not has_timeout_entry:
             needs_scan.add(job_name)
     return needs_scan
 

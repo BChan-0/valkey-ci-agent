@@ -81,6 +81,22 @@ _VOLATILE_COUNT_PATTERNS = (
     re.compile(r"\b\d{1,3}(?:,\d{3})+\b"),
 )
 
+# A macOS /usr/bin/leaks root-leak line: "1 (48 bytes) ROOT LEAK: <malloc in
+# sdsnewlen 0x600001d1c100> [48]". These are the only lines in a leaks report
+# that name the allocation site, so they are the identity anchor that keeps
+# two different leaks in the same test file as two issues. Addresses and
+# sizes around the symbol are scrubbed before this is applied.
+_ROOT_LEAK_RE = re.compile(r"ROOT LEAK:\s*(?P<site>[^\[]+)")
+
+# The startup blob's config dump: "Can't start <exe>\nCONFIGURATION:\n<full
+# config file>\nERROR:\n<reason>". The config is dozens of lines shared by
+# every startup failure; left in place it fills the significant-line window
+# before the ERROR: reason is reached, collapsing all startup causes into one
+# identity. The reason after ERROR: is the identity; the dump is not.
+_STARTUP_CONFIG_SECTION_RE = re.compile(
+    r"\nCONFIGURATION:\n.*?\nERROR:\n", re.DOTALL
+)
+
 # A stack frame after volatile stripping. Valgrind: "at : malloc (...)" or
 # "by : sdsdup (sds.c:190)". Sanitizer: "#1  in ztrymalloc_usable_internal
 # /.../zmalloc.c:172" (the "#N 0xADDR in func" shape with the address
@@ -90,6 +106,28 @@ _STACK_FRAME_RE = re.compile(
     r"^(?:at|by)\s*:\s*(?P<func>[^\s(]+)"
     r"|^#\d+\s+in\s+(?P<san_func>\S+)"
 )
+
+
+def _extract_root_leak_anchor(lines: list[str]) -> str:
+    """Allocation-site chain of a macOS leaks report, or "".
+
+    A leaks blob has no stack frames, so without this anchor every leak in
+    one test file normalizes to the same boilerplate and two distinct leaks
+    collapse into one issue. Unsymbolicated roots (bare scrubbed addresses)
+    yield an empty site and are skipped; sorted so report order does not
+    change the identity.
+    """
+    sites: set[str] = set()
+    for line in lines:
+        match = _ROOT_LEAK_RE.search(line)
+        if not match:
+            continue
+        site = match.group("site").strip()
+        if site:
+            sites.add(site)
+    if not sites:
+        return ""
+    return "roots: " + " > ".join(sorted(sites))
 
 
 def _extract_stack_anchor(lines: list[str]) -> str:
@@ -140,7 +178,7 @@ def normalize_error_identity(error: str) -> str:
     Two runs that hit the same bug with different PIDs/addresses will produce
     the same normalized identity.
     """
-    text = error
+    text = _STARTUP_CONFIG_SECTION_RE.sub("\nERROR:\n", error)
     for pattern in _VOLATILE_PATTERNS:
         text = pattern.sub("", text)
     for pattern in _VOLATILE_COUNT_PATTERNS:
@@ -151,23 +189,36 @@ def normalize_error_identity(error: str) -> str:
     # Extract up to 3 significant lines for the identity, skipping tool
     # boilerplate that is identical in every run of every bug.
     significant: list[str] = []
-    for line in lines[:30]:
+    for index, line in enumerate(lines[:30]):
         if any(bp in line for bp in _BOILERPLATE_SUBSTRINGS):
             continue
         if any(kw in line for kw in _SIGNIFICANT_KEYWORDS):
-            if line == "ERROR:" and lines[-1] != line:
+            if line == "ERROR:" and index + 1 < len(lines):
                 # A bare "ERROR:" header (startup blob's stderr separator)
-                # matches the keyword but names no bug; the fatal reason is
-                # the blob's last line ("Unable to bind unix socket: ...").
-                # Without it, every startup failure collapses into one issue.
-                line = f"ERROR: {lines[-1]}"
+                # matches the keyword but names no bug; the fatal reason
+                # follows it, possibly behind a "*** FATAL ... ***" banner
+                # that is identical across causes. Take the first non-banner
+                # line after the header, not the blob's last line: a trailing
+                # server-log tail would bind the identity to volatile text
+                # and mint a fresh issue per run.
+                reason = next(
+                    (
+                        following
+                        for following in lines[index + 1 :]
+                        if not following.startswith("***")
+                    ),
+                    "",
+                )
+                if reason:
+                    line = f"ERROR: {reason}"
             significant.append(line)
             if len(significant) >= 3:
                 break
 
-    # The stack frames pin the identity to the code path (two leaks with
-    # identical report lines but different allocation sites stay distinct).
-    stack_anchor = _extract_stack_anchor(lines)
+    # The stack frames (or a macOS leaks report's root-leak sites) pin the
+    # identity to the code path, so two leaks with identical report lines but
+    # different allocation sites stay distinct.
+    stack_anchor = _extract_stack_anchor(lines) or _extract_root_leak_anchor(lines)
     if significant:
         return "\n".join([*significant, stack_anchor] if stack_anchor else significant)
     if stack_anchor:
@@ -205,6 +256,16 @@ class UniqueFailure:
     def has_test_identity(self) -> bool:
         """Whether this failure has a meaningful test_name for fingerprinting."""
         return bool(self.test_name)
+
+
+def _coerce_str(value: Any) -> str:
+    """Return *value* if it is a string, else "".
+
+    Non-string artifact values (an int PID, null) carry no usable test
+    identity or error text, so they are treated as absent rather than
+    stringified into a bogus identity.
+    """
+    return value if isinstance(value, str) else ""
 
 
 def parse_and_deduplicate(
@@ -257,9 +318,12 @@ def parse_and_deduplicate(
                 if not isinstance(entry, dict):
                     continue
 
-                test_name = entry.get("test_name", "")
-                test_file = entry.get("test_file", "")
-                error = entry.get("error", "")
+                # Field values are producer-controlled; a non-string (int PID,
+                # null) must degrade to one bad entry, not a TypeError that
+                # aborts the whole batch in the regex calls below.
+                test_name = _coerce_str(entry.get("test_name", ""))
+                test_file = _coerce_str(entry.get("test_file", ""))
+                error = _coerce_str(entry.get("error", ""))
                 raw_type = entry.get("type", "assertion")
 
                 try:

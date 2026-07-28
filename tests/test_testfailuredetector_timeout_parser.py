@@ -24,7 +24,22 @@ class TestJobsNeedingLogScan:
         failed = {"test-ubuntu-jemalloc"}
         assert jobs_needing_log_scan(all_failures, failed) == {"test-ubuntu-jemalloc"}
 
-    def test_failed_job_with_captured_failures_skipped(self) -> None:
+    def test_failed_job_with_captured_timeout_skipped(self) -> None:
+        """A job whose artifact already holds a timeout entry needs no scan."""
+        all_failures = {
+            "test-ubuntu-jemalloc": {
+                "valkey": [{"test_name": "t", "test_file": "f.tcl",
+                            "type": "timeout", "error": "Test timed out"}],
+                "sentinel": [],
+            },
+        }
+        failed = {"test-ubuntu-jemalloc"}
+        assert jobs_needing_log_scan(all_failures, failed) == set()
+
+    def test_failed_job_with_only_non_timeout_failures_still_scanned(self) -> None:
+        """Captured assertions say nothing about timeouts (the runner excludes
+        them from the artifact), so the job's log is still scanned: a timeout
+        co-occurring with an assertion must not be lost."""
         all_failures = {
             "test-ubuntu-jemalloc": {
                 "valkey": [{"test_name": "t", "test_file": "f.tcl", "error": "e"}],
@@ -32,7 +47,7 @@ class TestJobsNeedingLogScan:
             },
         }
         failed = {"test-ubuntu-jemalloc"}
-        assert jobs_needing_log_scan(all_failures, failed) == set()
+        assert jobs_needing_log_scan(all_failures, failed) == {"test-ubuntu-jemalloc"}
 
     def test_failed_job_not_in_artifact_needs_scan(self) -> None:
         all_failures = {"test-ubuntu-jemalloc": {"valkey": [], "sentinel": []}}
@@ -46,7 +61,8 @@ class TestJobsNeedingLogScan:
 
     def test_multiple_failed_jobs_mixed(self) -> None:
         all_failures = {
-            "job-a": {"valkey": [{"test_name": "t", "test_file": "f.tcl", "error": ""}]},
+            "job-a": {"valkey": [{"test_name": "t", "test_file": "f.tcl",
+                                  "type": "timeout", "error": ""}]},
             "job-b": {"valkey": [], "sentinel": []},
         }
         failed = {"job-a", "job-b", "job-c"}

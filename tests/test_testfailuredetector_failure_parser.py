@@ -153,6 +153,26 @@ class TestParseAndDeduplicate:
         assert len(results) == 1
         assert results[0].test_name == "real test"
 
+    def test_non_string_field_values_do_not_abort_the_batch(self) -> None:
+        """A producer bug that emits a non-string field (int PID, null) must
+        degrade to one bad entry, not a TypeError that loses the whole run."""
+        data = {
+            "job-1": {
+                "suite": [
+                    {"test_name": "", "test_file": "f.tcl",
+                     "type": "sanitizer", "error": 12345},
+                    {"test_name": None, "test_file": "g.tcl", "error": "real"},
+                    {"test_name": "good", "test_file": "h.tcl", "error": "err"},
+                ]
+            }
+        }
+        results = parse_and_deduplicate(data, {})
+        names = {f.test_name for f in results}
+        assert "good" in names
+        # The int-error entry has no usable identity and is skipped; the
+        # None-name entry still groups by its error text.
+        assert any(f.error == "real" for f in results)
+
     def test_entries_missing_test_file_with_error_are_kept(self) -> None:
         """Entries with test_name but no test_file are kept when they have
         a test_name (the name itself provides identity)."""
@@ -699,3 +719,70 @@ class TestValgrindLeakIdentity:
             "debugCommand (debug.c:569)", "clusterCommand (cluster.c:123)",
         )
         assert normalize_error_identity(_MEMCHECK_LEAK) != normalize_error_identity(other)
+
+
+def _startup_blob(reason: str) -> str:
+    """A start_server_error blob: exe, full config dump, then the reason.
+
+    The config dump is long enough to push the ERROR: section past the
+    identity extraction's significant-line window if it were not elided.
+    """
+    config = "\n".join(f"config-directive-{i} value-{i}" for i in range(40))
+    return f"Can't start /path/to/valkey-server\nCONFIGURATION:\n{config}\nERROR:\n{reason}"
+
+
+class TestStartupFailureIdentity:
+    """Startup fingerprints must anchor on the failure reason after ERROR:,
+    not on the config dump shared by every startup blob."""
+
+    def test_different_reasons_different_identity(self) -> None:
+        bad_directive = _startup_blob(
+            "*** FATAL CONFIG FILE ERROR (Version 9.0.0) ***\n"
+            "Bad directive or wrong number of arguments"
+        )
+        bind_failure = _startup_blob("Unable to bind unix socket: Permission denied")
+        assert normalize_error_identity(bad_directive) != normalize_error_identity(bind_failure)
+
+    def test_identity_names_the_reason(self) -> None:
+        blob = _startup_blob("Unable to bind unix socket: Permission denied")
+        assert "Unable to bind unix socket" in normalize_error_identity(blob)
+
+    def test_same_reason_across_runs_same_identity(self) -> None:
+        # Config contents (ports, dirs) drift between runs of the same cause.
+        blob = _startup_blob("Unable to bind unix socket: Permission denied")
+        rerun = blob.replace("value-3", "value-3-changed")
+        assert normalize_error_identity(blob) == normalize_error_identity(rerun)
+
+    def test_blob_without_error_section_falls_back_to_first_line(self) -> None:
+        identity = normalize_error_identity("Can't start /path/to/valkey-server")
+        assert identity == "Can't start /path/to/valkey-server"
+
+
+def _leaks_blob(pid: int, root_site: str) -> str:
+    """A macOS /usr/bin/leaks failure as the test proc reports it."""
+    return (
+        f"Check for memory leaks (pid {pid}) in tests/unit/dummy-memory.tcl\n"
+        f"Expected '*0 leaks*' to equal or match 'Process {pid}: 1 leak for 48 total leaked bytes.\n"
+        f"leaks Report Version: 4.0\n"
+        f"Process {pid}: 1 leak for 48 total leaked bytes.\n"
+        f"    1 (48 bytes) ROOT LEAK: <{root_site} 0x600001d1c100> [48]'"
+    )
+
+
+class TestMacosLeaksIdentity:
+    """macOS leaks blobs carry no stack frames; the ROOT LEAK site lines are
+    the only allocation-site signal and must anchor the identity."""
+
+    def test_same_root_across_runs_same_identity(self) -> None:
+        assert normalize_error_identity(
+            _leaks_blob(9443, "malloc in sdsnewlen")
+        ) == normalize_error_identity(_leaks_blob(7121, "malloc in sdsnewlen"))
+
+    def test_different_roots_same_file_different_identity(self) -> None:
+        assert normalize_error_identity(
+            _leaks_blob(9443, "malloc in sdsnewlen")
+        ) != normalize_error_identity(_leaks_blob(9443, "malloc in clusterInit"))
+
+    def test_identity_names_the_root_site(self) -> None:
+        identity = normalize_error_identity(_leaks_blob(9443, "malloc in sdsnewlen"))
+        assert "malloc in sdsnewlen" in identity

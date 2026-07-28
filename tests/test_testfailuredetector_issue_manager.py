@@ -393,6 +393,16 @@ class TestExtractErrorFromBody:
         # Issues created before the Error stack trace section existed.
         assert _extract_error_from_body("**Environments:** `job-a`") == ""
 
+    def test_round_trips_error_containing_backtick_fence(self) -> None:
+        """An error that itself contains ``` must survive the body round-trip
+        intact; a truncated read-back would make _detect_new_error flag a
+        spurious "new error" on every recurrence."""
+        error = "assertion failed\n```\nembedded block\n```\ntrailing context"
+        body = _build_body(
+            _make_failure(error=error), marker="<!-- m -->", occurrences=1,
+        )
+        assert _extract_error_from_body(body) == error
+
 
 class TestRecurrenceCommentNewError:
     """The recurrence comment surfaces a changed error trace so a triager can
@@ -915,6 +925,156 @@ class TestValgrindBannerTitle:
         )
         assert "Leaked 96 byte(s)" in title_for(f)
 
+    def test_sanitizer_leak_site_skips_interceptor_frame(self) -> None:
+        """GCC's ASan interceptor frame carries a real file:line into the
+        sanitizer's own sources (asan_malloc_linux.cpp), so it passes the
+        source-frame regex; the site must skip it like the allocator
+        wrappers, or every leak titles as 'in malloc'."""
+        error = (
+            " Sanitizer error: \n"
+            "==3021==ERROR: LeakSanitizer: detected memory leaks\n"
+            "Direct leak of 49 byte(s) in 1 object(s) allocated from:\n"
+            "    #0 0x7f8a4a2b476f in malloc ../../../../src/libsanitizer/asan/asan_malloc_linux.cpp:69\n"
+            "    #1 0x55c908b21a02 in ztrymalloc_usable_internal /home/runner/work/valkey/valkey/src/zmalloc.c:172\n"
+            "    #2 0x55c908d1e222 in debugCommand /home/runner/work/valkey/valkey/src/debug.c:569\n"
+            "SUMMARY: AddressSanitizer: 49 byte(s) leaked in 1 allocation(s).\n"
+        )
+        f = UniqueFailure(
+            test_name="", test_file="",
+            failure_type=FailureType.SANITIZER, error=error,
+            jobs=[JobReference(job="j", suite="s", url="u")],
+        )
+        title = title_for(f)
+        assert "asan_malloc_linux" not in title
+        assert "debugCommand (debug.c:569)" in title
+
+
+class TestStartupFailureTitle:
+    """A startup blob's first line names only the executable, which is the
+    same for every startup failure; the title must carry the reason after the
+    ERROR: header so two causes are tellable apart in an issue list."""
+
+    def _failure(self, reason: str) -> UniqueFailure:
+        config = "\n".join(f"directive-{i} value-{i}" for i in range(40))
+        error = (
+            "Can't start /path/to/valkey-server\n"
+            f"CONFIGURATION:\n{config}\nERROR:\n{reason}"
+        )
+        return UniqueFailure(
+            test_name="", test_file="tests/unit/dummy-startup.tcl",
+            failure_type=FailureType.STARTUP, error=error,
+            jobs=[JobReference(job="j", suite="s", url="u")],
+        )
+
+    def test_title_names_the_reason(self) -> None:
+        title = title_for(self._failure("Unable to bind unix socket: Permission denied"))
+        assert "Unable to bind unix socket" in title
+
+    def test_title_skips_fatal_banner(self) -> None:
+        title = title_for(self._failure(
+            "*** FATAL CONFIG FILE ERROR (Version 9.0.0) ***\n"
+            "Bad directive or wrong number of arguments"
+        ))
+        assert "***" not in title
+        assert "Bad directive" in title
+
+    def test_different_causes_get_different_titles(self) -> None:
+        t1 = title_for(self._failure("Unable to bind unix socket: Permission denied"))
+        t2 = title_for(self._failure("Bad directive or wrong number of arguments"))
+        assert t1 != t2
+
+    def test_blob_without_error_section_falls_back(self) -> None:
+        f = UniqueFailure(
+            test_name="", test_file="",
+            failure_type=FailureType.STARTUP,
+            error="Can't start /path/to/valkey-server",
+            jobs=[JobReference(job="j", suite="s", url="u")],
+        )
+        assert "Can't start" in title_for(f)
+
+
+class TestValgrindRecurrenceStaysQuiet:
+    """A recurrence of the same valgrind leak differs only in ==PID== markers,
+    sizes, and loss-record coordinates. The fingerprint calls it the same bug,
+    so the recurrence comment must not flag it as a new error."""
+
+    _RUN1 = (
+        "Valgrind error: ==12345== Memcheck, a memory error detector\n"
+        "==12345== 49 bytes in 1 blocks are definitely lost in loss record 900 of 1,109\n"
+        "==12345==    by 0x1E8076: ztrymalloc_usable_internal (zmalloc.c:172)\n"
+        "==12345==    by 0x3CD456: debugCommand (debug.c:569)\n"
+    )
+
+    def _failure(self, error: str) -> UniqueFailure:
+        return UniqueFailure(
+            test_name="", test_file="",
+            failure_type=FailureType.VALGRIND, error=error,
+            jobs=[JobReference(job="j", suite="s", url="u")],
+        )
+
+    def _recur(self, old_error: str, new_error: str) -> str:
+        body = _build_body(self._failure(old_error), marker="<!-- m -->", occurrences=1)
+        renderer = renderer_for(self._failure(new_error))
+        renderer.merge_environments(body)
+        return renderer.render("<!-- m -->", 2).comment
+
+    def test_same_leak_new_pid_and_size_stays_quiet(self) -> None:
+        rerun = (
+            self._RUN1.replace("12345", "999")
+            .replace("49 bytes", "41 bytes")
+            .replace("900 of 1,109", "850 of 1,050")
+        )
+        assert "New error stack trace" not in self._recur(self._RUN1, rerun)
+
+    def test_different_allocation_site_is_flagged(self) -> None:
+        other = self._RUN1.replace(
+            "debugCommand (debug.c:569)", "clusterCommand (cluster.c:1201)",
+        )
+        assert "New error stack trace" in self._recur(self._RUN1, other)
+
+
+class TestTraceTruncation:
+    """GitHub rejects bodies over 65536 chars; oversized traces are capped
+    keeping head (names the error) and tail (holds the summary totals)."""
+
+    def _big_failure(self) -> UniqueFailure:
+        error = "HEAD: first line names the error\n" + ("x" * 100 + "\n") * 1000 + "TAIL: summary totals"
+        return UniqueFailure(
+            test_name="", test_file="",
+            failure_type=FailureType.VALGRIND, error=error,
+            jobs=[JobReference(job="j", suite="s", url="u")],
+        )
+
+    def test_body_stays_under_github_limit(self) -> None:
+        body = _build_body(self._big_failure(), marker="<!-- m -->", occurrences=1)
+        assert len(body) < 65536
+
+    def test_truncation_keeps_head_and_tail_and_says_so(self) -> None:
+        body = _build_body(self._big_failure(), marker="<!-- m -->", occurrences=1)
+        assert "HEAD: first line names the error" in body
+        assert "TAIL: summary totals" in body
+        assert "trace truncated" in body
+
+    def test_short_trace_untouched(self) -> None:
+        f = UniqueFailure(
+            test_name="", test_file="",
+            failure_type=FailureType.VALGRIND, error="short trace",
+            jobs=[JobReference(job="j", suite="s", url="u")],
+        )
+        body = _build_body(f, marker="<!-- m -->", occurrences=1)
+        assert "trace truncated" not in body
+        assert "short trace" in body
+
+    def test_truncated_recurrence_stays_quiet(self) -> None:
+        """The stored trace is the truncated form; the fresh full-length trace
+        must compare equal to it or every recurrence posts a new-error comment."""
+        f = self._big_failure()
+        body = _build_body(f, marker="<!-- m -->", occurrences=1)
+        renderer = renderer_for(self._big_failure())
+        renderer.merge_environments(body)
+        comment = renderer.render("<!-- m -->", 2).comment
+        assert "New error stack trace" not in comment
+
 
 class TestExceptionTitle:
     """Uncaught test-client exceptions arrive wrapped in the runner's
@@ -938,6 +1098,16 @@ class TestExceptionTitle:
         assert "Executing test client:" not in title
         assert "Intentional runtime exception for detector testing." in title
         assert title.startswith("[EXCEPTION] ")
+
+    def test_title_stable_across_volatile_ports_and_pids(self) -> None:
+        """The fingerprint scrubs ports/PIDs, so one recurring exception keeps
+        one issue; the title must scrub them too or the publisher rewrites it
+        with the new port on every recurrence."""
+        template = " Executing test client: couldn't open socket: connection refused, port {port}\n"
+        t1 = title_for(self._failure(template.format(port=21079)))
+        t2 = title_for(self._failure(template.format(port=21987)))
+        assert t1 == t2
+        assert "21079" not in t1
 
 
 def _macos_leaks_error(pid: int, leaks: int, leaked_bytes: int, address: str) -> str:
@@ -992,3 +1162,22 @@ class TestMacosLeaksTitle:
         t1 = title_for(self._failure(_macos_leaks_error(9443, 1, 48, "0x953074d20")))
         t2 = title_for(self._failure(_macos_leaks_error(9443, 12, 4096, "0x953074d20")))
         assert t1 != t2
+
+    def test_unsymbolicated_leaks_in_one_file_share_a_fingerprint(self) -> None:
+        """Documents a known granularity limit: with bare-address ROOT LEAK
+        lines (no symbol names), the blob carries no allocation-site signal,
+        so two different leaks in the same test file collapse into one issue
+        (see fingerprint_for). Symbolicated roots stay distinct via the
+        root-site anchor in normalize_error_identity."""
+        f1 = self._failure(_macos_leaks_error(9443, 1, 48, "0x953074d20"))
+        f2 = self._failure(_macos_leaks_error(9443, 12, 4096, "0x9dd024100"))
+        assert fingerprint_for(f1) == fingerprint_for(f2)
+
+    def test_symbolicated_leaks_in_one_file_stay_distinct(self) -> None:
+        f1 = self._failure(
+            _macos_leaks_error(9443, 1, 48, "<malloc in sdsnewlen 0x953074d20>")
+        )
+        f2 = self._failure(
+            _macos_leaks_error(9443, 1, 48, "<malloc in clusterInit 0x9dd024100>")
+        )
+        assert fingerprint_for(f1) != fingerprint_for(f2)

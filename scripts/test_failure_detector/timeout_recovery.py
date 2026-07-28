@@ -1,10 +1,11 @@
 """Recover timeout failures from CI console logs.
 
-When the Tcl test runner's watchdog kills a process before
-``write_test_failures`` executes, the structured artifact has empty entries
-for that job. This module identifies those jobs, downloads their console logs,
-and extracts [TIMEOUT] failures that would otherwise be invisible to the
-detector.
+The Tcl test runner excludes timeouts from the structured artifact (and its
+watchdog may kill the process before ``write_test_failures`` runs at all), so
+a timed-out job's artifact carries no timeout entry regardless of what else it
+captured. This module identifies failed jobs without a captured timeout,
+downloads their console logs, and extracts [TIMEOUT] failures that would
+otherwise be invisible to the detector.
 
 Orchestration is separated from parsing: :mod:`timeout_parser` handles the
 regex extraction; this module decides which jobs to scan, downloads their logs,
@@ -53,7 +54,7 @@ def recover_timeouts(
         return []
 
     logger.info(
-        "Scanning console logs for %d job(s) with empty artifact entries: %s",
+        "Scanning console logs of %d failed job(s) without a captured timeout: %s",
         len(needs_scan), ", ".join(sorted(needs_scan)),
     )
 

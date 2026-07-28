@@ -83,6 +83,12 @@ def fingerprint_for(failure: UniqueFailure) -> str:
     For other nameless failures (sanitizer/valgrind/startup): hash of
     (type_namespace,) with the normalized error as shapes input. This means the
     same bug detected after different test files produces the same fingerprint.
+
+    Known granularity limit: a macOS /usr/bin/leaks blob whose root-leak
+    lines are unsymbolicated (bare addresses, no site names) normalizes to
+    the boilerplate shared by every leak in that test file, so two such
+    distinct leaks collapse into one issue. Symbolicated roots stay distinct
+    via the root-site anchor in normalize_error_identity.
     """
     ns = marker_namespace_for(failure)
 
@@ -157,7 +163,10 @@ class _FailureRenderer:
         """Return the failure's error trace when it meaningfully differs from
         what is stored on the issue, else None.
         """
-        new_error = self._failure.error
+        # The stored trace was truncated when published, so the fresh trace
+        # must be compared in its truncated form too, or every recurrence of
+        # an oversized trace would register as a new error.
+        new_error = _truncate_trace(self._failure.error)
         if not new_error.strip():
             return None
         stored = _extract_error_from_body(existing_body)
@@ -197,6 +206,25 @@ _COUNT_RE = re.compile(r"\b\d[\d,]*(\s+(?:bytes?|blocks?|byte\(s\)|object\(s\)))
 # address and registers change every run of the same bug; the fingerprint
 # scrubs them, so the title must too or it is rewritten on each recurrence.
 _ASAN_ADDR_NOISE_RE = re.compile(r"\s+on address 0x[0-9a-fA-F]+.*$")
+
+# Volatile run-specific tokens in generic title candidates: ports, PIDs, hex
+# addresses, temp paths, and long bare numbers. The fingerprint scrubs these
+# for identity, so one recurring failure keeps one issue; the title must scrub
+# them too, or the publisher rewrites the title with the new port/PID on every
+# recurrence. Leak titles are exempt: their sizes are triage signal and
+# refreshing them is intentional.
+_TITLE_VOLATILE_SUBS: tuple[tuple[re.Pattern, str], ...] = (
+    (re.compile(r"0x[0-9a-fA-F]+"), "0xN"),
+    (re.compile(r"/tmp/[^\s:]+"), "/tmp/..."),
+    (re.compile(r"\b(pid|port)([=\s]+)\d+", re.IGNORECASE), r"\1\2N"),
+    (re.compile(r"\b\d{4,}\b"), "N"),
+)
+
+
+def _scrub_volatile_title_tokens(line: str) -> str:
+    for pattern, repl in _TITLE_VOLATILE_SUBS:
+        line = pattern.sub(repl, line)
+    return line
 
 # Valgrind stack frame naming a source location: "by 0x1E8076: debugCommand
 # (debug.c:569)". Frames in tool preload libraries (malloc interceptors)
@@ -248,14 +276,22 @@ _LEAKS_TOTAL_RE = re.compile(
 # frame is their first caller outside this set.
 _ALLOC_WRAPPER_FILES = frozenset({"zmalloc.c", "sds.c"})
 
+# Sanitizer runtime interceptor frames carry a source file:line into the
+# sanitizer's own sources ("malloc ../../../../src/libsanitizer/asan/
+# asan_malloc_linux.cpp:69"), so unlike valgrind's preload frames they pass
+# the source-frame regex. They are shared plumbing like the wrappers above.
+_SANITIZER_RUNTIME_PATH_RE = re.compile(
+    r"libsanitizer|sanitizer_common|/(?:asan|lsan|ubsan|tsan|msan)[_/]"
+)
+
 
 def _leak_site(error: str) -> str:
     """Distinctive "func (file:line)" in the report's first stack, or "".
 
-    Skips allocator-wrapper frames so the site names the code path that
-    leaked (debugCommand (debug.c:569)), not the shared plumbing
-    (ztrymalloc_usable). Falls back to the first source frame when the
-    whole stack is wrappers.
+    Skips allocator-wrapper and sanitizer-runtime frames so the site names
+    the code path that leaked (debugCommand (debug.c:569)), not the shared
+    plumbing (ztrymalloc_usable, the ASan malloc interceptor). Falls back to
+    the first source frame when the whole stack is plumbing.
     """
     first_source_site = ""
     for line in error.split("\n"):
@@ -263,13 +299,37 @@ def _leak_site(error: str) -> str:
         match = _SOURCE_FRAME_RE.match(line) or _SAN_SOURCE_FRAME_RE.match(line)
         if not match:
             continue
-        source_file = match.group("file").rsplit("/", 1)[-1]
+        source_path = match.group("file")
+        source_file = source_path.rsplit("/", 1)[-1]
         site = f"{match.group('func')} ({source_file}:{match.group('line')})"
         if not first_source_site:
             first_source_site = site
-        if source_file not in _ALLOC_WRAPPER_FILES:
-            return site
+        if source_file in _ALLOC_WRAPPER_FILES:
+            continue
+        if _SANITIZER_RUNTIME_PATH_RE.search(source_path):
+            continue
+        return site
     return first_source_site
+
+
+# A startup blob: "Can't start <exe>\nCONFIGURATION:\n<config>\nERROR:\n
+# <reason>". The exe path is identical for every startup failure; the reason
+# is what tells two causes apart, so the title must carry it. "***" banner
+# lines ("*** FATAL CONFIG FILE ERROR ... ***") are shared across causes and
+# skipped, mirroring the identity extraction in normalize_error_identity.
+_STARTUP_REASON_RE = re.compile(r"\nERROR:\n(?P<tail>.+)", re.DOTALL)
+
+
+def _startup_reason(error: str) -> str:
+    """First non-banner line after the startup blob's ERROR: header, or ""."""
+    match = _STARTUP_REASON_RE.search(error)
+    if not match:
+        return ""
+    for line in match.group("tail").split("\n"):
+        line = line.strip()
+        if line and not line.startswith("***"):
+            return line
+    return ""
 
 
 def _error_summary_line(error: str) -> str:
@@ -282,6 +342,11 @@ def _error_summary_line(error: str) -> str:
     and names the first user-code stack frame so two bugs with the same
     diagnostic line stay tellable apart in an issue list.
     """
+    if error.startswith("Can't start"):
+        reason = _startup_reason(error)
+        if reason:
+            return f"Can't start server: {reason}"[:80]
+
     # A macOS leaks report's first line is the Tcl test name with a volatile
     # PID ("Check for memory leaks (pid 9443) in ..."); the payload is the
     # totals line. The leaked-bytes figure is shown as-is for the same
@@ -341,14 +406,16 @@ def _error_summary_line(error: str) -> str:
             summary = _LOSS_RECORD_RE.sub("", line)
             summary = _COUNT_RE.sub(r"N\1", summary)
             summary = _ASAN_ADDR_NOISE_RE.sub("", summary)
+            summary = _scrub_volatile_title_tokens(summary)
             site = _leak_site(error)
             if site and site not in summary:
                 summary = f"{summary} in {site}"
             return summary[:60]
 
     if candidates:
-        return candidates[0][:60]
-    return clean.strip()[:60] if clean.strip() else "unknown error"
+        return _scrub_volatile_title_tokens(candidates[0])[:60]
+    stripped = clean.strip()
+    return _scrub_volatile_title_tokens(stripped)[:60] if stripped else "unknown error"
 
 
 # Nameless failure types whose fingerprint keys on test_file, so the file is
@@ -418,13 +485,15 @@ def _build_body(failure: UniqueFailure, marker: str, *, occurrences: int) -> str
             ci_links,
         ])
 
+    error_text = _truncate_trace(failure.error) or "N/A"
+    fence = _fence_for(error_text)
     lines.extend([
         "",
         "**Error stack trace**",
         "",
-        "```",
-        failure.error or "N/A",
-        "```",
+        fence,
+        error_text,
+        fence,
         "",
         f"**Environments:** {env_list}",
         "",
@@ -432,6 +501,37 @@ def _build_body(failure: UniqueFailure, marker: str, *, occurrences: int) -> str
         "*Auto-created by Test Failure Detector*",
     ])
     return "\n".join(lines)
+
+
+def _fence_for(text: str) -> str:
+    """A code fence longer than any backtick run in *text*.
+
+    A fence closes only on a run at least as long as its opener, so an error
+    that itself contains ``` must be wrapped in a longer fence or it would
+    close the block early (and the round-trip in _extract_error_from_body
+    would return a truncated trace, triggering a spurious new-error comment
+    on every recurrence).
+    """
+    longest = max((len(m.group()) for m in re.finditer(r"`+", text)), default=0)
+    return "`" * max(3, longest + 1)
+
+
+# GitHub rejects issue bodies and comments over 65536 characters. A full
+# valgrind or sanitizer log can be several times that; the create call would
+# 422 and the failure would never get an issue. The cap leaves ample room for
+# the surrounding body (markers, links, environments). Head and tail are both
+# kept: the head names the error, the tail holds the summary totals.
+_MAX_TRACE_CHARS = 40_000
+
+_TRUNCATION_NOTICE = "\n... [trace truncated by Test Failure Detector] ...\n"
+
+
+def _truncate_trace(trace: str) -> str:
+    """Cap a trace to fit a GitHub issue body, keeping its head and tail."""
+    if len(trace) <= _MAX_TRACE_CHARS:
+        return trace
+    keep = (_MAX_TRACE_CHARS - len(_TRUNCATION_NOTICE)) // 2
+    return f"{trace[:keep]}{_TRUNCATION_NOTICE}{trace[-keep:]}"
 
 
 def _build_comment(
@@ -450,7 +550,9 @@ def _build_comment(
         new_envs = ", ".join(f"`{e}`" for e in newly_failing)
         lines.append(f"\n**Newly failing in:** {new_envs}")
     if new_error:
-        lines.append(f"\n**New error stack trace**\n\n```\n{new_error}\n```")
+        new_error = _truncate_trace(new_error)
+        fence = _fence_for(new_error)
+        lines.append(f"\n**New error stack trace**\n\n{fence}\n{new_error}\n{fence}")
     lines.append(f"\n**Failed in:**\n{ci_links}")
     return "\n".join(lines)
 
@@ -463,8 +565,11 @@ def _extract_environments_from_body(body: str) -> list[str]:
     return re.findall(r"`([^`]+)`", env_match.group(1))
 
 
+# The fence length varies (see _fence_for); the backreference requires the
+# closer to be the same run that opened the block, so an embedded shorter
+# backtick run inside the error does not end the match early.
 _ERROR_BLOCK_RE = re.compile(
-    r"\*\*Error stack trace\*\*\s*```\n(.*?)\n```",
+    r"\*\*Error stack trace\*\*\s*(`{3,})\n(.*?)\n\1",
     re.DOTALL,
 )
 
@@ -474,15 +579,24 @@ def _extract_error_from_body(body: str) -> str:
     match = _ERROR_BLOCK_RE.search(body)
     if not match:
         return ""
-    return match.group(1).strip()
+    return match.group(2).strip()
 
 
+# Must scrub at least everything the fingerprint scrubs: two traces the
+# fingerprint calls the same bug must compare equal here, or every recurrence
+# posts a spurious "new error stack trace" comment. Valgrind ==PID== markers,
+# loss-record coordinates, and byte/block counts drift on every run of the
+# same leak.
 _TRACE_NOISE_RES = (
     re.compile(r"\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?"),
     re.compile(r"\b\d{2}:\d{2}:\d{2}(?:\.\d+)?\b"),
+    re.compile(r"==\d+==\s*"),
     re.compile(r"0x[0-9a-fA-F]+"),
     re.compile(r"/tmp/[^\s:]+"),
     re.compile(r"\b(pid|port)[=\s]+\d+", re.IGNORECASE),
+    re.compile(r"\bin loss record \d[\d,]* of \d[\d,]*"),
+    re.compile(r"\b\d[\d,]*\s+(?:bytes?|blocks?|byte\(s\)|object\(s\)|allocation\(s\)|leaks?)\b"),
+    re.compile(r"\b\d{4,}\b"),
 )
 
 
