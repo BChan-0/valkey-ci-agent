@@ -26,7 +26,6 @@ from scripts.test_failure_detector.timeout_recovery import recover_timeouts
 
 logger = logging.getLogger(__name__)
 
-# New: Build a markdown summary for the GitHub Actions job summary.
 def _build_job_summary(
     run_id: int,
     repo_full_name: str,

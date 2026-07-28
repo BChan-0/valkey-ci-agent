@@ -40,9 +40,9 @@ def recover_timeouts(
 
     Returns a list of UniqueFailure objects (with FailureType.TIMEOUT) for
     timeouts recovered from logs. These are already deduplicated within each
-    job but may overlap with timeouts captured in the artifact by the updated
-    test_helper.tcl; callers should merge them with artifact-derived failures
-    and rely on parse_and_deduplicate's grouping to collapse duplicates.
+    job but may overlap with timeouts the runner captured in the artifact;
+    callers should merge them with artifact-derived failures and rely on
+    parse_and_deduplicate's grouping to collapse duplicates.
 
     Returns an empty list (rather than raising) if logs are unavailable,
     expired, or contain no timeout markers. This is best-effort recovery:
