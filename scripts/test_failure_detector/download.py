@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
+from itertools import islice
 
 from github import Github
 from github.WorkflowRun import WorkflowRun
@@ -17,6 +18,11 @@ logger = logging.getLogger(__name__)
 # Name of the JSON file the Valkey CI workflow uploads inside its artifact zip.
 _FAILURES_JSON_NAME = "all-test-failures.json"
 _FAILURES_ARTIFACT_NAME = "all-test-failures"
+
+# How far back to look for a usable run. The sweep only ever wants the latest
+# one, so a run older than this is stale enough that reporting nothing found is
+# more useful than paging through the whole history.
+_MAX_RUNS_SCANNED = 50
 
 def get_latest_daily_run(
     gh: Github,
@@ -50,20 +56,28 @@ def get_latest_daily_run(
     # Accept scheduled and manually dispatched runs. Pull-request runs are
     # excluded by their conclusion (action_required/skipped) in the loop below,
     # so we don't need to filter by event at the API level.
+    #
+    # get_runs() is lazy, so the islice must run inside the retried call for the
+    # retries to cover the actual request.
     runs = retry_github_call(
-        lambda: daily_workflow.get_runs(
-            branch=branch, status="completed",
-        ),
+        lambda: list(islice(
+            daily_workflow.get_runs(branch=branch, status="completed"),
+            _MAX_RUNS_SCANNED,
+        )),
         retries=3,
         description=f"list runs for {workflow_name}",
     )
 
     for run in runs:
         # Skip runs that never actually executed: cancelled/skipped, runs
-        # awaiting approval (action_required, e.g. fork PRs) or expired
-        # (stale), and runs with no conclusion yet. These produce no test
+        # awaiting approval (action_required, e.g. fork PRs), expired (stale),
+        # runs that died before any job started (startup_failure, e.g. invalid
+        # workflow YAML), and runs with no conclusion yet. These produce no test
         # artifacts and would be mistaken for a clean pass.
-        if run.conclusion in ("cancelled", "skipped", "action_required", "stale", None):
+        if run.conclusion in (
+            "cancelled", "skipped", "action_required", "stale",
+            "startup_failure", None,
+        ):
             logger.debug(
                 "Skipping run #%d (conclusion=%s)", run.run_number, run.conclusion,
             )
@@ -95,21 +109,27 @@ def download_all_test_failures(
     """
     client = artifact_client or ArtifactClient(gh, token=github_token)
 
-    artifacts = client.list_run_artifacts(repo_full_name, run_id)
-    target = next(
-        (a for a in artifacts if a.name == _FAILURES_ARTIFACT_NAME), None
+    artifacts = client.list_run_artifacts(
+        repo_full_name, run_id, name=_FAILURES_ARTIFACT_NAME,
     )
-    if target is None:
+    matches = [a for a in artifacts if a.name == _FAILURES_ARTIFACT_NAME]
+    if not matches:
         logger.info(
             "No %r artifact found in run %d", _FAILURES_ARTIFACT_NAME, run_id
         )
         return None
-    if target.expired:
+
+    # Re-running a workflow leaves one artifact per attempt under the same run
+    # and name, each expiring on its own clock. Take the newest live one: a
+    # stale earlier attempt must not shadow the re-run's usable artifact.
+    live = [a for a in matches if not a.expired]
+    if not live:
         logger.warning(
-            "Artifact %r (id=%d) in run %d has expired",
-            target.name, target.artifact_id, run_id,
+            "All %d %r artifact(s) in run %d have expired",
+            len(matches), _FAILURES_ARTIFACT_NAME, run_id,
         )
         return None
+    target = max(live, key=lambda a: a.artifact_id)
 
     logger.info("Downloading artifact: %s (id=%d)", target.name, target.artifact_id)
     files = client.download_artifact(repo_full_name, target.artifact_id)
@@ -158,13 +178,14 @@ def get_job_info(
         description=f"get run {run_id}",
     )
 
-    jobs = retry_github_call(
-        lambda: run.jobs(),
+    # The list() must happen inside the retried call: jobs() returns a lazy
+    # PaginatedList that issues no request until iterated, so retrying only the
+    # construction would leave the actual HTTP call unprotected.
+    job_list = retry_github_call(
+        lambda: list(run.jobs()),
         retries=3,
         description=f"list jobs for run {run_id}",
     )
-
-    job_list = list(jobs)
 
     job_url_map: dict[str, str] = {job.name: job.html_url for job in job_list}
     failed_jobs: set[str] = set()

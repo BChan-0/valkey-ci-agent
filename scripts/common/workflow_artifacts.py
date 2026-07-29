@@ -10,10 +10,12 @@ import io
 import logging
 import time
 import zipfile
+import zlib
 from dataclasses import dataclass
 from itertools import islice
 from typing import TYPE_CHECKING, Any
 from urllib.error import HTTPError, URLError
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 from scripts.common.github_client import (
@@ -26,6 +28,10 @@ if TYPE_CHECKING:
     from github import Github
 
 logger = logging.getLogger(__name__)
+
+# Bounds the artifact listing so a pathological run can't spin forever. At 100
+# per page this covers far more artifacts than any real run uploads.
+_MAX_ARTIFACT_PAGES = 20
 
 
 @dataclass(frozen=True)
@@ -59,30 +65,62 @@ class ArtifactClient:
             _fetch, retries=self._retries, description=f"list runs {workflow_file}",
         )
 
-    def list_run_artifacts(self, repo_full_name: str, run_id: int) -> list[WorkflowArtifact]:
+    def list_run_artifacts(
+        self, repo_full_name: str, run_id: int, *, name: str | None = None,
+    ) -> list[WorkflowArtifact]:
+        """List a run's artifacts, following pagination.
+
+        A single Valkey Daily run uploads one artifact per job, hundreds after
+        matrix expansion, so the response is paginated and reading only the
+        first page can miss the artifact entirely. Pass ``name`` to have GitHub
+        filter server-side, which is both cheaper and immune to that ordering.
+        """
         repo = self._gh.get_repo(repo_full_name)
+        base = f"/repos/{repo_full_name}/actions/runs/{run_id}/artifacts"
+        query = "per_page=100" if name is None else f"per_page=100&name={quote(name)}"
 
-        def _fetch() -> Any:
-            _, data = repo._requester.requestJsonAndCheck(
-                "GET", f"/repos/{repo_full_name}/actions/runs/{run_id}/artifacts",
-            )
-            return data
+        artifacts: list[WorkflowArtifact] = []
+        seen_ids: set[int] = set()
+        for page in range(1, _MAX_ARTIFACT_PAGES + 1):
+            def _fetch(page: int = page) -> Any:
+                _, data = repo._requester.requestJsonAndCheck(
+                    "GET", f"{base}?{query}&page={page}",
+                )
+                return data
 
-        payload = retry_github_call(_fetch, retries=self._retries,
-                                    description=f"list artifacts {run_id}")
-        if not isinstance(payload, dict):
-            return []
-        return [
-            WorkflowArtifact(
-                artifact_id=a["id"], name=a["name"],
-                size_in_bytes=a.get("size_in_bytes", 0),
-                expired=a.get("expired", False),
+            payload = retry_github_call(
+                _fetch, retries=self._retries,
+                description=f"list artifacts {run_id} page {page}",
             )
-            for a in payload.get("artifacts", [])
-            if isinstance(a, dict)
-            and isinstance(a.get("id"), int)
-            and isinstance(a.get("name"), str)
-        ]
+            if not isinstance(payload, dict):
+                break
+            entries = payload.get("artifacts")
+            if not isinstance(entries, list) or not entries:
+                break
+            for a in entries:
+                if (
+                    isinstance(a, dict)
+                    and isinstance(a.get("id"), int)
+                    and isinstance(a.get("name"), str)
+                    and a["id"] not in seen_ids
+                ):
+                    seen_ids.add(a["id"])
+                    artifacts.append(WorkflowArtifact(
+                        artifact_id=a["id"], name=a["name"],
+                        size_in_bytes=a.get("size_in_bytes", 0),
+                        expired=a.get("expired", False),
+                    ))
+            total = payload.get("total_count")
+            if isinstance(total, int) and len(seen_ids) >= total:
+                break
+            if len(entries) < 100:
+                break
+        else:
+            logger.warning(
+                "Stopped listing artifacts for run %d at the %d-page cap; "
+                "%d seen so far", run_id, _MAX_ARTIFACT_PAGES, len(artifacts),
+            )
+        return artifacts
 
     def download_artifact(self, repo_full_name: str, artifact_id: int) -> dict[str, bytes]:
         return _extract_zip(self._download(
@@ -149,14 +187,51 @@ def _extract_zip(blob: bytes) -> dict[str, bytes]:
     try:
         with zipfile.ZipFile(io.BytesIO(blob)) as zf:
             members = [m for m in zf.infolist() if not m.is_dir()]
-            total = sum(m.file_size for m in members)
-            if total > _MAX_UNCOMPRESSED_BYTES:
+            # file_size is the zip's own declaration, so it is checked again
+            # against the bytes actually decompressed below.
+            declared = sum(m.file_size for m in members)
+            if declared > _MAX_UNCOMPRESSED_BYTES:
                 logger.warning(
-                    "Artifact uncompressed size %d exceeds cap %d; refusing to extract",
-                    total, _MAX_UNCOMPRESSED_BYTES,
+                    "Artifact declares uncompressed size %d over cap %d; "
+                    "refusing to extract", declared, _MAX_UNCOMPRESSED_BYTES,
                 )
                 return {}
-            return {m.filename: zf.read(m) for m in members}
-    except zipfile.BadZipFile:
+            return _read_members(zf, members)
+    except (zipfile.BadZipFile, EOFError):
         logger.warning("Artifact zip is corrupt; returning empty")
         return {}
+
+
+def _read_members(
+    zf: zipfile.ZipFile, members: list[zipfile.ZipInfo],
+) -> dict[str, bytes]:
+    """Decompress members, skipping any that are individually unreadable.
+
+    A corrupt or unsupported member raises from its own read, so each is
+    attempted independently: one bad file in an artifact bundle must not
+    discard the others (the failures JSON is usually the one that matters).
+    """
+    files: dict[str, bytes] = {}
+    budget = _MAX_UNCOMPRESSED_BYTES
+    for member in members:
+        try:
+            with zf.open(member) as fh:
+                # Read one byte past the budget so an over-cap member is
+                # detected rather than silently truncated.
+                data = fh.read(budget + 1)
+        except (zipfile.BadZipFile, NotImplementedError, RuntimeError,
+                EOFError, zlib.error, ValueError) as exc:
+            logger.warning(
+                "Skipping unreadable zip member %r: %s: %s",
+                member.filename, type(exc).__name__, exc,
+            )
+            continue
+        if len(data) > budget:
+            logger.warning(
+                "Artifact exceeds uncompressed cap %d while reading %r; "
+                "stopping extraction", _MAX_UNCOMPRESSED_BYTES, member.filename,
+            )
+            break
+        budget -= len(data)
+        files[member.filename] = data
+    return files

@@ -75,6 +75,55 @@ class TestGetLatestDailyRun:
         assert result == failure_run
 
     @patch("scripts.test_failure_detector.download.retry_github_call")
+    def test_skips_startup_failure_runs(self, mock_retry) -> None:
+        """A run that died before any job started uploads no artifact. Returning
+        it would report the older run's real failures as a clean pass."""
+        startup_failed = _make_mock_run(14, 200, "startup_failure")
+        failure_run = _make_mock_run(13, 199, "failure")
+
+        mock_workflow = MagicMock()
+        mock_workflow.name = "Daily"
+        mock_workflow.get_runs.return_value = [startup_failed, failure_run]
+
+        mock_repo = MagicMock()
+        mock_repo.get_workflows.return_value = [mock_workflow]
+        mock_retry.side_effect = lambda op, **kwargs: op()
+
+        mock_gh = MagicMock()
+        mock_gh.get_repo.return_value = mock_repo
+
+        assert get_latest_daily_run(mock_gh, "owner/repo") == failure_run
+
+    def test_run_listing_is_retried_around_iteration(self) -> None:
+        """get_runs() returns a lazy PaginatedList that issues no request until
+        iterated, so the retry must wrap the iteration, not the construction."""
+        from github import GithubException
+
+        state = {"calls": 0}
+
+        class _LazyRuns:
+            def __iter__(self):
+                state["calls"] += 1
+                if state["calls"] == 1:
+                    raise GithubException(502, {"message": "Server Error"}, None)
+                return iter([_make_mock_run(13, 199, "failure")])
+
+        mock_workflow = MagicMock()
+        mock_workflow.name = "Daily"
+        mock_workflow.get_runs.return_value = _LazyRuns()
+
+        mock_repo = MagicMock()
+        mock_repo.get_workflows.return_value = [mock_workflow]
+        mock_gh = MagicMock()
+        mock_gh.get_repo.return_value = mock_repo
+
+        with patch("scripts.common.github_client.time.sleep"):
+            result = get_latest_daily_run(mock_gh, "owner/repo")
+
+        assert result.id == 199
+        assert state["calls"] == 2
+
+    @patch("scripts.test_failure_detector.download.retry_github_call")
     def test_returns_first_success_or_failure(self, mock_retry) -> None:
         """Should return the most recent run with conclusion success or failure."""
         runs = [
@@ -260,6 +309,47 @@ class TestDownloadAllTestFailures:
             MagicMock(), "owner/repo", 123, "fake-token", artifact_client=client,
         )
         assert result is None
+
+    def test_filters_by_name_so_siblings_cannot_hide_the_artifact(self) -> None:
+        """The listing must be name-filtered: a Daily run uploads one artifact
+        per job, and an unfiltered first page can omit the one we want."""
+        client = MagicMock()
+        client.list_run_artifacts.return_value = [self._make_artifact("all-test-failures")]
+        client.download_artifact.return_value = {"all-test-failures.json": b"{}"}
+
+        download_all_test_failures(
+            MagicMock(), "owner/repo", 123, "fake-token", artifact_client=client,
+        )
+        assert client.list_run_artifacts.call_args.kwargs["name"] == "all-test-failures"
+
+    def test_prefers_newest_live_artifact_over_expired_attempt(self) -> None:
+        """Re-running a workflow leaves one artifact per attempt under the same
+        name. An expired earlier attempt must not shadow the usable one."""
+        client = MagicMock()
+        client.list_run_artifacts.return_value = [
+            self._make_artifact("all-test-failures", artifact_id=1, expired=True),
+            self._make_artifact("all-test-failures", artifact_id=2, expired=False),
+        ]
+        client.download_artifact.return_value = {"all-test-failures.json": b'{"ok":1}'}
+
+        result = download_all_test_failures(
+            MagicMock(), "owner/repo", 123, "fake-token", artifact_client=client,
+        )
+        assert result == b'{"ok":1}'
+        client.download_artifact.assert_called_once_with("owner/repo", 2)
+
+    def test_returns_none_when_every_attempt_expired(self) -> None:
+        client = MagicMock()
+        client.list_run_artifacts.return_value = [
+            self._make_artifact("all-test-failures", artifact_id=1, expired=True),
+            self._make_artifact("all-test-failures", artifact_id=2, expired=True),
+        ]
+
+        result = download_all_test_failures(
+            MagicMock(), "owner/repo", 123, "fake-token", artifact_client=client,
+        )
+        assert result is None
+        client.download_artifact.assert_not_called()
 
 
 class TestGetJobUrls:

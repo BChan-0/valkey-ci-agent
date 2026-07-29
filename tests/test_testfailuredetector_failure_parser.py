@@ -211,7 +211,7 @@ class TestParseAndDeduplicate:
             "job-1": {
                 "suite": [
                     # Under f"{name} in {file}" both collapse to
-                    # "foo in bar.tcl in baz.tcl" — but they are different tests.
+                    # "foo in bar.tcl in baz.tcl", but they are different tests.
                     {"test_name": "foo in bar.tcl", "test_file": "baz.tcl", "error": "a"},
                     {"test_name": "foo", "test_file": "bar.tcl in baz.tcl", "error": "b"},
                 ]

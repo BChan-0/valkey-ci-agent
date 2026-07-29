@@ -201,7 +201,7 @@ class TestProcessFailures:
         publisher = mock_publisher_cls.return_value
         publisher.upsert.side_effect = [
             ("created", "https://x/issues/1"),
-            RuntimeError("boom"),  # failure b — must NOT kill the loop
+            RuntimeError("boom"),  # failure b must not kill the loop
             ("updated", "https://x/issues/3"),
         ]
 
@@ -346,7 +346,9 @@ class TestMergeSameFingerprintFailures:
             MagicMock(), "valkey-io/valkey", [f1, f2], run_id=29944432899,
         )
 
-        assert result == {"created": 1, "updated": 0, "skipped": 0, "errors": 0}
+        assert result == {
+            "created": 1, "updated": 0, "skipped": 0, "skipped_closed": 0, "errors": 0,
+        }
         assert publisher.upsert.call_count == 1
         body = publisher.upsert.call_args.kwargs["render"]("<!-- m -->", 1).body
         assert "`valgrind-ubuntu`" in body

@@ -243,10 +243,10 @@ _SAN_SOURCE_FRAME_RE = re.compile(
 )
 
 # A valgrind leak record: "49 bytes in 1 blocks are definitely lost ...".
-# The title reformats it as "Definitely lost: 49 bytes in <site>". Unlike the
-# fingerprint (which scrubs sizes as volatile), the title shows the real
-# size: maintainers triage leaks by magnitude, and the publisher refreshes
-# the title on each recurrence, so drift just keeps it current.
+# The title reformats it as "Definitely lost: 49 bytes in <site>". Leak titles
+# keep their real byte counts even though the fingerprint scrubs them as
+# volatile: maintainers triage leaks by magnitude, and the publisher refreshes
+# the title on each recurrence, so drift keeps it current.
 _LEAK_RECORD_RE = re.compile(
     r"(?P<size>\d[\d,]*\s+bytes?)\s+in\s+\d[\d,]*\s+blocks?\s+are\s+"
     r"(?P<kind>definitely|indirectly|possibly)\s+lost"
@@ -254,19 +254,17 @@ _LEAK_RECORD_RE = re.compile(
 
 # The AddressSanitizer/LeakSanitizer summary line: "SUMMARY: AddressSanitizer:
 # 41 byte(s) leaked in 1 allocation(s)." The banner ("detected memory leaks")
-# names no magnitude; this line does. The leaked-byte figure is shown as-is for
-# the same reason valgrind sizes are (the title refreshes on recurrence).
+# names no magnitude; this line does.
 _SANITIZER_LEAK_RE = re.compile(
     r"(?P<size>\d[\d,]*\s+byte\(s\))\s+leaked\s+in\s+\d[\d,]*\s+allocation\(s\)"
 )
 
 # The totals line of a macOS /usr/bin/leaks report: "Process 9443: 1 leak for
-# 48 total leaked bytes." This is the memory-leak type's payload. The type is
-# Not redundant with valgrind/sanitizer: it is the only leak detector on the
+# 48 total leaked bytes." This is the memory-leak type's payload, and the type
+# does not overlap valgrind/sanitizer: it is the only leak detector on the
 # macos jobs (valgrind has no Apple Silicon port; the CI matrix builds ASan
-# only on Linux), it inspects the live server after each test file rather
-# than at exit, and Daily run 29461435670 caught a real 32-byte leak with it
-# that the same run's four Linux valgrind/ASan jobs all missed.
+# only on Linux), and it inspects the live server after each test file rather
+# than at exit, so it catches leaks the Linux leak jobs miss.
 _LEAKS_TOTAL_RE = re.compile(
     r"Process\s+\d+:\s*"
     r"(?P<phrase>\d[\d,]*\s+leaks?\s+for\s+\d[\d,]*\s+total\s+leaked\s+bytes)"
@@ -353,14 +351,11 @@ def _error_summary_line(error: str) -> str:
 
     # A macOS leaks report's first line is the Tcl test name with a volatile
     # PID ("Check for memory leaks (pid 9443) in ..."); the payload is the
-    # totals line. The leaked-bytes figure is shown as-is for the same
-    # reason valgrind sizes are (title refreshes on recurrence).
+    # totals line.
     leaks_total = _LEAKS_TOTAL_RE.search(error)
     if leaks_total:
         return leaks_total.group("phrase")[:60]
 
-    # A LeakSanitizer report's diagnostic banner ("detected memory leaks") names
-    # no magnitude; its "SUMMARY: AddressSanitizer: N byte(s) leaked" line does.
     # Lead with the size, then the leaking code path, so two sanitizer leaks
     # stay distinct in a title list.
     sanitizer_leak = _SANITIZER_LEAK_RE.search(error)

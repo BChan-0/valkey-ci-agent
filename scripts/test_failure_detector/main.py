@@ -1,4 +1,4 @@
-"""Test Failure Detector — main entry point"""
+"""Test Failure Detector main entry point"""
 
 from __future__ import annotations
 
@@ -35,8 +35,8 @@ def _build_job_summary(
     lines = [
         "## Test Failure Detector",
         "",
-        f"**Source:** [{repo_full_name}](https://github.com/{repo_full_name}) "
-        f"— [Run #{run_id}](https://github.com/{repo_full_name}/actions/runs/{run_id})",
+        f"**Source:** [{repo_full_name}](https://github.com/{repo_full_name}), "
+        f"[Run #{run_id}](https://github.com/{repo_full_name}/actions/runs/{run_id})",
         "",
         "| Metric | Count |",
         "|--------|-------|",
@@ -63,9 +63,13 @@ def _merge_timeout_recoveries(
     if not timeout_failures:
         return unique_failures
 
+    # Nameless timeouts are routine (a volatile runner name like "pid:NNNN" or
+    # "hang" is demoted to "" on both the artifact and recovery sides), and they
+    # group by test_file, which the ("", file) key handles. Excluding them from
+    # the index would report one timeout as two failures.
     existing_timeouts: dict[tuple[str, str], UniqueFailure] = {}
     for f in unique_failures:
-        if f.failure_type == FailureType.TIMEOUT and f.test_name:
+        if f.failure_type == FailureType.TIMEOUT:
             existing_timeouts[(f.test_name, f.test_file)] = f
 
     for recovered in timeout_failures:
@@ -106,10 +110,16 @@ def run(
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(level=level, format="%(levelname)s %(name)s: %(message)s")
 
+    # Auth.Token raises a bare AssertionError on an empty token, which reads as
+    # an internal error rather than a missing secret.
+    if not github_token:
+        raise ValueError("GitHub token is required")
+
     gh = Github(auth=Auth.Token(github_token))
     artifact_client = ArtifactClient(gh, token=github_token)
 
     # Step 1: Find the workflow run
+    run_conclusion: str | None = None
     if run_id is None:
         logger.info("Looking for latest %s run on %s/%s...", workflow_name, repo_full_name, branch)
         daily_run = get_latest_daily_run(gh, repo_full_name, workflow_name, branch)
@@ -122,6 +132,7 @@ def run(
             )
             return 1
         run_id = daily_run.id
+        run_conclusion = daily_run.conclusion
     else:
         logger.info("Using specified run ID: %d", run_id)
 
@@ -131,7 +142,24 @@ def run(
         gh, repo_full_name, run_id, github_token, artifact_client=artifact_client,
     )
     if artifact_content is None:
-        logger.info("No test failures artifact found — CI run likely passed cleanly.")
+        # A red run with no artifact is not a clean pass: the artifact expired,
+        # the upload failed, or the run died before the consolidate step. Saying
+        # "passed cleanly" there hides a real failure behind a green sweep, so
+        # report it as a problem instead.
+        if run_conclusion == "failure":
+            logger.error(
+                "Run %d concluded 'failure' but has no test failures artifact; "
+                "its failures cannot be reported.", run_id,
+            )
+            emit_job_summary(
+                f"### ⚠️ Test Failure Detector\n\n"
+                f"[Run #{run_id}](https://github.com/{repo_full_name}/actions/runs/{run_id}) "
+                f"failed but uploaded no `all-test-failures` artifact, so its "
+                f"failures could not be analyzed. The artifact may have expired, "
+                f"or the run may have failed before consolidating results."
+            )
+            return 1
+        logger.info("No test failures artifact found; CI run likely passed cleanly.")
         emit_job_summary(_build_job_summary(run_id, repo_full_name, 0, {}))
         return 0
 
@@ -146,8 +174,8 @@ def run(
         emit_job_summary(
             f"### ⚠️ Test Failure Detector\n\n"
             f"Could not parse the `all-test-failures` artifact from "
-            f"[run #{run_id}](https://github.com/{repo_full_name}/actions/runs/{run_id}) "
-            f"— the artifact is malformed or truncated."
+            f"[run #{run_id}](https://github.com/{repo_full_name}/actions/runs/{run_id}). "
+            f"The artifact is malformed or truncated."
         )
         return 1
 
@@ -164,7 +192,7 @@ def run(
             f"### ⚠️ Test Failure Detector\n\n"
             f"The `all-test-failures` artifact from "
             f"[run #{run_id}](https://github.com/{repo_full_name}/actions/runs/{run_id}) "
-            f"has an unexpected format — expected a JSON object."
+            f"has an unexpected format; expected a JSON object."
         )
         return 1
     logger.info("Loaded failures from %d job(s)", len(all_failures))
@@ -194,7 +222,7 @@ def run(
     logger.info("Found %d unique failure(s)", len(unique_failures))
 
     if dry_run:
-        logger.info("Dry run — skipping issue creation/update.")
+        logger.info("Dry run: skipping issue creation/update.")
         for f in unique_failures:
             envs = ", ".join(j.job for j in f.jobs)
             logger.info("  %s [%s]", f.display_name, envs)

@@ -115,7 +115,7 @@ _STARTUP_EXE_PATH_RE = re.compile(r"(Can't start )\S*/([^/\s]+)")
 _STARTUP_NOISE_PREFIXES = ("***", "###", ">>>")
 
 # The server's config loader prints the fatal reason last, behind a fixed
-# banner and -- only when it knows the offending line -- a position line and an
+# banner and, only when it knows the offending line, a position line and an
 # echo of that line. The banner is identical across causes and the position
 # moves whenever the config file changes, so neither can be the identity; the
 # reason after them is. Nothing before the banner qualifies either: under

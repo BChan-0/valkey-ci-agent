@@ -13,9 +13,8 @@ and later in the summary::
 
     *** [TIMEOUT]: <test_name> in <test_file>
 
-This module recovers those failures by scanning the console logs for jobs
-whose artifact entries are empty (indicating the test run ended in timeout
-without capturing the failure).
+This module recovers those failures by scanning the console logs of failed
+jobs whose artifact carries no timeout entry.
 """
 
 from __future__ import annotations
