@@ -22,9 +22,7 @@ REST list endpoint and matching markers and titles locally, not via the
 Search API. The list endpoint draws on the core rate limit (thousands of
 requests per hour) instead of the Search API's 30-per-minute budget, which
 a batch of failures could exhaust, and it is strongly consistent where
-search results can lag the index or silently omit matches. Listings are
-fetched once per publisher, so callers that upsert several findings against
-one namespace should reuse a single publisher to share the cache.
+search results can lag the index or silently omit matches.
 
 Callers supply rendered title, body, and comment via a render callback;
 this module owns only the dedup machinery. Listing failures are propagated

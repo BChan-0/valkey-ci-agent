@@ -223,6 +223,120 @@ def is_plumbing_frame(func: str, source_path: str) -> bool:
     return source_path.rsplit("/", 1)[-1] in _PLUMBING_FRAME_FILES
 
 
+# Cross-tool error classes. Valgrind and the sanitizers report the same bug in
+# different vocabularies, so an identity that spans both needs a class each can
+# be mapped onto. The classes are coarse on purpose: they only have to be equal
+# for one bug seen by both tools, and unequal for different bugs at one site.
+_CLASS_LEAK = "leak"
+_CLASS_USE_AFTER_FREE = "use-after-free"
+_CLASS_BUFFER_OVERFLOW = "buffer-overflow"
+_CLASS_UNINITIALIZED = "uninitialized"
+_CLASS_INVALID_FREE = "invalid-free"
+_CLASS_RUNTIME_ERROR = "runtime-error"
+
+# Sanitizer diagnostics name their class outright, so a substring is enough.
+# Ordered: the longer, more specific names come first so "use-after-poison" is
+# not shadowed by a bare overflow match.
+_SANITIZER_CLASS_TOKENS: tuple[tuple[str, str], ...] = (
+    ("heap-use-after-free", _CLASS_USE_AFTER_FREE),
+    ("use-after-poison", _CLASS_USE_AFTER_FREE),
+    ("heap-buffer-overflow", _CLASS_BUFFER_OVERFLOW),
+    ("stack-buffer-overflow", _CLASS_BUFFER_OVERFLOW),
+    ("stack-buffer-underflow", _CLASS_BUFFER_OVERFLOW),
+    ("dynamic-stack-buffer-overflow", _CLASS_BUFFER_OVERFLOW),
+    ("global-buffer-overflow", _CLASS_BUFFER_OVERFLOW),
+    ("alloc-dealloc-mismatch", _CLASS_INVALID_FREE),
+    ("attempting double-free", _CLASS_INVALID_FREE),
+    ("bad-free", _CLASS_INVALID_FREE),
+    ("use-of-uninitialized-value", _CLASS_UNINITIALIZED),
+    ("LeakSanitizer", _CLASS_LEAK),
+    ("detected memory leaks", _CLASS_LEAK),
+    ("runtime error", _CLASS_RUNTIME_ERROR),
+)
+
+# Valgrind diagnostics that name their class outright. "Invalid read/write" is
+# absent: it is shared by use-after-free and overflow and needs the follow-up
+# address description to tell them apart (see _valgrind_access_class).
+_VALGRIND_CLASS_TOKENS: tuple[tuple[str, str], ...] = (
+    ("definitely lost", _CLASS_LEAK),
+    ("indirectly lost", _CLASS_LEAK),
+    ("possibly lost", _CLASS_LEAK),
+    ("Mismatched free", _CLASS_INVALID_FREE),
+    ("Invalid free", _CLASS_INVALID_FREE),
+    ("uninitialised value", _CLASS_UNINITIALIZED),
+    ("uninitialized value", _CLASS_UNINITIALIZED),
+    ("Conditional jump", _CLASS_UNINITIALIZED),
+)
+
+_VALGRIND_ACCESS_RE = re.compile(r"\bInvalid (?:read|write)\b")
+
+# Valgrind's address description follows the offending access and its stack,
+# and is the only thing distinguishing a use-after-free ("... free'd") from an
+# overflow ("... after a block of size N alloc'd"). It appears within a few
+# lines of the access, so the lookahead is bounded rather than scanning the
+# whole report and picking up an unrelated later error.
+_VALGRIND_ADDRESS_LOOKAHEAD = 15
+
+
+def _valgrind_access_class(lines: list[str], start: int) -> str | None:
+    """Class of a valgrind "Invalid read/write" from its address description.
+
+    Returns None when no description is found in the lookahead window, which
+    keeps the failure on its per-tool identity rather than guessing a class.
+    """
+    for line in lines[start + 1 : start + 1 + _VALGRIND_ADDRESS_LOOKAHEAD]:
+        if "free'd" in line:
+            return _CLASS_USE_AFTER_FREE
+        if "after a block" in line or "before a block" in line:
+            return _CLASS_BUFFER_OVERFLOW
+    return None
+
+
+def error_class(error: str, failure_type: FailureType) -> str | None:
+    """Cross-tool class of *error*, or None when it cannot be determined.
+
+    Only valgrind and sanitizer errors are classified; every other type keeps
+    its own identity and never participates in a cross-tool merge.
+
+    The report is scanned in order and the first line that maps wins, because
+    the runner hands over the tool's whole stderr buffer: a report opened by an
+    invalid access also carries a leak summary at exit, and the class has to
+    describe the same error the stack anchor does (the first stack block).
+
+    None is returned rather than a catch-all class whenever the vocabulary is
+    unrecognized, so an unclassifiable report stays separate instead of
+    merging on a guess.
+    """
+    if failure_type == FailureType.VALGRIND:
+        tokens = _VALGRIND_CLASS_TOKENS
+    elif failure_type == FailureType.SANITIZER:
+        tokens = _SANITIZER_CLASS_TOKENS
+    else:
+        return None
+
+    lines = [line.strip() for line in scrub_volatile_tokens(error).split("\n")]
+    for index, line in enumerate(lines):
+        if not line or any(bp in line for bp in _BOILERPLATE_SUBSTRINGS):
+            continue
+        for token, cls in tokens:
+            if token in line:
+                return cls
+        if failure_type == FailureType.VALGRIND and _VALGRIND_ACCESS_RE.search(line):
+            return _valgrind_access_class(lines, index)
+    return None
+
+
+def stack_anchor(error: str) -> str:
+    """Frame chain of *error*'s first stack block, or "" when it has none.
+
+    The same anchor both tools reduce to (see :func:`_extract_stack_anchor`),
+    exposed so the renderer can key a cross-tool identity on it.
+    """
+    text = scrub_volatile_tokens(error)
+    lines = [line.strip() for line in text.split("\n") if line.strip()]
+    return _extract_stack_anchor(lines)
+
+
 def _extract_root_leak_anchor(lines: list[str]) -> str:
     """Allocation-site chain of a macOS leaks report, or "".
 
@@ -405,6 +519,12 @@ class UniqueFailure:
     failure_type: FailureType = FailureType.ASSERTION
     error: str = ""
     jobs: list[JobReference] = field(default_factory=list)
+    # Traces from other tools that reported this same bug, as (label, text).
+    # Valgrind and the sanitizers describe one bug in different vocabularies,
+    # so when both fire in a run their reports are kept side by side instead of
+    # discarding one: each names details the other omits. Populated when two
+    # failures merge under one fingerprint; empty for a single-tool failure.
+    extra_traces: list[tuple[str, str]] = field(default_factory=list)
 
     @property
     def display_name(self) -> str:

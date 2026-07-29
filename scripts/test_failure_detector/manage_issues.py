@@ -39,6 +39,10 @@ def _merge_same_fingerprint_failures(
     and stamps the run id, the second is rejected by the idempotency key and
     its jobs (environments, CI links) silently vanish. Merging by the
     published identity keeps every job reference on the surviving failure.
+
+    A merge across tools (a valgrind and a sanitizer report of one bug) also
+    carries the absorbed failure's trace onto the survivor, so the issue shows
+    what each tool said rather than only whichever was processed first.
     """
     merged: dict[str, UniqueFailure] = {}
     unmergeable: list[UniqueFailure] = []
@@ -65,7 +69,26 @@ def _merge_same_fingerprint_failures(
         for job_ref in failure.jobs:
             if not any(j.job == job_ref.job for j in existing.jobs):
                 existing.jobs.append(job_ref)
+        _absorb_trace(existing, failure)
     return list(merged.values()) + unmergeable
+
+
+def _absorb_trace(survivor: UniqueFailure, absorbed: UniqueFailure) -> None:
+    """Carry *absorbed*'s trace onto *survivor* when it adds something.
+
+    Only a differently-typed report is kept. Two failures of the same type that
+    hash together are the same tool describing the same bug (the identity
+    already scrubbed what differs between runs), so keeping both traces would
+    show near-duplicate text.
+    """
+    if absorbed.failure_type == survivor.failure_type:
+        return
+    if not absorbed.error.strip():
+        return
+    label = issue_renderer.trace_label_for(absorbed)
+    if any(existing_label == label for existing_label, _ in survivor.extra_traces):
+        return
+    survivor.extra_traces.append((label, absorbed.error))
 
 
 def process_failures(

@@ -168,6 +168,28 @@ def test_list_run_artifacts_follows_pagination():
     assert "page=1" in urls[0] and "page=2" in urls[1]
 
 
+def test_list_run_artifacts_ignores_ids_repeated_across_pages():
+    """An upload landing mid-listing shifts later entries onto the next page, so
+    the same artifact can come back twice. Counting it twice would make a single
+    consolidated artifact look like several."""
+    mock_repo = MagicMock()
+    page = [{"id": i, "name": f"test-failures-job{i}"} for i in range(100)]
+    mock_repo.pages = [
+        {"total_count": 150, "artifacts": page},
+        # Page 2 repeats one entry from page 1 alongside a genuinely new one.
+        {"total_count": 150, "artifacts": [page[99], {"id": 100, "name": "all-test-failures"}]},
+    ]
+    _artifact_pages(mock_repo)
+    mock_gh = MagicMock()
+    mock_gh.get_repo.return_value = mock_repo
+
+    client = ArtifactClient(mock_gh, token="t")
+    arts = client.list_run_artifacts("r", 99)
+
+    assert len(arts) == 101
+    assert len({a.artifact_id for a in arts}) == 101
+
+
 def test_list_run_artifacts_filters_by_name_server_side():
     """Passing name lets GitHub do the filtering, so the result can't be pushed
     off page 1 by hundreds of sibling artifacts."""
@@ -249,9 +271,10 @@ def test_extract_zip_survives_corrupt_deflate_stream():
     assert files == {"all-test-failures.json": b'{"real":"data"}'}
 
 
-def test_extract_zip_caps_actual_decompressed_bytes(monkeypatch):
-    """The cap must apply to bytes actually read, not the zip's self-declared
-    file_size, which a malformed archive can understate."""
+def test_extract_zip_skips_member_understating_its_size(monkeypatch):
+    """An archive that understates file_size slips past the declared-total cap.
+    zipfile bounds the read to that understated size, so the payload fails its
+    CRC and the member is skipped rather than extracted at its real size."""
     from scripts.common import workflow_artifacts as artifacts_mod
     monkeypatch.setattr(artifacts_mod, "_MAX_UNCOMPRESSED_BYTES", 64)
     buf = io.BytesIO()
@@ -264,3 +287,16 @@ def test_extract_zip_caps_actual_decompressed_bytes(monkeypatch):
     struct.pack_into("<I", raw, raw.find(b"PK\x01\x02") + 24, 1)
 
     assert _extract_zip(bytes(raw)) == {}
+
+
+def test_extract_zip_refuses_archive_declaring_oversized_total(monkeypatch):
+    """The declared-total cap is what bounds decompression: members are each
+    read whole, so an honest archive over the cap must be refused up front."""
+    from scripts.common import workflow_artifacts as artifacts_mod
+    monkeypatch.setattr(artifacts_mod, "_MAX_UNCOMPRESSED_BYTES", 64)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("a.bin", b"a" * 40)
+        zf.writestr("b.bin", b"b" * 40)  # cumulative 80 > 64
+
+    assert _extract_zip(buf.getvalue()) == {}

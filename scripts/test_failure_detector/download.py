@@ -199,6 +199,18 @@ class JobInfo:
     failed: set[str]
 
 
+def normalize_job_name(job_name: str) -> str:
+    """Convert an API job name to the spelling the artifact uses.
+
+    A matrix job is named ``base (value)`` by the API, but its artifact is
+    uploaded as ``base-value`` because the workflow interpolates the matrix
+    variable into ``job-name``. Callers matching one against the other must
+    normalize first.
+    """
+    collapsed = re.sub(r"\s*\(([^)]+)\)", r"-\1", job_name)
+    return re.sub(r"\s+", "-", collapsed)
+
+
 def get_job_info(
     gh: Github,
     repo_full_name: str,
@@ -240,8 +252,7 @@ def get_job_info(
         if job.conclusion == "failure":
             failed_jobs.add(job.name)
 
-        normalized = re.sub(r"\s*\(([^)]+)\)", r"-\1", job.name)
-        normalized = re.sub(r"\s+", "-", normalized)
+        normalized = normalize_job_name(job.name)
         if normalized != job.name and normalized not in job_url_map:
             job_url_map[normalized] = job.html_url
 

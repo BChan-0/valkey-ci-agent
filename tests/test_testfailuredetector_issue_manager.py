@@ -13,10 +13,12 @@ import pytest
 try:
     from scripts.test_failure_detector.issue_renderer import (
         MARKER_NAMESPACE,
+        MEMORY_ERROR_NAMESPACE,
         _build_body,
         _build_title,
         _extract_environments_from_body,
         _extract_error_from_body,
+        _extract_errors_from_body,
         _update_environments_in_body,
         fingerprint_for,
         label_for,
@@ -33,6 +35,7 @@ try:
         FailureType,
         JobReference,
         UniqueFailure,
+        error_class,
         normalize_error_identity,
     )
 
@@ -635,7 +638,7 @@ class TestTypeSpecificRendering:
             jobs=[JobReference(job="j", suite="s", url="u")],
         )
         title = title_for(f)
-        assert title.startswith("[SANITIZER]")
+        assert title.startswith("[TEST-FAILURE]")
 
     def test_valgrind_title_prefix(self) -> None:
         f = UniqueFailure(
@@ -644,7 +647,19 @@ class TestTypeSpecificRendering:
             error="Valgrind error: Invalid read of size 4",
             jobs=[JobReference(job="j", suite="s", url="u")],
         )
-        assert title_for(f).startswith("[VALGRIND]")
+        assert title_for(f).startswith("[TEST-FAILURE]")
+
+    def test_every_type_shares_one_title_prefix(self) -> None:
+        """The type is named in the body, not the title, so an issue is not
+        retitled when the same bug is reattributed to another type."""
+        for failure_type in FailureType:
+            f = UniqueFailure(
+                test_name="", test_file="tests/unit/expire.tcl",
+                failure_type=failure_type,
+                error="Invalid read of size 4",
+                jobs=[JobReference(job="j", suite="s", url="u")],
+            )
+            assert title_for(f).startswith("[TEST-FAILURE]")
 
     def test_valgrind_leak_title_format(self) -> None:
         # Issue #91/#93: the Memcheck banner is the first line of every
@@ -672,7 +687,7 @@ class TestTypeSpecificRendering:
         # fingerprint on the error, not the file), so it is not in the title.
         title = title_for(f)
         assert title == (
-            "[VALGRIND] Definitely lost: 49 bytes in debugCommand (debug.c:569)"
+            "[TEST-FAILURE] Definitely lost: 49 bytes in debugCommand (debug.c:569)"
         )
 
     def test_valgrind_leak_title_ignores_loss_record_and_pid_drift(self) -> None:
@@ -722,7 +737,7 @@ class TestTypeSpecificRendering:
             jobs=[JobReference(job="j", suite="s", url="u")],
         )
         title = title_for(f)
-        assert title.startswith("[TIMEOUT]")
+        assert title.startswith("[TEST-FAILURE]")
         assert "PSYNC2 test" in title
 
     def test_unittest_title(self) -> None:
@@ -734,7 +749,7 @@ class TestTypeSpecificRendering:
             jobs=[JobReference(job="j", suite="s", url="u")],
         )
         title = title_for(f)
-        assert title.startswith("[UNITTEST]")
+        assert title.startswith("[TEST-FAILURE]")
         assert "DictTest.BasicOps" in title
 
     def test_startup_title_without_test_name(self) -> None:
@@ -749,7 +764,7 @@ class TestTypeSpecificRendering:
                 jobs=[JobReference(job="j", suite="s", url="u")],
             )
         title = title_for(startup("tests/unit/cluster.tcl"))
-        assert title.startswith("[STARTUP-FAILURE]")
+        assert title.startswith("[TEST-FAILURE]")
         assert "cluster.tcl" not in title
         assert title == title_for(startup("tests/unit/expire.tcl"))
 
@@ -1292,7 +1307,7 @@ class TestExceptionTitle:
         title = title_for(self._failure(error))
         assert "Executing test client:" not in title
         assert "Intentional runtime exception for detector testing." in title
-        assert title.startswith("[EXCEPTION] ")
+        assert title.startswith("[TEST-FAILURE] ")
 
     def test_title_stable_across_volatile_ports_and_pids(self) -> None:
         """The fingerprint scrubs ports/PIDs, so one recurring exception keeps
@@ -1341,7 +1356,7 @@ class TestMacosLeaksTitle:
     def test_title_uses_leaks_totals_line(self) -> None:
         f = self._failure(_macos_leaks_error(9443, 1, 48, "0x953074d20"))
         title = title_for(f)
-        assert title == "[MEMORY-LEAK] 1 leak for 48 total leaked bytes"
+        assert title == "[TEST-FAILURE] 1 leak for 48 total leaked bytes"
 
     def test_title_omits_the_test_file(self) -> None:
         """A leak in shared code is reported after whichever test file exposed
@@ -1396,3 +1411,364 @@ class TestMacosLeaksTitle:
             _macos_leaks_error(9443, 1, 48, "<malloc in clusterInit 0x9dd024100>")
         )
         assert fingerprint_for(f1) != fingerprint_for(f2)
+
+
+# --- Cross-tool merging of valgrind and sanitizer reports ---
+
+
+def _vg(body: str) -> str:
+    """A valgrind report: runner wrapper, Memcheck banner, then *body*."""
+    return (
+        " Valgrind error: ==6554== Memcheck, a memory error detector\n"
+        "==6554== Copyright (C) 2002-2022, by Julian Seward et al.\n"
+        f"{body}"
+    )
+
+
+_VG_USE_AFTER_FREE = _vg(
+    "==6554== Invalid read of size 4\n"
+    "==6554==    at 0x1E8076: lookupKey (db.c:120)\n"
+    "==6554==    by 0x1E9000: getCommand (t_string.c:75)\n"
+    "==6554==  Address 0x5a1b2c0 is 8 bytes inside a block of size 32 free'd\n"
+    "==6554==    at 0x484BB2F: free (vg_replace_malloc.c:872)\n"
+)
+
+_ASAN_USE_AFTER_FREE = (
+    " Sanitizer error: ==1234==ERROR: AddressSanitizer: heap-use-after-free on "
+    "address 0x60300000eff8 at pc 0x55b bp 0x7ff sp 0x7ff\n"
+    "READ of size 4 at 0x60300000eff8 thread T0\n"
+    "    #0 0x55ba1234 in lookupKey /home/runner/work/valkey/valkey/src/db.c:120:9\n"
+    "    #1 0x55ba5678 in getCommand /home/runner/work/valkey/valkey/src/t_string.c:75:5\n"
+)
+
+# A buffer overflow at the same site as the use-after-free above. Valgrind words
+# the offending access identically ("Invalid read of size 4") for both and only
+# the address description tells them apart.
+_VG_BUFFER_OVERFLOW = _vg(
+    "==6554== Invalid read of size 4\n"
+    "==6554==    at 0x1E8076: lookupKey (db.c:120)\n"
+    "==6554==    by 0x1E9000: getCommand (t_string.c:75)\n"
+    "==6554==  Address 0x5a1b2c0 is 4 bytes after a block of size 32 alloc'd\n"
+    "==6554==    at 0x4846828: malloc (vg_replace_malloc.c:381)\n"
+)
+
+_VG_LEAK_SAME_SITE = _vg(
+    "==6554== 49 bytes in 1 blocks are definitely lost in loss record 900 of 1,109\n"
+    "==6554==    at 0x4846828: malloc (vg_replace_malloc.c:381)\n"
+    "==6554==    by 0x1E8076: lookupKey (db.c:120)\n"
+)
+
+_UBSAN_RUNTIME_ERROR = (
+    " Sanitizer error: src/bitops.c:88:12: runtime error: signed integer overflow\n"
+    "    #0 0x55ba9999 in bitcountCommand "
+    "/home/runner/work/valkey/valkey/src/bitops.c:88:12\n"
+)
+
+
+def _memory_failure(
+    failure_type: FailureType,
+    error: str,
+    job: str,
+    test_file: str = "tests/unit/other.tcl",
+) -> UniqueFailure:
+    return UniqueFailure(
+        test_name="", test_file=test_file, failure_type=failure_type, error=error,
+        jobs=[JobReference(job=job, suite="valkey", url=f"https://x/{job}")],
+    )
+
+
+class TestCrossToolErrorClass:
+    """The coarse class each tool's vocabulary maps onto."""
+
+    def test_valgrind_and_sanitizer_agree_on_use_after_free(self) -> None:
+        assert (
+            error_class(_VG_USE_AFTER_FREE, FailureType.VALGRIND)
+            == error_class(_ASAN_USE_AFTER_FREE, FailureType.SANITIZER)
+            == "use-after-free"
+        )
+
+    def test_valgrind_access_class_comes_from_address_description(self) -> None:
+        """Valgrind words the access line identically for a use-after-free and
+        an overflow, so the class must come from the address description that
+        follows it, not the access line."""
+        assert error_class(_VG_USE_AFTER_FREE, FailureType.VALGRIND) == "use-after-free"
+        assert error_class(_VG_BUFFER_OVERFLOW, FailureType.VALGRIND) == "buffer-overflow"
+
+    def test_leaks_classify_as_leak_in_both_tools(self) -> None:
+        asan_leak = (
+            " Sanitizer error: ==1==ERROR: LeakSanitizer: detected memory leaks\n"
+            "Direct leak of 41 byte(s) in 1 object(s) allocated from:\n"
+            "    #0 0x55b in malloc\n"
+            "    #1 0x55c in lookupKey /src/db.c:120:9\n"
+        )
+        assert error_class(_VG_LEAK_SAME_SITE, FailureType.VALGRIND) == "leak"
+        assert error_class(asan_leak, FailureType.SANITIZER) == "leak"
+
+    def test_ubsan_runtime_error(self) -> None:
+        assert error_class(_UBSAN_RUNTIME_ERROR, FailureType.SANITIZER) == "runtime-error"
+
+    def test_unrecognized_vocabulary_is_unclassified(self) -> None:
+        """None, not a catch-all: an unclassifiable report must stay on its
+        per-tool identity rather than merge on a guess."""
+        assert error_class(_vg("==6554== something we do not know\n"),
+                           FailureType.VALGRIND) is None
+
+    def test_only_valgrind_and_sanitizer_are_classified(self) -> None:
+        for failure_type in FailureType:
+            if failure_type in (FailureType.VALGRIND, FailureType.SANITIZER):
+                continue
+            assert error_class(_ASAN_USE_AFTER_FREE, failure_type) is None
+
+    def test_banner_does_not_shadow_the_real_class(self) -> None:
+        """The Memcheck banner leads every valgrind report and contains
+        "error"; the class must come from the diagnostic below it."""
+        assert error_class(_VG_LEAK_SAME_SITE, FailureType.VALGRIND) == "leak"
+
+
+class TestCrossToolMerge:
+    """One bug both tools caught resolves to one issue."""
+
+    def test_same_bug_shares_namespace_and_fingerprint(self) -> None:
+        vg = _memory_failure(FailureType.VALGRIND, _VG_USE_AFTER_FREE, "test-valgrind")
+        asan = _memory_failure(
+            FailureType.SANITIZER, _ASAN_USE_AFTER_FREE, "test-sanitizer-address",
+        )
+        assert marker_namespace_for(vg) == marker_namespace_for(asan)
+        assert marker_namespace_for(vg) == MEMORY_ERROR_NAMESPACE
+        assert fingerprint_for(vg) == fingerprint_for(asan)
+
+    def test_merge_keeps_both_traces_and_both_jobs(self) -> None:
+        vg = _memory_failure(FailureType.VALGRIND, _VG_USE_AFTER_FREE, "test-valgrind")
+        asan = _memory_failure(
+            FailureType.SANITIZER, _ASAN_USE_AFTER_FREE, "test-sanitizer-address",
+        )
+        merged = _merge_same_fingerprint_failures([vg, asan])
+        assert len(merged) == 1
+        survivor = merged[0]
+        assert [label for label, _ in survivor.extra_traces] == ["Sanitizer"]
+        assert survivor.extra_traces[0][1] == _ASAN_USE_AFTER_FREE
+        assert {j.job for j in survivor.jobs} == {"test-valgrind", "test-sanitizer-address"}
+
+    def test_merge_is_independent_of_processing_order(self) -> None:
+        def merge(order: list[UniqueFailure]) -> UniqueFailure:
+            return _merge_same_fingerprint_failures(order)[0]
+
+        def pair() -> tuple[UniqueFailure, UniqueFailure]:
+            return (
+                _memory_failure(FailureType.VALGRIND, _VG_USE_AFTER_FREE, "test-valgrind"),
+                _memory_failure(
+                    FailureType.SANITIZER, _ASAN_USE_AFTER_FREE, "test-sanitizer-address",
+                ),
+            )
+
+        vg, asan = pair()
+        forward = merge([vg, asan])
+        vg2, asan2 = pair()
+        reverse = merge([asan2, vg2])
+        assert len(forward.extra_traces) == len(reverse.extra_traces) == 1
+        assert {j.job for j in forward.jobs} == {j.job for j in reverse.jobs}
+
+    def test_same_tool_twice_does_not_duplicate_the_trace(self) -> None:
+        """Two failures of one type that hash together are the same tool on the
+        same bug; a second near-identical trace adds nothing."""
+        a = _memory_failure(FailureType.VALGRIND, _VG_USE_AFTER_FREE, "test-valgrind")
+        b = _memory_failure(
+            FailureType.VALGRIND, _VG_USE_AFTER_FREE, "test-valgrind-no-malloc-usable-size",
+        )
+        merged = _merge_same_fingerprint_failures([a, b])
+        assert len(merged) == 1
+        assert merged[0].extra_traces == []
+        assert len(merged[0].jobs) == 2
+
+
+class TestCrossToolSeparation:
+    """Everything not confidently the same bug must stay a separate issue.
+
+    These are the correctness cases for the cross-tool identity: a missed merge
+    only costs a duplicate issue, while a wrong merge hides one bug inside
+    another's issue.
+    """
+
+    def test_same_site_different_class_stays_separate(self) -> None:
+        """A leak and a use-after-free reported at one allocation site are two
+        bugs, so the anchor alone cannot be the identity."""
+        leak = _memory_failure(FailureType.VALGRIND, _VG_LEAK_SAME_SITE, "test-valgrind")
+        uaf = _memory_failure(
+            FailureType.SANITIZER, _ASAN_USE_AFTER_FREE, "test-sanitizer-address",
+        )
+        assert fingerprint_for(leak) != fingerprint_for(uaf)
+
+    def test_use_after_free_and_overflow_stay_separate(self) -> None:
+        uaf = _memory_failure(FailureType.VALGRIND, _VG_USE_AFTER_FREE, "test-valgrind")
+        overflow = _memory_failure(
+            FailureType.VALGRIND, _VG_BUFFER_OVERFLOW, "test-valgrind",
+        )
+        assert fingerprint_for(uaf) != fingerprint_for(overflow)
+
+    def test_same_class_different_site_stays_separate(self) -> None:
+        other_site = _ASAN_USE_AFTER_FREE.replace("db.c:120", "cluster.c:900")
+        a = _memory_failure(
+            FailureType.SANITIZER, _ASAN_USE_AFTER_FREE, "test-sanitizer-address",
+        )
+        b = _memory_failure(FailureType.SANITIZER, other_site, "test-sanitizer-address")
+        assert fingerprint_for(a) != fingerprint_for(b)
+
+    def test_unclassifiable_report_keeps_its_per_tool_namespace(self) -> None:
+        f = _memory_failure(
+            FailureType.VALGRIND,
+            _vg("==6554== unrecognized diagnostic\n"
+                "==6554==    at 0x1E8076: lookupKey (db.c:120)\n"),
+            "test-valgrind",
+        )
+        assert marker_namespace_for(f) == "valkey-ci-agent:valgrind-error"
+
+    def test_report_without_stack_frames_keeps_its_per_tool_namespace(self) -> None:
+        """No frames means no anchor, so there is nothing to match on."""
+        f = _memory_failure(
+            FailureType.VALGRIND, " Valgrind error: Invalid read of size 4\n", "test-valgrind",
+        )
+        assert marker_namespace_for(f) == "valkey-ci-agent:valgrind-error"
+
+    def test_ubsan_runtime_error_does_not_merge_with_a_memory_error(self) -> None:
+        ub = _memory_failure(
+            FailureType.SANITIZER, _UBSAN_RUNTIME_ERROR, "test-sanitizer-undefined",
+        )
+        uaf = _memory_failure(FailureType.VALGRIND, _VG_USE_AFTER_FREE, "test-valgrind")
+        assert fingerprint_for(ub) != fingerprint_for(uaf)
+
+    def test_macos_memory_leak_is_excluded_from_the_merge(self) -> None:
+        """/usr/bin/leaks runs where no other leak detector does and emits no
+        stack frames, so it keeps its own namespace and identity."""
+        f = _memory_failure(
+            FailureType.MEMORY_LEAK,
+            "Check for memory leaks (pid 9443) in tests/unit/other.tcl\n"
+            "Process 9443: 1 leak for 48 total leaked bytes\n",
+            "test-macos-latest",
+        )
+        assert marker_namespace_for(f) == "valkey-ci-agent:memory-leak"
+
+    def test_other_types_keep_their_namespaces(self) -> None:
+        expected = {
+            FailureType.ASSERTION: "valkey-ci-agent:test-failure",
+            FailureType.TIMEOUT: "valkey-ci-agent:test-timeout",
+            FailureType.STARTUP: "valkey-ci-agent:startup-failure",
+            FailureType.EXCEPTION: "valkey-ci-agent:test-exception",
+            FailureType.MEMORY_LEAK: "valkey-ci-agent:memory-leak",
+            FailureType.UNITTEST: "valkey-ci-agent:unittest-failure",
+        }
+        for failure_type, namespace in expected.items():
+            f = _memory_failure(failure_type, _ASAN_USE_AFTER_FREE, "job")
+            assert marker_namespace_for(f) == namespace
+
+
+class TestMultiTraceBody:
+    def _body(self, failure: UniqueFailure) -> str:
+        return _build_body(failure, marker="<!-- m -->", occurrences=1)
+
+    def test_single_trace_is_not_collapsed(self) -> None:
+        body = self._body(
+            _memory_failure(FailureType.VALGRIND, _VG_USE_AFTER_FREE, "test-valgrind")
+        )
+        assert "<details>" not in body
+        assert _extract_error_from_body(body) == _VG_USE_AFTER_FREE.strip()
+
+    def test_two_traces_are_each_collapsed_and_labeled(self) -> None:
+        vg = _memory_failure(FailureType.VALGRIND, _VG_USE_AFTER_FREE, "test-valgrind")
+        asan = _memory_failure(
+            FailureType.SANITIZER, _ASAN_USE_AFTER_FREE, "test-sanitizer-address",
+        )
+        body = self._body(_merge_same_fingerprint_failures([vg, asan])[0])
+        assert body.count("<details>") == body.count("</details>") == 2
+        assert "<summary>Valgrind trace</summary>" in body
+        assert "<summary>Sanitizer trace</summary>" in body
+        assert "Invalid read of size 4" in body
+        assert "heap-use-after-free" in body
+
+    def test_both_tools_appear_in_the_environments_line(self) -> None:
+        vg = _memory_failure(FailureType.VALGRIND, _VG_USE_AFTER_FREE, "test-valgrind")
+        asan = _memory_failure(
+            FailureType.SANITIZER, _ASAN_USE_AFTER_FREE, "test-sanitizer-address",
+        )
+        body = self._body(_merge_same_fingerprint_failures([vg, asan])[0])
+        assert "`test-valgrind`" in body
+        assert "`test-sanitizer-address`" in body
+
+
+class TestRecurrenceCommentWithMultipleTraces:
+    """New traces go in comments; the body is never rewritten to add one.
+
+    An issue can record a trace per tool, so the recurrence check has to read
+    every stored trace. Reading only the first would drop a genuinely new trace
+    from the comment (it is the only place a new trace appears) and would also
+    call an unchanged trace new on every run, commenting forever.
+    """
+
+    def _two_trace_body(self) -> str:
+        vg = _memory_failure(FailureType.VALGRIND, _VG_USE_AFTER_FREE, "test-valgrind")
+        asan = _memory_failure(
+            FailureType.SANITIZER, _ASAN_USE_AFTER_FREE, "test-sanitizer-address",
+        )
+        merged = _merge_same_fingerprint_failures([vg, asan])[0]
+        return _build_body(merged, marker="<!-- m -->", occurrences=1)
+
+    def _comment(self, body: str, failure: UniqueFailure, occurrences: int = 3) -> str:
+        renderer = renderer_for(failure)
+        # The publisher runs body_transform before render on the update path.
+        renderer.merge_environments(body)
+        return renderer.render("<!-- m -->", occurrences).comment
+
+    def test_extracts_every_trace_from_a_multi_tool_body(self) -> None:
+        traces = _extract_errors_from_body(self._two_trace_body())
+        assert len(traces) == 2
+        assert any("Invalid read of size 4" in t for t in traces)
+        assert any("heap-use-after-free" in t for t in traces)
+
+    def test_extracts_the_single_trace_of_a_one_tool_body(self) -> None:
+        body = _build_body(
+            _memory_failure(FailureType.VALGRIND, _VG_USE_AFTER_FREE, "test-valgrind"),
+            marker="<!-- m -->", occurrences=1,
+        )
+        assert _extract_errors_from_body(body) == [_VG_USE_AFTER_FREE.strip()]
+
+    def test_changed_trace_is_reported_in_the_comment(self) -> None:
+        moved = _ASAN_USE_AFTER_FREE.replace("db.c:120:9", "cluster.c:900:5").replace(
+            "lookupKey", "clusterProcessPacket",
+        )
+        comment = self._comment(
+            self._two_trace_body(),
+            _memory_failure(FailureType.SANITIZER, moved, "test-sanitizer-address"),
+        )
+        assert "New error stack trace" in comment
+        assert "clusterProcessPacket" in comment
+
+    def test_unchanged_trace_posts_no_new_error_section(self) -> None:
+        """Matching any stored trace means the run says nothing new. Both tools
+        are checked, so the second <details> block counts too."""
+        body = self._two_trace_body()
+        for failure_type, error, job in (
+            (FailureType.SANITIZER, _ASAN_USE_AFTER_FREE, "test-sanitizer-address"),
+            (FailureType.VALGRIND, _VG_USE_AFTER_FREE, "test-valgrind"),
+        ):
+            comment = self._comment(body, _memory_failure(failure_type, error, job))
+            assert "New error stack trace" not in comment
+
+    def test_body_is_not_rewritten_to_add_a_trace(self) -> None:
+        """A recurrence carrying a tool the body lacks leaves the body alone."""
+        body = _build_body(
+            _memory_failure(FailureType.VALGRIND, _VG_USE_AFTER_FREE, "test-valgrind"),
+            marker="<!-- m -->", occurrences=1,
+        )
+        renderer = renderer_for(_memory_failure(
+            FailureType.SANITIZER, _ASAN_USE_AFTER_FREE, "test-sanitizer-address",
+        ))
+        transformed = renderer.merge_environments(body)
+        assert "heap-use-after-free" not in transformed
+        # It surfaces in the comment instead.
+        assert "heap-use-after-free" in renderer.render("<!-- m -->", 2).comment
+
+    def test_traces_are_collapsed_by_default(self) -> None:
+        """<details> without an open attribute renders collapsed, so a reader
+        expands the tool they care about."""
+        body = self._two_trace_body()
+        assert "<details>" in body
+        assert "<details open" not in body

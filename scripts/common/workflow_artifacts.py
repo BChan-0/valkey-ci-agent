@@ -187,8 +187,8 @@ def _extract_zip(blob: bytes) -> dict[str, bytes]:
     try:
         with zipfile.ZipFile(io.BytesIO(blob)) as zf:
             members = [m for m in zf.infolist() if not m.is_dir()]
-            # file_size is the zip's own declaration, so it is checked again
-            # against the bytes actually decompressed below.
+            # zipfile bounds each read to the member's declared file_size, so
+            # capping the declared total also caps what can be decompressed.
             declared = sum(m.file_size for m in members)
             if declared > _MAX_UNCOMPRESSED_BYTES:
                 logger.warning(
@@ -212,13 +212,10 @@ def _read_members(
     discard the others (the failures JSON is usually the one that matters).
     """
     files: dict[str, bytes] = {}
-    budget = _MAX_UNCOMPRESSED_BYTES
     for member in members:
         try:
             with zf.open(member) as fh:
-                # Read one byte past the budget so an over-cap member is
-                # detected rather than silently truncated.
-                data = fh.read(budget + 1)
+                data = fh.read()
         except (zipfile.BadZipFile, NotImplementedError, RuntimeError,
                 EOFError, zlib.error, ValueError) as exc:
             logger.warning(
@@ -226,12 +223,5 @@ def _read_members(
                 member.filename, type(exc).__name__, exc,
             )
             continue
-        if len(data) > budget:
-            logger.warning(
-                "Artifact exceeds uncompressed cap %d while reading %r; "
-                "stopping extraction", _MAX_UNCOMPRESSED_BYTES, member.filename,
-            )
-            break
-        budget -= len(data)
         files[member.filename] = data
     return files

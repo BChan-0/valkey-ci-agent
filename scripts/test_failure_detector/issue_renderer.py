@@ -24,15 +24,23 @@ from scripts.common.issue_dedup import IssueContent
 from scripts.test_failure_detector.parse_failures import (
     FailureType,
     UniqueFailure,
+    error_class,
     is_plumbing_frame,
     normalize_error_identity,
     scrub_volatile_tokens,
+    stack_anchor,
     startup_reason_from_lines,
 )
 
 MARKER_NAMESPACE = "valkey-ci-agent:test-failure"
 
 LABEL_NAME = "test-failure"
+
+# Shared namespace for valgrind and sanitizer failures that carry a determinable
+# cross-tool identity, so one bug both tools caught resolves to one issue
+# instead of one per tool. Failures that do not qualify keep the per-tool
+# namespaces below.
+MEMORY_ERROR_NAMESPACE = "valkey-ci-agent:memory-error"
 
 # Type-specific marker namespaces for fingerprinting and issue search.
 _TYPE_NAMESPACE: dict[FailureType, str] = {
@@ -46,21 +54,49 @@ _TYPE_NAMESPACE: dict[FailureType, str] = {
     FailureType.UNITTEST: "valkey-ci-agent:unittest-failure",
 }
 
-# Title prefix per failure type.
-_TYPE_TITLE_PREFIX: dict[FailureType, str] = {
-    FailureType.ASSERTION: "[TEST-FAILURE]",
-    FailureType.SANITIZER: "[SANITIZER]",
-    FailureType.VALGRIND: "[VALGRIND]",
-    FailureType.TIMEOUT: "[TIMEOUT]",
-    FailureType.STARTUP: "[STARTUP-FAILURE]",
-    FailureType.EXCEPTION: "[EXCEPTION]",
-    FailureType.MEMORY_LEAK: "[MEMORY-LEAK]",
-    FailureType.UNITTEST: "[UNITTEST]",
-}
+# Every type shares one title prefix. The failure type is named in the body
+# instead, so an issue is not retitled when the same bug is later attributed to
+# a different type (a valgrind report and a sanitizer report of one bug).
+TITLE_PREFIX = "[TEST-FAILURE]"
+
+# Types eligible for the shared cross-tool identity. macOS /usr/bin/leaks
+# (MEMORY_LEAK) is excluded: it runs on jobs no other leak detector runs on and
+# emits no stack frames, so it has nothing to merge against.
+_CROSS_TOOL_TYPES = frozenset({FailureType.VALGRIND, FailureType.SANITIZER})
+
+
+def _cross_tool_identity(failure: UniqueFailure) -> tuple[str, str] | None:
+    """A valgrind/sanitizer failure's (class, anchor) identity, or None.
+
+    None means the failure cannot be matched across tools with confidence and
+    must keep its per-tool identity. That is the safe direction: both tools
+    describing one bug produce two issues, which is what happens today, whereas
+    a wrong merge hides one bug inside another's issue.
+
+    Both components are required. The class alone is far too coarse (every leak
+    in the codebase shares one), and the anchor alone would merge a leak and a
+    use-after-free that happen to share an allocation site.
+    """
+    if failure.failure_type not in _CROSS_TOOL_TYPES:
+        return None
+    cls = error_class(failure.error, failure.failure_type)
+    if cls is None:
+        return None
+    anchor = stack_anchor(failure.error)
+    if not anchor:
+        return None
+    return cls, anchor
 
 
 def marker_namespace_for(failure: UniqueFailure) -> str:
-    """Return the marker namespace for a failure's type."""
+    """Return the marker namespace for a failure's type.
+
+    Valgrind and sanitizer failures with a determinable cross-tool identity
+    share one namespace so they can dedup against each other; the rest keep
+    their per-tool namespace.
+    """
+    if _cross_tool_identity(failure) is not None:
+        return MEMORY_ERROR_NAMESPACE
     return _TYPE_NAMESPACE.get(failure.failure_type, MARKER_NAMESPACE)
 
 
@@ -96,13 +132,28 @@ def fingerprint_for(failure: UniqueFailure) -> str:
     issue. normalize_error_identity has already removed the volatile digits,
     so the ones that survive to here are identity.
 
+    For a valgrind/sanitizer failure with a cross-tool identity: hash of
+    (shared_namespace, error_class, stack_anchor), so one bug reported by both
+    tools resolves to one fingerprint despite their reports sharing no text.
+
     Known granularity limit: a macOS /usr/bin/leaks blob whose root-leak
     lines are unsymbolicated (bare addresses, no site names) normalizes to
     the boilerplate shared by every leak in that test file, so two such
     distinct leaks collapse into one issue. Symbolicated roots stay distinct
     via the root-site anchor in normalize_error_identity.
+
+    The cross-tool path has a matching limit in the other direction: two
+    same-class bugs whose first stack block is frame-for-frame identical hash
+    together. That needs the same error class at the same site through the same
+    call chain, which in practice means one bug. It is the accepted cost of
+    matching across two tools whose only common ground is the frame chain.
     """
     ns = marker_namespace_for(failure)
+
+    cross_tool = _cross_tool_identity(failure)
+    if cross_tool is not None:
+        cls, anchor = cross_tool
+        return compute_fingerprint(namespace=(ns, cls, anchor), shapes=())
 
     if failure.has_test_identity:
         return compute_fingerprint(
@@ -173,18 +224,26 @@ class _FailureRenderer:
 
     def _detect_new_error(self, existing_body: str) -> str | None:
         """Return the failure's error trace when it meaningfully differs from
-        what is stored on the issue, else None.
+        every trace stored on the issue, else None.
+
+        An issue can record a trace per tool (a valgrind and a sanitizer report
+        of one bug), and a recurrence brings only one tool's. Matching any
+        stored trace means this run says nothing new; matching none means it
+        does, whether because the trace changed or because this tool's trace is
+        not on the issue yet. The body is never rewritten to add it, so the
+        comment is the only place it appears.
         """
-        # The stored trace was truncated when published, so the fresh trace
+        # The stored traces were truncated when published, so the fresh trace
         # must be compared in its truncated form too, or every recurrence of
         # an oversized trace would register as a new error.
         new_error = _truncate_trace(self._failure.error)
         if not new_error.strip():
             return None
-        stored = _extract_error_from_body(existing_body)
-        if not stored.strip():
+        stored = [t for t in _extract_errors_from_body(existing_body) if t.strip()]
+        if not stored:
             return None
-        if _normalize_trace(stored) == _normalize_trace(new_error):
+        normalized_new = _normalize_trace(new_error)
+        if any(_normalize_trace(t) == normalized_new for t in stored):
             return None
         return new_error
 
@@ -425,13 +484,12 @@ _TITLE_SHOWS_FILE = frozenset({FailureType.TIMEOUT})
 
 
 def _build_title(failure: UniqueFailure) -> str:
-    prefix = _TYPE_TITLE_PREFIX.get(failure.failure_type, "[TEST-FAILURE]")
     if failure.has_test_identity:
-        return f"{prefix} {failure.test_name} in {failure.test_file}"
+        return f"{TITLE_PREFIX} {failure.test_name} in {failure.test_file}"
     summary = _error_summary_line(failure.error)
     if failure.test_file and failure.failure_type in _TITLE_SHOWS_FILE:
-        return f"{prefix} {summary} in {failure.test_file}"
-    return f"{prefix} {summary}"
+        return f"{TITLE_PREFIX} {summary} in {failure.test_file}"
+    return f"{TITLE_PREFIX} {summary}"
 
 
 def _build_body(failure: UniqueFailure, marker: str, *, occurrences: int) -> str:
@@ -482,15 +540,11 @@ def _build_body(failure: UniqueFailure, marker: str, *, occurrences: int) -> str
             ci_links,
         ])
 
-    error_text = _truncate_trace(failure.error) or "N/A"
-    fence = _fence_for(error_text)
     lines.extend([
         "",
         "**Error stack trace**",
         "",
-        fence,
-        error_text,
-        fence,
+        *_render_traces(failure),
         "",
         f"**Environments:** {env_list}",
         "",
@@ -498,6 +552,43 @@ def _build_body(failure: UniqueFailure, marker: str, *, occurrences: int) -> str
         "*Auto-created by Test Failure Detector*",
     ])
     return "\n".join(lines)
+
+
+def trace_label_for(failure: UniqueFailure) -> str:
+    """Human label naming which tool produced a failure's own trace."""
+    return failure.failure_type.value.replace("-", " ").title()
+
+
+def _fenced(text: str) -> list[str]:
+    fence = _fence_for(text)
+    return [fence, text, fence]
+
+
+def _render_traces(failure: UniqueFailure) -> list[str]:
+    """Render a failure's trace, or every tool's trace when more than one.
+
+    A single trace is rendered as a plain fenced block. When two tools reported
+    the same bug their traces are each collapsed behind a summary naming the
+    tool: together they are long enough to bury the rest of the issue, and a
+    reader usually wants only the one from the tool they are debugging.
+    """
+    own_label = trace_label_for(failure)
+    own_trace = _truncate_trace(failure.error) or "N/A"
+    if not failure.extra_traces:
+        return _fenced(own_trace)
+
+    blocks: list[str] = []
+    for label, trace in [(own_label, own_trace), *failure.extra_traces]:
+        blocks.extend([
+            "<details>",
+            f"<summary>{label} trace</summary>",
+            "",
+            *_fenced(_truncate_trace(trace) or "N/A"),
+            "",
+            "</details>",
+            "",
+        ])
+    return blocks[:-1]
 
 
 def _fence_for(text: str) -> str:
@@ -570,13 +661,34 @@ _ERROR_BLOCK_RE = re.compile(
     re.DOTALL,
 )
 
+# A body holding more than one tool's trace wraps each in a labeled <details>
+# block (see _render_traces), which the single-block pattern above cannot read:
+# it would match across the first block's markup and compare garbage.
+_TRACE_DETAILS_RE = re.compile(
+    r"<summary>(?P<label>[^<]*?)\s*trace</summary>\s*(?P<fence>`{3,})\n(?P<trace>.*?)\n\2",
+    re.DOTALL,
+)
 
-def _extract_error_from_body(body: str) -> str:
-    """Extract the error trace recorded under the Error stack trace header."""
+
+def _extract_errors_from_body(body: str) -> list[str]:
+    """Every error trace recorded in an issue body.
+
+    Returns the traces from a multi-tool body's <details> blocks, or the single
+    trace of a one-tool body. Empty when the body records none.
+    """
+    details = [m.group("trace").strip() for m in _TRACE_DETAILS_RE.finditer(body)]
+    if details:
+        return details
     match = _ERROR_BLOCK_RE.search(body)
     if not match:
-        return ""
-    return match.group(2).strip()
+        return []
+    return [match.group(2).strip()]
+
+
+def _extract_error_from_body(body: str) -> str:
+    """The first error trace recorded in an issue body, or ""."""
+    traces = _extract_errors_from_body(body)
+    return traces[0] if traces else ""
 
 
 # Must scrub at least everything the fingerprint scrubs: two traces the

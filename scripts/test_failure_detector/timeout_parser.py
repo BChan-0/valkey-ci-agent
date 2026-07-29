@@ -23,6 +23,7 @@ import logging
 import re
 from typing import Any
 
+from scripts.test_failure_detector.download import normalize_job_name
 from scripts.test_failure_detector.parse_failures import (
     _VOLATILE_TEST_NAME_RE,
     FailureType,
@@ -55,10 +56,17 @@ def jobs_needing_log_scan(
 
     The run-logs archive is downloaded once per run, so scanning extra jobs
     costs only regex passes, not API calls.
+
+    ``failed_job_names`` holds API job names, while ``all_failures`` is keyed by
+    the artifact's spelling. For a matrix job those differ (``base (value)`` vs
+    ``base-value``), so a sharded job's captured timeout would otherwise go
+    unseen and the job would be scanned and reported under both spellings.
     """
     needs_scan: set[str] = set()
     for job_name in failed_job_names:
         suites = all_failures.get(job_name)
+        if suites is None:
+            suites = all_failures.get(normalize_job_name(job_name))
         if not isinstance(suites, dict):
             # Job absent from the artifact (upload skipped) or malformed.
             needs_scan.add(job_name)

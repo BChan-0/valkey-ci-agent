@@ -59,6 +59,29 @@ class TestJobsNeedingLogScan:
         failed: set[str] = set()
         assert jobs_needing_log_scan(all_failures, failed) == set()
 
+    def test_matrix_job_captured_timeout_matched_across_name_spellings(self) -> None:
+        """The API names a matrix job "base (value)" but its artifact is keyed
+        "base-value". Without normalizing, a sharded job's captured timeout is
+        missed and the job gets rescanned and reported under both spellings."""
+        all_failures = {
+            "test-valgrind-test-unit": {
+                "valkey": [{"test_name": "t", "test_file": "f.tcl",
+                            "type": "timeout", "error": "Test timed out"}],
+            },
+        }
+        failed = {"test-valgrind-test (unit)"}
+        assert jobs_needing_log_scan(all_failures, failed) == set()
+
+    def test_matrix_job_without_captured_timeout_still_scanned(self) -> None:
+        """Normalizing must not suppress a scan the job genuinely needs."""
+        all_failures = {
+            "test-valgrind-test-unit": {
+                "valkey": [{"test_name": "t", "test_file": "f.tcl", "error": "e"}],
+            },
+        }
+        failed = {"test-valgrind-test (unit)"}
+        assert jobs_needing_log_scan(all_failures, failed) == {"test-valgrind-test (unit)"}
+
     def test_multiple_failed_jobs_mixed(self) -> None:
         all_failures = {
             "job-a": {"valkey": [{"test_name": "t", "test_file": "f.tcl",
