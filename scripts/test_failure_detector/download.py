@@ -261,5 +261,10 @@ def get_job_urls(
 
     Also includes normalized variants (parentheses replaced with dashes,
     spaces replaced with dashes) for fuzzy matching.
+
+    Timeout recovery also needs to know which jobs failed, so the detector
+    calls :func:`get_job_info` and reads both fields off one response rather
+    than paying for a second job listing. This narrower view is kept for
+    callers that only want the URLs.
     """
     return get_job_info(gh, repo_full_name, run_id).urls
