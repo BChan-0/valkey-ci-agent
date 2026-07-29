@@ -24,6 +24,7 @@ from scripts.common.issue_dedup import IssueContent
 from scripts.test_failure_detector.parse_failures import (
     FailureType,
     UniqueFailure,
+    is_plumbing_frame,
     normalize_error_identity,
     startup_reason_from_lines,
 )
@@ -270,27 +271,14 @@ _LEAKS_TOTAL_RE = re.compile(
     r"(?P<phrase>\d[\d,]*\s+leaks?\s+for\s+\d[\d,]*\s+total\s+leaked\s+bytes)"
 )
 
-# Allocation plumbing every valkey heap operation passes through. Frames in
-# these files say nothing about which code path leaked; the distinctive
-# frame is their first caller outside this set.
-_ALLOC_WRAPPER_FILES = frozenset({"zmalloc.c", "sds.c"})
-
-# Sanitizer runtime interceptor frames carry a source file:line into the
-# sanitizer's own sources ("malloc ../../../../src/libsanitizer/asan/
-# asan_malloc_linux.cpp:69"), so unlike valgrind's preload frames they pass
-# the source-frame regex. They are shared plumbing like the wrappers above.
-_SANITIZER_RUNTIME_PATH_RE = re.compile(
-    r"libsanitizer|sanitizer_common|/(?:asan|lsan|ubsan|tsan|msan)[_/]"
-)
-
-
 def _leak_site(error: str) -> str:
     """Distinctive "func (file:line)" in the report's first stack, or "".
 
-    Skips allocator-wrapper and sanitizer-runtime frames so the site names
-    the code path that leaked (debugCommand (debug.c:569)), not the shared
-    plumbing (ztrymalloc_usable, the ASan malloc interceptor). Falls back to
-    the first source frame when the whole stack is plumbing.
+    Skips shared allocation and sanitizer-runtime plumbing via the same
+    predicate the identity uses, so the site names the code path that leaked
+    (debugCommand (debug.c:569)) rather than the allocator every leak passes
+    through. Falls back to the first source frame when the whole stack is
+    plumbing, so a title is never left empty.
     """
     first_source_site = ""
     for line in error.split("\n"):
@@ -300,12 +288,11 @@ def _leak_site(error: str) -> str:
             continue
         source_path = match.group("file")
         source_file = source_path.rsplit("/", 1)[-1]
-        site = f"{match.group('func')} ({source_file}:{match.group('line')})"
+        func = match.group("func")
+        site = f"{func} ({source_file}:{match.group('line')})"
         if not first_source_site:
             first_source_site = site
-        if source_file in _ALLOC_WRAPPER_FILES:
-            continue
-        if _SANITIZER_RUNTIME_PATH_RE.search(source_path):
+        if is_plumbing_frame(func, source_path):
             continue
         return site
     return first_source_site

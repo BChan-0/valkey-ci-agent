@@ -720,6 +720,35 @@ class TestValgrindLeakIdentity:
         )
         assert normalize_error_identity(_MEMCHECK_LEAK) != normalize_error_identity(other)
 
+    def test_identity_survives_loss_record_crossing_four_digits(self) -> None:
+        # A four-digit loss record is scrubbed by the bare-number pattern as
+        # well as the loss-record phrase. If the bare-number pattern runs
+        # first it strips the digits and strands "in loss record  of", which
+        # then reaches the identity and mints a second issue for one leak.
+        rerun = _MEMCHECK_LEAK.replace(
+            "loss record 900 of 1,109", "loss record 1001 of 1,110",
+        )
+        assert normalize_error_identity(_MEMCHECK_LEAK) == normalize_error_identity(rerun)
+        assert "loss record" not in normalize_error_identity(rerun)
+
+    def test_identity_stable_across_full_heap_coordinate_drift(self) -> None:
+        # Every count in the report may drift between runs of one leak: the
+        # size, the loss record, the total record count, and the in-use
+        # totals. None of them may reach the identity.
+        identities = set()
+        for size, record, total in (
+            ("49 bytes", "900 of 1,109", "1,080,661 bytes in 13,544 blocks"),
+            ("52 bytes", "1001 of 1,110", "1,093,102 bytes in 13,671 blocks"),
+            ("1,024 bytes", "12 of 998", "972,701 bytes in 13,549 blocks"),
+        ):
+            report = (
+                _MEMCHECK_LEAK.replace("49 bytes", size)
+                .replace("900 of 1,109", record)
+                .replace("1,080,661 bytes in 13,544 blocks", total)
+            )
+            identities.add(normalize_error_identity(report))
+        assert len(identities) == 1
+
 
 def _asan_leak(frames: str) -> str:
     return (

@@ -817,6 +817,51 @@ class TestValgrindBannerTitle:
         # title is kind + size without a site.
         assert "Definitely lost: 49 bytes" in title
 
+    def test_title_names_leaking_code_path_not_the_allocator(self) -> None:
+        """Valgrind resolves its malloc interceptor to a source file inside the
+        preload library, so a file-only plumbing check lets it through and every
+        leak title reads "in malloc". The title must name the first frame that
+        identifies the leaking code path, matching the identity's anchor.
+        """
+        error = (
+            " Valgrind error: ==6554== Memcheck, a memory error detector\n"
+            "==6554== 41 bytes in 1 blocks are definitely lost in loss record 900 of 1,109\n"
+            "==6554==    at 0x4846828: malloc (vg_replace_malloc.c:307)\n"
+            "==6554==    by 0x3189FB: ztrymalloc_usable_internal (zmalloc.c:172)\n"
+            "==6554==    by 0x29072A: sdsdup (sds.c:190)\n"
+            "==6554==    by 0x1E8076: debugCommand (debug.c:569)\n"
+        )
+        f = UniqueFailure(
+            test_name="", test_file="tests/unit/dummy-memory.tcl",
+            failure_type=FailureType.VALGRIND, error=error,
+            jobs=[JobReference(job="j", suite="s", url="u")],
+        )
+        title = title_for(f)
+        assert "debugCommand (debug.c:569)" in title
+        assert "malloc" not in title
+        assert "zmalloc.c" not in title
+
+    def test_two_leaks_sharing_an_allocator_get_distinct_titles(self) -> None:
+        """Two leaks whose stacks differ only past the shared allocator frames
+        must not collapse to one title, or an issue list cannot tell them apart.
+        """
+        def leak(site_func: str, site_loc: str) -> UniqueFailure:
+            error = (
+                "==6554== 41 bytes in 1 blocks are definitely lost in loss record 9 of 99\n"
+                "==6554==    at 0x4846828: malloc (vg_replace_malloc.c:307)\n"
+                "==6554==    by 0x3189FB: ztrymalloc_usable_internal (zmalloc.c:172)\n"
+                f"==6554==    by 0x1E8076: {site_func} ({site_loc})\n"
+            )
+            return UniqueFailure(
+                test_name="", test_file="tests/unit/dummy-memory.tcl",
+                failure_type=FailureType.VALGRIND, error=error,
+                jobs=[JobReference(job="j", suite="s", url="u")],
+            )
+        first = leak("debugCommand", "debug.c:569")
+        second = leak("clusterCommand", "cluster.c:123")
+        assert title_for(first) != title_for(second)
+        assert fingerprint_for(first) != fingerprint_for(second)
+
     def test_sanitizer_banner_stripped(self) -> None:
         error = (
             " Sanitizer error: \n"

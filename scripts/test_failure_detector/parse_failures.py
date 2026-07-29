@@ -164,8 +164,9 @@ _STACK_FRAME_RE = re.compile(
 # the bug: clang inlines sdsnewlen/sdsdup into their caller while gcc emits them
 # as separate frames, so a stack anchor that keeps them makes one leak look like
 # two distinct bugs across compilers. Dropping them leaves the frames that
-# actually identify the leaking code path. Mirrors the title-side skip in
-# issue_renderer._leak_site.
+# actually identify the leaking code path. issue_renderer imports
+# is_plumbing_frame for its titles, so a title names the same frame the
+# identity keys on.
 _PLUMBING_FRAME_FILES = frozenset({"zmalloc.c", "sds.c"})
 _SANITIZER_RUNTIME_PATH_RE = re.compile(
     r"libsanitizer|sanitizer_common|/(?:asan|lsan|ubsan|tsan|msan)[_/]"
@@ -181,11 +182,13 @@ _ALLOCATOR_FRAME_FUNCS = frozenset(
 )
 
 
-def _is_plumbing_frame(func: str, source_path: str) -> bool:
+def is_plumbing_frame(func: str, source_path: str) -> bool:
     """Whether a stack frame is shared allocation/interceptor plumbing.
 
     These frames are present or absent depending on the toolchain's inlining
-    rather than on the bug, so they must not reach the identity.
+    rather than on the bug, so they must not reach the identity, and the title
+    must not name them either. ``source_path`` may be "" for a frame whose
+    location is a binary offset rather than a source file.
     """
     if func in _ALLOCATOR_FRAME_FUNCS:
         return True
@@ -235,7 +238,7 @@ def _extract_stack_anchor(lines: list[str]) -> str:
             in_stack = True
             func = match.group("func") or match.group("san_func")
             source_path = match.group("file") or match.group("san_file") or ""
-            if not _is_plumbing_frame(func, source_path):
+            if not is_plumbing_frame(func, source_path):
                 frames.append(func)
                 if len(frames) >= 8:
                     break
@@ -271,9 +274,14 @@ def normalize_error_identity(error: str) -> str:
     """
     text = _STARTUP_CONFIG_SECTION_RE.sub("\nERROR:\n", error)
     text = _STARTUP_EXE_PATH_RE.sub(r"\1\2", text)
-    for pattern in _VOLATILE_PATTERNS:
-        text = pattern.sub("", text)
+    # Count patterns first: they match whole phrases around their digits ("in
+    # loss record 1001 of 1,110"), so a bare-number pattern that ran earlier
+    # would eat the digits and leave the phrase behind. The phrase would then
+    # reach the identity and drift whenever the leak moved between loss
+    # records, minting a fresh issue for one recurring leak.
     for pattern in _VOLATILE_COUNT_PATTERNS:
+        text = pattern.sub("", text)
+    for pattern in _VOLATILE_PATTERNS:
         text = pattern.sub("", text)
 
     lines = [line.strip() for line in text.split("\n") if line.strip()]
