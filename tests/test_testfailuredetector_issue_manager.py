@@ -791,8 +791,10 @@ class TestTypeSpecificRendering:
         content = renderer_for(f).render("<!-- m -->", 1)
         assert content.labels == ("test-failure",)
 
-    def test_nameless_body_has_error_details_section(self) -> None:
-        """Nameless failures get 'Error details' instead of 'Failing test(s)'."""
+    def test_nameless_body_uses_the_same_sections_as_a_named_one(self) -> None:
+        """Every type shares one body shape, so an issue reads the same
+        whichever type it came from. A nameless failure has no test name to
+        list, but the sections around it are identical."""
         f = UniqueFailure(
             test_name="", test_file="tests/unit/expire.tcl",
             failure_type=FailureType.SANITIZER,
@@ -800,9 +802,12 @@ class TestTypeSpecificRendering:
             jobs=[JobReference(job="j", suite="s", url="u")],
         )
         body = _build_body(f, marker="<!-- m -->", occurrences=1)
-        assert "**Error details**" in body
-        assert "Sanitizer" in body
-        assert "expire.tcl" in body
+        assert "**Failing test(s)**" in body
+        assert "**Error details**" not in body
+        assert "is failing in CI." in body
+        assert "- Failure type: `Sanitizer`" in body
+        assert "- Test file context: `tests/unit/expire.tcl`" in body
+        assert "- Test name:" not in body
 
     def test_named_body_has_failure_type_field(self) -> None:
         """Named failures include a Failure type line in the body."""
@@ -1870,12 +1875,14 @@ class TestMergedBodyNamesBothTools:
             or "- Failure type: `Sanitizer + Valgrind`" in body
         )
 
-    def test_single_tool_body_is_unchanged(self) -> None:
+    def test_single_tool_is_not_named_in_the_summary(self) -> None:
+        """One tool needs no "Reported by": the Failure type row already
+        says which it was."""
         body = _build_body(
             _memory_failure(FailureType.VALGRIND, _VG_USE_AFTER_FREE, "test-valgrind"),
             marker="<!-- m -->", occurrences=1,
         )
-        assert "A **Valgrind** error was detected in CI." in body
+        assert "Reported by" not in body
         assert "- Failure type: `Valgrind`" in body
 
     def test_named_failure_body_is_unchanged(self) -> None:
@@ -1889,3 +1896,54 @@ class TestMergedBodyNamesBothTools:
         assert "- Failure type: `Unittest`" in _build_body(
             f, marker="<!-- m -->", occurrences=1,
         )
+
+
+class TestBodyShapeMatchesLegacyAcrossTypes:
+    """Every failure type renders the same body shape.
+
+    The detector's issues sit alongside ones filed by hand from the repository's
+    test-failure template, so they follow its wording: a "<what> in <where> is
+    failing in CI" summary over a Failing test(s) list, then the trace.
+    """
+
+    def _body(self, failure: UniqueFailure) -> str:
+        return _build_body(failure, marker="<!-- m -->", occurrences=1)
+
+    def test_named_failure_reads_like_the_template(self) -> None:
+        body = self._body(_make_failure())
+        assert (
+            "`PSYNC2 test` in `tests/integration/replication-psync.tcl` "
+            "is failing in CI." in body
+        )
+
+    def test_every_type_shares_the_summary_shape(self) -> None:
+        for failure_type in FailureType:
+            f = _memory_failure(
+                failure_type, _VG_USE_AFTER_FREE, "job", test_file="tests/unit/other.tcl",
+            )
+            body = self._body(f)
+            assert "**Summary**" in body
+            assert "**Failing test(s)**" in body
+            assert "is failing in CI." in body
+            assert "**Error details**" not in body
+
+    def test_merged_failure_names_both_tools_after_the_sentence(self) -> None:
+        vg = _memory_failure(FailureType.VALGRIND, _VG_USE_AFTER_FREE, "test-valgrind")
+        asan = _memory_failure(
+            FailureType.SANITIZER, _ASAN_USE_AFTER_FREE, "test-sanitizer-address",
+        )
+        body = self._body(_merge_same_fingerprint_failures([vg, asan])[0])
+        assert "is failing in CI. Reported by " in body
+        assert "**Valgrind**" in body
+        assert "**Sanitizer**" in body
+
+    def test_ci_links_are_indented_under_their_bullet(self) -> None:
+        """The links are children of the "CI link(s):" bullet, so they must be
+        indented; at the same level Markdown renders them as siblings."""
+        body = self._body(_make_failure(jobs=[
+            ("job-a", "suite", "https://example.com/a"),
+            ("job-b", "suite", "https://example.com/b"),
+        ]))
+        assert "- CI link(s):\n    - `job-a`: [CI link](https://example.com/a)" in body
+        assert "    - `job-b`: [CI link](https://example.com/b)" in body
+        assert "\n- `job-a`" not in body

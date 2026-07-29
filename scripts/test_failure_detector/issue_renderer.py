@@ -510,20 +510,41 @@ def _type_label_for(failure: UniqueFailure) -> str:
     return " + ".join(_tool_labels_for(failure))
 
 
-def _error_sentence_for(failure: UniqueFailure) -> str:
-    """The summary sentence for a failure with no test identity."""
+def _summary_sentence_for(failure: UniqueFailure) -> str:
+    """The one-line summary opening the issue body.
+
+    Every type gets the same shape as a named test failure, "<what> in <where>
+    is failing in CI", so an issue reads the same whichever type it came from.
+    A nameless failure has no test name to be the subject, so its error summary
+    (the same one the title carries) stands in.
+
+    When two tools reported one bug they are named after the sentence, since
+    that is not evident from the trace section alone. A single tool is not
+    named: the Failure type row below already says it.
+    """
+    if failure.has_test_identity:
+        return f"`{failure.test_name}` in `{failure.test_file}` is failing in CI."
+
+    summary = _error_summary_line(failure.error)
+    if failure.test_file:
+        sentence = f"`{summary}` in `{failure.test_file}` is failing in CI."
+    else:
+        sentence = f"`{summary}` is failing in CI."
+
     labels = _tool_labels_for(failure)
     if len(labels) == 1:
-        return f"A **{labels[0]}** error was detected in CI."
+        return sentence
     tools = " and ".join(f"**{label}**" for label in labels)
-    return f"The same error was detected in CI by {tools}."
+    return f"{sentence} Reported by {tools}."
 
 
 def _build_body(failure: UniqueFailure, marker: str, *, occurrences: int) -> str:
     """Build the issue body for a test failure."""
     ns = marker_namespace_for(failure)
+    # Indented one level so the links read as children of the "CI link(s):"
+    # bullet they follow rather than as siblings of it.
     ci_links = "\n".join(
-        f"- `{j.job}`: [CI link]({j.url})" for j in failure.jobs
+        f"    - `{j.job}`: [CI link]({j.url})" for j in failure.jobs
     )
     env_list = ", ".join(f"`{j.job}`" for j in failure.jobs)
     type_label = _type_label_for(failure)
@@ -534,38 +555,25 @@ def _build_body(failure: UniqueFailure, marker: str, *, occurrences: int) -> str
         "",
         "**Summary**",
         "",
+        _summary_sentence_for(failure),
+        "",
+        "**Failing test(s)**",
+        "",
     ]
 
+    # A nameless failure has no test name, and its file is the context the error
+    # surfaced under rather than a failing test, so those rows are omitted
+    # instead of carrying an empty or misleading value.
     if failure.has_test_identity:
-        lines.append(
-            f"`{failure.test_name}` in `{failure.test_file}` is failing in CI."
-        )
-        lines.extend([
-            "",
-            "**Failing test(s)**",
-            "",
-            f"- Test name: `{failure.test_name}`",
-            f"- Test file: `{failure.test_file}`",
-            f"- Failure type: `{type_label}`",
-            "- CI link(s):",
-            ci_links,
-        ])
-    else:
-        lines.append(f"{_error_sentence_for(failure)}")
-        if failure.test_file:
-            lines.append(f"Context: running `{failure.test_file}`")
-        lines.extend([
-            "",
-            "**Error details**",
-            "",
-            f"- Failure type: `{type_label}`",
-        ])
-        if failure.test_file:
-            lines.append(f"- Test file context: `{failure.test_file}`")
-        lines.extend([
-            "- CI link(s):",
-            ci_links,
-        ])
+        lines.append(f"- Test name: `{failure.test_name}`")
+        lines.append(f"- Test file: `{failure.test_file}`")
+    elif failure.test_file:
+        lines.append(f"- Test file context: `{failure.test_file}`")
+    lines.extend([
+        f"- Failure type: `{type_label}`",
+        "- CI link(s):",
+        ci_links,
+    ])
 
     lines.extend([
         "",
