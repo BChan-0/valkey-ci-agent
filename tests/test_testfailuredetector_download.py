@@ -21,12 +21,19 @@ except ImportError as _exc:
 pytestmark = pytest.mark.skipif(_SKIP_REASON is not None, reason=_SKIP_REASON or "")
 
 
-def _make_mock_run(run_number: int, run_id: int, conclusion: str, status: str = "completed"):
+def _make_mock_run(
+    run_number: int,
+    run_id: int,
+    conclusion: str,
+    status: str = "completed",
+    event: str = "schedule",
+):
     run = MagicMock()
     run.run_number = run_number
     run.id = run_id
     run.conclusion = conclusion
     run.status = status
+    run.event = event
     run.created_at = "2026-06-01 00:00:00+00:00"
     return run
 
@@ -188,17 +195,46 @@ class TestGetLatestDailyRun:
 
     @patch("scripts.test_failure_detector.download.retry_github_call")
     def test_accepts_scheduled_and_dispatched_runs(self, mock_retry) -> None:
-        """Run selection must not filter by event.
+        """A manually dispatched Daily run is as valid as a scheduled one.
 
-        Manually dispatched Daily runs (workflow_dispatch) are as valid as
-        scheduled ones; PR runs are excluded by their conclusion/branch, not
-        by an event filter.
+        Both test the branch itself, so a maintainer re-running Daily by hand
+        gets its failures reported. The API filters a single event at a time,
+        so the listing stays unfiltered and the event check is local.
         """
-        scheduled_run = _make_mock_run(12, 199, "failure")
+        for event in ("schedule", "workflow_dispatch"):
+            run = _make_mock_run(12, 199, "failure", event=event)
+
+            mock_workflow = MagicMock()
+            mock_workflow.name = "Daily"
+            mock_workflow.get_runs.return_value = [run]
+
+            mock_repo = MagicMock()
+            mock_repo.get_workflows.return_value = [mock_workflow]
+
+            mock_retry.side_effect = lambda op, **kwargs: op()
+
+            mock_gh = MagicMock()
+            mock_gh.get_repo.return_value = mock_repo
+
+            assert get_latest_daily_run(mock_gh, "owner/repo") == run
+            mock_workflow.get_runs.assert_called_once_with(
+                branch="unstable", status="completed",
+            )
+
+    @patch("scripts.test_failure_detector.download.retry_github_call")
+    def test_skips_pull_request_runs(self, mock_retry) -> None:
+        """A pull_request run tests the PR's merge commit, not the branch, so
+        its failures belong to the PR. A PR opened from a branch in the same
+        repo needs no approval and reaches a real conclusion, so the
+        conclusion check alone would let it through and the detector would
+        file PR failures against the branch.
+        """
+        pr_run = _make_mock_run(14, 299, "failure", event="pull_request")
+        nightly_run = _make_mock_run(13, 298, "failure", event="schedule")
 
         mock_workflow = MagicMock()
         mock_workflow.name = "Daily"
-        mock_workflow.get_runs.return_value = [scheduled_run]
+        mock_workflow.get_runs.return_value = [pr_run, nightly_run]
 
         mock_repo = MagicMock()
         mock_repo.get_workflows.return_value = [mock_workflow]
@@ -208,11 +244,7 @@ class TestGetLatestDailyRun:
         mock_gh = MagicMock()
         mock_gh.get_repo.return_value = mock_repo
 
-        result = get_latest_daily_run(mock_gh, "owner/repo")
-        assert result == scheduled_run
-        mock_workflow.get_runs.assert_called_once_with(
-            branch="unstable", status="completed",
-        )
+        assert get_latest_daily_run(mock_gh, "owner/repo") == nightly_run
 
     @patch("scripts.test_failure_detector.download.retry_github_call")
     def test_skips_action_required_runs(self, mock_retry) -> None:

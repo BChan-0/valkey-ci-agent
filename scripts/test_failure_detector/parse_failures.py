@@ -73,10 +73,16 @@ _BOILERPLATE_SUBSTRINGS = (
 
 # Heap-layout coordinates and allocation sizes: the same leak moves between
 # loss records and can vary in size run to run, so these must not feed the
-# fingerprint identity.
+# fingerprint identity. The unit list spans all three leak detectors, since
+# each words its counts differently: valgrind "41 bytes in 1 blocks",
+# LeakSanitizer "41 byte(s) in 1 object(s)" and "1 allocation(s)", and
+# /usr/bin/leaks "1 leak for 48 total leaked bytes".
 _VOLATILE_COUNT_PATTERNS = (
     re.compile(r"\bin loss record \d[\d,]* of \d[\d,]*"),
-    re.compile(r"\b\d[\d,]*\s+(?:bytes?|blocks?)\b"),
+    re.compile(
+        r"\b\d[\d,]*\s+"
+        r"(?:bytes?|blocks?|byte\(s\)|object\(s\)|allocation\(s\)|leaks?)\b"
+    ),
     # Any remaining thousands-separated number is a count/size.
     re.compile(r"\b\d{1,3}(?:,\d{3})+\b"),
 )
@@ -262,6 +268,26 @@ _VOLATILE_TEST_NAME_RE = re.compile(
 )
 
 
+def scrub_volatile_tokens(text: str) -> str:
+    """Remove the run-specific tokens that must not reach a failure's identity.
+
+    Phrase patterns run before bare-number ones: a phrase match spans the
+    digits inside it ("in loss record 1001 of 1,110"), so scrubbing bare
+    numbers first would strip the digits and strand the phrase, which would
+    then drift between runs of one bug.
+
+    Exposed so the recurrence comparison in :mod:`issue_renderer` scrubs at
+    least what the identity scrubs. Two traces the fingerprint calls the same
+    bug must compare equal there, or every recurrence posts a redundant
+    "new error stack trace".
+    """
+    for pattern in _VOLATILE_COUNT_PATTERNS:
+        text = pattern.sub("", text)
+    for pattern in _VOLATILE_PATTERNS:
+        text = pattern.sub("", text)
+    return text
+
+
 def normalize_error_identity(error: str) -> str:
     """Extract a stable identity from an error message for fingerprinting.
 
@@ -274,15 +300,7 @@ def normalize_error_identity(error: str) -> str:
     """
     text = _STARTUP_CONFIG_SECTION_RE.sub("\nERROR:\n", error)
     text = _STARTUP_EXE_PATH_RE.sub(r"\1\2", text)
-    # Count patterns first: they match whole phrases around their digits ("in
-    # loss record 1001 of 1,110"), so a bare-number pattern that ran earlier
-    # would eat the digits and leave the phrase behind. The phrase would then
-    # reach the identity and drift whenever the leak moved between loss
-    # records, minting a fresh issue for one recurring leak.
-    for pattern in _VOLATILE_COUNT_PATTERNS:
-        text = pattern.sub("", text)
-    for pattern in _VOLATILE_PATTERNS:
-        text = pattern.sub("", text)
+    text = scrub_volatile_tokens(text)
 
     lines = [line.strip() for line in text.split("\n") if line.strip()]
 

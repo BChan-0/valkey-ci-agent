@@ -26,6 +26,7 @@ from scripts.test_failure_detector.parse_failures import (
     UniqueFailure,
     is_plumbing_frame,
     normalize_error_identity,
+    scrub_volatile_tokens,
     startup_reason_from_lines,
 )
 
@@ -571,19 +572,21 @@ def _extract_error_from_body(body: str) -> str:
 
 # Must scrub at least everything the fingerprint scrubs: two traces the
 # fingerprint calls the same bug must compare equal here, or every recurrence
-# posts a spurious "new error stack trace" comment. Valgrind ==PID== markers,
-# loss-record coordinates, and byte/block counts drift on every run of the
-# same leak.
+# posts a spurious "new error stack trace" comment. The shared scrub covers
+# the identity's tokens (PID markers, addresses, loss records, byte/block
+# counts); these add the timestamps a trace can carry that an identity's few
+# significant lines never reach.
 _TRACE_NOISE_RES = (
     re.compile(r"\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?"),
     re.compile(r"\b\d{2}:\d{2}:\d{2}(?:\.\d+)?\b"),
-    re.compile(r"==\d+==\s*"),
-    re.compile(r"0x[0-9a-fA-F]+"),
-    re.compile(r"/tmp/[^\s:]+"),
-    re.compile(r"\b(pid|port)[=\s]+\d+", re.IGNORECASE),
-    re.compile(r"\bin loss record \d[\d,]* of \d[\d,]*"),
-    re.compile(r"\b\d[\d,]*\s+(?:bytes?|blocks?|byte\(s\)|object\(s\)|allocation\(s\)|leaks?)\b"),
-    re.compile(r"\b\d{4,}\b"),
+    # A sanitizer frame's build hash ("(BuildId: 2bf960fb...)"). It changes
+    # whenever the binary is recompiled, so it differs between two runs of one
+    # bug. Only the trace carries it; a frame reaches the identity as a
+    # function name, without this suffix.
+    re.compile(r"\s*\(BuildId:\s*[0-9a-fA-F]+\)"),
+    # The macOS leaks report's process footprint ("Physical footprint: 2801K").
+    # It measures the live server when the report was taken, not the leak.
+    re.compile(r"(Physical footprint(?:\s*\(peak\))?:\s*)\d+K"),
 )
 
 
@@ -591,7 +594,7 @@ def _normalize_trace(text: str) -> str:
     """Normalize a trace for comparison by scrubbing run-specific noise."""
     for noise in _TRACE_NOISE_RES:
         text = noise.sub("", text)
-    return " ".join(text.split())
+    return " ".join(scrub_volatile_tokens(text).split())
 
 
 def _update_environments_in_body(body: str, all_envs: list[str]) -> str:

@@ -24,6 +24,11 @@ _FAILURES_ARTIFACT_NAME = "all-test-failures"
 # more useful than paging through the whole history.
 _MAX_RUNS_SCANNED = 50
 
+# Events whose runs test the branch itself. "schedule" is the nightly Daily
+# run the sweep exists to analyze; "workflow_dispatch" is the same run
+# triggered by hand, which a maintainer uses to re-check a branch.
+_ANALYZABLE_EVENTS = frozenset({"schedule", "workflow_dispatch"})
+
 def get_latest_daily_run(
     gh: Github,
     repo_full_name: str,
@@ -53,9 +58,8 @@ def get_latest_daily_run(
         logger.warning("Workflow %r not found in %s", workflow_name, repo_full_name)
         return None
 
-    # Accept scheduled and manually dispatched runs. Pull-request runs are
-    # excluded by their conclusion (action_required/skipped) in the loop below,
-    # so we don't need to filter by event at the API level.
+    # The API filters one event at a time, and the sweep wants two (the nightly
+    # cron plus a manual re-run of it), so events are filtered locally.
     #
     # get_runs() is lazy, so the islice must run inside the retried call for the
     # retries to cover the actual request.
@@ -69,6 +73,17 @@ def get_latest_daily_run(
     )
 
     for run in runs:
+        # The Daily workflow also runs on pull_request. Such a run tests the
+        # PR's merge commit, not the branch, so its failures belong to the PR
+        # and filing them as branch failures would blame the wrong code. Most
+        # sit at action_required and would be dropped below anyway, but a PR
+        # from a branch in the same repo runs without approval and reaches a
+        # real conclusion, so the event must be checked explicitly.
+        if run.event not in _ANALYZABLE_EVENTS:
+            logger.debug(
+                "Skipping run #%d (event=%s)", run.run_number, run.event,
+            )
+            continue
         # Skip runs that never actually executed: cancelled/skipped, runs
         # awaiting approval (action_required, e.g. fork PRs), expired (stale),
         # runs that died before any job started (startup_failure, e.g. invalid

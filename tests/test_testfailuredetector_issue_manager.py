@@ -1127,6 +1127,49 @@ class TestValgrindRecurrenceStaysQuiet:
         )
         assert "New error stack trace" in self._recur(self._RUN1, other)
 
+    def test_heap_usage_totals_stay_quiet(self) -> None:
+        """Valgrind's heap totals count every allocation the server made, so
+        they drift on every run of one leak. The comparison must scrub them or
+        each recurrence reposts the whole trace.
+        """
+        with_totals = self._RUN1 + (
+            "==12345==   total heap usage: 18,053 allocs, 4,513 frees, "
+            "1,383,828 bytes allocated\n"
+        )
+        rerun = with_totals.replace("18,053 allocs, 4,513 frees", "18,066 allocs, 4,517 frees")
+        assert "New error stack trace" not in self._recur(with_totals, rerun)
+
+    def test_sanitizer_build_id_stays_quiet(self) -> None:
+        """A sanitizer frame's BuildId changes whenever the binary is rebuilt,
+        which is every CI run, so it is not evidence of a different bug.
+        """
+        def report(build_id: str) -> str:
+            return (
+                "==1==ERROR: LeakSanitizer: detected memory leaks\n"
+                "Direct leak of 41 byte(s) in 1 object(s) allocated from:\n"
+                f"    #0 0x55 in malloc (/src/valkey-server+0x20de33) (BuildId: {build_id})\n"
+                "    #4 0x55 in debugCommand /src/debug.c:569:9\n"
+            )
+        assert "New error stack trace" not in self._recur(
+            report("eaa319adda1cfec4d818"), report("2bf960fbb10e52be190f"),
+        )
+
+    def test_macos_leaks_footprint_stays_quiet(self) -> None:
+        """The leaks report's footprint measures the live server rather than
+        the leak, so it varies run to run for one leak.
+        """
+        def report(footprint: str) -> str:
+            return (
+                "Check for memory leaks in tests/unit/dummy-memory.tcl\n"
+                f"Physical footprint:         {footprint}\n"
+                f"Physical footprint (peak):  {footprint}\n"
+                "Process 9761: 1 leak for 48 total leaked bytes.\n"
+                "    1 (48 bytes) ROOT LEAK: <malloc in sdsnewlen>\n"
+            )
+        assert "New error stack trace" not in self._recur(
+            report("2865K"), report("2801K"),
+        )
+
 
 class TestTraceTruncation:
     """GitHub rejects bodies over 65536 chars; oversized traces are capped
