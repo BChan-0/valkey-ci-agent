@@ -493,6 +493,32 @@ def _build_title(failure: UniqueFailure) -> str:
     return f"{TITLE_PREFIX} {summary}"
 
 
+def _tool_labels_for(failure: UniqueFailure) -> list[str]:
+    """Every tool that reported this bug, in the order their traces appear."""
+    labels = [trace_label_for(failure)]
+    labels.extend(label for label, _ in failure.extra_traces if label not in labels)
+    return labels
+
+
+def _type_label_for(failure: UniqueFailure) -> str:
+    """The failure type, naming every tool when more than one reported the bug.
+
+    A merged failure carries one type of its own but a trace per tool, so
+    reporting only its own type would credit the bug to whichever tool happened
+    to be processed first.
+    """
+    return " + ".join(_tool_labels_for(failure))
+
+
+def _error_sentence_for(failure: UniqueFailure) -> str:
+    """The summary sentence for a failure with no test identity."""
+    labels = _tool_labels_for(failure)
+    if len(labels) == 1:
+        return f"A **{labels[0]}** error was detected in CI."
+    tools = " and ".join(f"**{label}**" for label in labels)
+    return f"The same error was detected in CI by {tools}."
+
+
 def _build_body(failure: UniqueFailure, marker: str, *, occurrences: int) -> str:
     """Build the issue body for a test failure."""
     ns = marker_namespace_for(failure)
@@ -500,7 +526,7 @@ def _build_body(failure: UniqueFailure, marker: str, *, occurrences: int) -> str
         f"- `{j.job}`: [CI link]({j.url})" for j in failure.jobs
     )
     env_list = ", ".join(f"`{j.job}`" for j in failure.jobs)
-    type_label = failure.failure_type.value.replace("-", " ").title()
+    type_label = _type_label_for(failure)
 
     lines = [
         marker,
@@ -525,7 +551,7 @@ def _build_body(failure: UniqueFailure, marker: str, *, occurrences: int) -> str
             ci_links,
         ])
     else:
-        lines.append(f"A **{type_label}** error was detected in CI.")
+        lines.append(f"{_error_sentence_for(failure)}")
         if failure.test_file:
             lines.append(f"Context: running `{failure.test_file}`")
         lines.extend([

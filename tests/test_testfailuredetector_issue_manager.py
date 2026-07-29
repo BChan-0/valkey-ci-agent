@@ -1838,3 +1838,54 @@ class TestCrossToolAnchorDepth:
         )
         assert cross_tool_anchor(f.error)
         assert marker_namespace_for(f) == MEMORY_ERROR_NAMESPACE
+
+
+class TestMergedBodyNamesBothTools:
+    """A merged issue must credit every tool that reported the bug.
+
+    The surviving failure carries one type of its own, so reporting that alone
+    would name whichever tool happened to be processed first and read as though
+    the other never fired.
+    """
+
+    def _merged_body(self) -> str:
+        vg = _memory_failure(FailureType.VALGRIND, _VG_USE_AFTER_FREE, "test-valgrind")
+        asan = _memory_failure(
+            FailureType.SANITIZER, _ASAN_USE_AFTER_FREE, "test-sanitizer-address",
+        )
+        merged = _merge_same_fingerprint_failures([vg, asan])[0]
+        return _build_body(merged, marker="<!-- m -->", occurrences=1)
+
+    def test_summary_names_both_tools(self) -> None:
+        body = self._merged_body()
+        assert "**Valgrind**" in body
+        assert "**Sanitizer**" in body
+        assert "A **Sanitizer** error was detected in CI." not in body
+
+    def test_failure_type_field_names_both_tools(self) -> None:
+        """Order follows which tool was processed first, so either is valid."""
+        body = self._merged_body()
+        assert (
+            "- Failure type: `Valgrind + Sanitizer`" in body
+            or "- Failure type: `Sanitizer + Valgrind`" in body
+        )
+
+    def test_single_tool_body_is_unchanged(self) -> None:
+        body = _build_body(
+            _memory_failure(FailureType.VALGRIND, _VG_USE_AFTER_FREE, "test-valgrind"),
+            marker="<!-- m -->", occurrences=1,
+        )
+        assert "A **Valgrind** error was detected in CI." in body
+        assert "- Failure type: `Valgrind`" in body
+
+    def test_named_failure_body_is_unchanged(self) -> None:
+        """Failures with a test name use the test-identity branch, which names
+        one type because they never merge across tools."""
+        f = UniqueFailure(
+            test_name="DictTest.BasicOps", test_file="src/unit/valkey-unit-gtests",
+            failure_type=FailureType.UNITTEST, error="gtest FAIL",
+            jobs=[JobReference(job="j", suite="s", url="u")],
+        )
+        assert "- Failure type: `Unittest`" in _build_body(
+            f, marker="<!-- m -->", occurrences=1,
+        )
