@@ -337,6 +337,33 @@ def stack_anchor(error: str) -> str:
     return _extract_stack_anchor(lines)
 
 
+# Frames nearest the bug used to match one bug across tools. Valgrind and the
+# sanitizers unwind to different depths on the same stack: on one observed leak
+# valgrind stopped at readQueryFromClient while the sanitizer continued two
+# frames further into the event loop, and the jobs also build at different
+# optimization levels, so the outer frames disagree on how far they reach.
+# Comparing whole chains therefore never matched a real pair. The frames closest
+# to the bug are the ones both tools agree on and the ones that identify it;
+# outer frames are the generic command/event-loop path shared by most of the
+# codebase, so they add little and cost every match.
+_CROSS_TOOL_ANCHOR_FRAMES = 3
+
+
+def cross_tool_anchor(error: str) -> str:
+    """The leading :data:`_CROSS_TOOL_ANCHOR_FRAMES` frames of *error*'s stack.
+
+    Returns "" when the error has no stack frames. Shorter chains are returned
+    whole rather than rejected: a stack that ends before the cap is the entire
+    call path the tool reported, so it is the strongest identity available.
+    """
+    anchor = stack_anchor(error)
+    if not anchor:
+        return ""
+    prefix, _, chain = anchor.partition(": ")
+    frames = chain.split(" > ")[:_CROSS_TOOL_ANCHOR_FRAMES]
+    return f"{prefix}: " + " > ".join(frames)
+
+
 def _extract_root_leak_anchor(lines: list[str]) -> str:
     """Allocation-site chain of a macOS leaks report, or "".
 
@@ -551,6 +578,7 @@ def _coerce_str(value: Any) -> str:
 def parse_and_deduplicate(
     all_failures: dict[str, Any],
     job_urls: dict[str, str],
+    step_urls: dict[str, dict[str, str]] | None = None,
 ) -> list[UniqueFailure]:
     """Parse the all-test-failures JSON and deduplicate.
 
@@ -558,6 +586,9 @@ def parse_and_deduplicate(
         all_failures: The parsed all-test-failures.json content.
             Structure: {job_name: {suite_name: [{test_name, test_file, type?, error}]}}
         job_urls: Mapping of job name -> HTML URL for CI links.
+        step_urls: Optional job name -> suite -> step-anchored URL. When a
+            suite has an entry, its failures link to that step instead of the
+            plain job URL, which lands on the job's first failed step.
 
     Returns:
         List of UniqueFailure objects, deduplicated across jobs.
@@ -657,11 +688,14 @@ def parse_and_deduplicate(
 
                 failure = grouped[key]
                 if not any(j.job == job_name for j in failure.jobs):
+                    step_url = ""
+                    if step_urls is not None:
+                        step_url = step_urls.get(job_name, {}).get(suite_name, "")
                     failure.jobs.append(
                         JobReference(
                             job=job_name,
                             suite=suite_name,
-                            url=job_urls.get(job_name, ""),
+                            url=step_url or job_urls.get(job_name, ""),
                         )
                     )
                     logger.debug("%s in %s/%s", failure.display_name, job_name, suite_name)

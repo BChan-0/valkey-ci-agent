@@ -35,6 +35,7 @@ try:
         FailureType,
         JobReference,
         UniqueFailure,
+        cross_tool_anchor,
         error_class,
         normalize_error_identity,
     )
@@ -1772,3 +1773,68 @@ class TestRecurrenceCommentWithMultipleTraces:
         body = self._two_trace_body()
         assert "<details>" in body
         assert "<details open" not in body
+
+
+class TestCrossToolAnchorDepth:
+    """The two tools do not unwind one stack to the same depth.
+
+    Observed on a real Daily run: for one leak in debugCommand, valgrind
+    stopped at readQueryFromClient while the sanitizer continued two frames
+    further into the event loop. Requiring whole-chain equality never matched a
+    real pair, so the identity keys on the frames nearest the bug.
+    """
+
+    def _leak(self, frames: str, failure_type: FailureType) -> UniqueFailure:
+        if failure_type == FailureType.VALGRIND:
+            error = _vg("==6554== 49 bytes in 1 blocks are definitely lost\n" + frames)
+        else:
+            error = (
+                " Sanitizer error: ==1==ERROR: LeakSanitizer: detected memory leaks\n"
+                "Direct leak of 41 byte(s) in 1 object(s) allocated from:\n" + frames
+            )
+        return _memory_failure(failure_type, error, "job")
+
+    def test_shared_leading_frames_merge_despite_extra_outer_frames(self) -> None:
+        vg = self._leak(
+            "==6554==    at 0x484: malloc (vg_replace_malloc.c:381)\n"
+            "==6554==    by 0x1E8: debugCommand (debug.c:569)\n"
+            "==6554==    by 0x1E9: call (server.c:3600)\n"
+            "==6554==    by 0x1EA: processCommand (server.c:4000)\n",
+            FailureType.VALGRIND,
+        )
+        asan = self._leak(
+            "    #0 0x55b in malloc\n"
+            "    #1 0x55c in debugCommand /src/debug.c:569:9\n"
+            "    #2 0x55d in call /src/server.c:3600:5\n"
+            "    #3 0x55e in processCommand /src/server.c:4000:5\n"
+            "    #4 0x55f in readQueryFromClient /src/networking.c:2500:5\n"
+            "    #5 0x560 in connSocketEventHandler /src/socket.c:280:5\n",
+            FailureType.SANITIZER,
+        )
+        assert fingerprint_for(vg) == fingerprint_for(asan)
+
+    def test_divergence_within_the_anchor_still_separates(self) -> None:
+        """Only the outer frames may differ. A different function near the bug
+        is a different bug."""
+        vg = self._leak(
+            "==6554==    by 0x1E8: debugCommand (debug.c:569)\n"
+            "==6554==    by 0x1E9: call (server.c:3600)\n"
+            "==6554==    by 0x1EA: processCommand (server.c:4000)\n",
+            FailureType.VALGRIND,
+        )
+        asan = self._leak(
+            "    #1 0x55c in clusterCommand /src/cluster.c:900:9\n"
+            "    #2 0x55d in call /src/server.c:3600:5\n"
+            "    #3 0x55e in processCommand /src/server.c:4000:5\n",
+            FailureType.SANITIZER,
+        )
+        assert fingerprint_for(vg) != fingerprint_for(asan)
+
+    def test_short_stack_is_used_whole(self) -> None:
+        """A stack shorter than the cap is the whole path the tool reported, so
+        it is kept rather than rejected for being short."""
+        f = self._leak(
+            "==6554==    by 0x1E8: debugCommand (debug.c:569)\n", FailureType.VALGRIND,
+        )
+        assert cross_tool_anchor(f.error)
+        assert marker_namespace_for(f) == MEMORY_ERROR_NAMESPACE

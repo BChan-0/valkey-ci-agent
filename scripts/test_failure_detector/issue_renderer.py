@@ -24,11 +24,11 @@ from scripts.common.issue_dedup import IssueContent
 from scripts.test_failure_detector.parse_failures import (
     FailureType,
     UniqueFailure,
+    cross_tool_anchor,
     error_class,
     is_plumbing_frame,
     normalize_error_identity,
     scrub_volatile_tokens,
-    stack_anchor,
     startup_reason_from_lines,
 )
 
@@ -82,7 +82,7 @@ def _cross_tool_identity(failure: UniqueFailure) -> tuple[str, str] | None:
     cls = error_class(failure.error, failure.failure_type)
     if cls is None:
         return None
-    anchor = stack_anchor(failure.error)
+    anchor = cross_tool_anchor(failure.error)
     if not anchor:
         return None
     return cls, anchor
@@ -142,11 +142,12 @@ def fingerprint_for(failure: UniqueFailure) -> str:
     distinct leaks collapse into one issue. Symbolicated roots stay distinct
     via the root-site anchor in normalize_error_identity.
 
-    The cross-tool path has a matching limit in the other direction: two
-    same-class bugs whose first stack block is frame-for-frame identical hash
-    together. That needs the same error class at the same site through the same
-    call chain, which in practice means one bug. It is the accepted cost of
-    matching across two tools whose only common ground is the frame chain.
+    The cross-tool path has a matching limit in the other direction: it keys on
+    the frames nearest the bug (see cross_tool_anchor), so two same-class bugs
+    reached through those same frames but diverging further out hash together.
+    The outer frames cannot be included, since the two tools do not unwind to
+    the same depth on one stack. It is the accepted cost of matching across two
+    tools whose only common ground is the frame chain.
     """
     ns = marker_namespace_for(failure)
 
