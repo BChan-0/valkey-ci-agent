@@ -516,26 +516,17 @@ def _summary_sentence_for(failure: UniqueFailure) -> str:
     Every type gets the same shape as a named test failure, "<what> in <where>
     is failing in CI", so an issue reads the same whichever type it came from.
     A nameless failure has no test name to be the subject, so its error summary
-    (the same one the title carries) stands in.
-
-    When two tools reported one bug they are named after the sentence, since
-    that is not evident from the trace section alone. A single tool is not
-    named: the Failure type row below already says it.
+    (the same one the title carries) stands in. Which tools reported it is left
+    to the Failure type row and the labeled trace blocks, keeping the sentence
+    to the template's wording.
     """
     if failure.has_test_identity:
         return f"`{failure.test_name}` in `{failure.test_file}` is failing in CI."
 
     summary = _error_summary_line(failure.error)
     if failure.test_file:
-        sentence = f"`{summary}` in `{failure.test_file}` is failing in CI."
-    else:
-        sentence = f"`{summary}` is failing in CI."
-
-    labels = _tool_labels_for(failure)
-    if len(labels) == 1:
-        return sentence
-    tools = " and ".join(f"**{label}**" for label in labels)
-    return f"{sentence} Reported by {tools}."
+        return f"`{summary}` in `{failure.test_file}` is failing in CI."
+    return f"`{summary}` is failing in CI."
 
 
 def _build_body(failure: UniqueFailure, marker: str, *, occurrences: int) -> str:

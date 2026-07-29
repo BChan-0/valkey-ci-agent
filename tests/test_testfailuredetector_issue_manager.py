@@ -1861,11 +1861,14 @@ class TestMergedBodyNamesBothTools:
         merged = _merge_same_fingerprint_failures([vg, asan])[0]
         return _build_body(merged, marker="<!-- m -->", occurrences=1)
 
-    def test_summary_names_both_tools(self) -> None:
+    def test_both_tools_are_named_somewhere_in_the_body(self) -> None:
+        """Not in the summary, which keeps the template's wording, but in the
+        Failure type row and the labeled trace blocks."""
         body = self._merged_body()
-        assert "**Valgrind**" in body
-        assert "**Sanitizer**" in body
-        assert "A **Sanitizer** error was detected in CI." not in body
+        assert "Valgrind" in body
+        assert "Sanitizer" in body
+        assert "<summary>Valgrind trace</summary>" in body
+        assert "<summary>Sanitizer trace</summary>" in body
 
     def test_failure_type_field_names_both_tools(self) -> None:
         """Order follows which tool was processed first, so either is valid."""
@@ -1875,14 +1878,11 @@ class TestMergedBodyNamesBothTools:
             or "- Failure type: `Sanitizer + Valgrind`" in body
         )
 
-    def test_single_tool_is_not_named_in_the_summary(self) -> None:
-        """One tool needs no "Reported by": the Failure type row already
-        says which it was."""
+    def test_single_tool_is_named_only_in_the_failure_type_row(self) -> None:
         body = _build_body(
             _memory_failure(FailureType.VALGRIND, _VG_USE_AFTER_FREE, "test-valgrind"),
             marker="<!-- m -->", occurrences=1,
         )
-        assert "Reported by" not in body
         assert "- Failure type: `Valgrind`" in body
 
     def test_named_failure_body_is_unchanged(self) -> None:
@@ -1927,15 +1927,18 @@ class TestBodyShapeMatchesLegacyAcrossTypes:
             assert "is failing in CI." in body
             assert "**Error details**" not in body
 
-    def test_merged_failure_names_both_tools_after_the_sentence(self) -> None:
+    def test_merged_failure_keeps_the_template_summary(self) -> None:
+        """A merged issue's summary reads like any other. The two tools are
+        named in the Failure type row and the trace labels, so nothing is added
+        to the sentence."""
         vg = _memory_failure(FailureType.VALGRIND, _VG_USE_AFTER_FREE, "test-valgrind")
         asan = _memory_failure(
             FailureType.SANITIZER, _ASAN_USE_AFTER_FREE, "test-sanitizer-address",
         )
         body = self._body(_merge_same_fingerprint_failures([vg, asan])[0])
-        assert "is failing in CI. Reported by " in body
-        assert "**Valgrind**" in body
-        assert "**Sanitizer**" in body
+        summary = body.split("**Failing test(s)**")[0]
+        assert "is failing in CI." in summary
+        assert "Reported by" not in body
 
     def test_ci_links_are_indented_under_their_bullet(self) -> None:
         """The links are children of the "CI link(s):" bullet, so they must be
