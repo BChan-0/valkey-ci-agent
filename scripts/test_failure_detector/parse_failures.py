@@ -245,14 +245,19 @@ def _extract_root_leak_anchor(lines: list[str]) -> str:
     return "roots: " + " > ".join(sorted(sites))
 
 
-def _frame_anchor(func: str, source_path: str, source_line: str) -> str:
+def _frame_anchor(func: str, source_path: str, source_line: str = "") -> str:
     """One frame's identity: "func (file.c:120)", or just "func".
 
     The file is reduced to its basename so the runner's workspace layout
     ("/home/runner/work/..." on Linux, "/Users/runner/..." on macOS, "/__w/..."
-    in a container) cannot split one bug into an issue per platform. The line
-    number is kept: two bugs can share a function, and then it is the only
-    thing telling them apart.
+    in a container) cannot split one bug into an issue per platform.
+
+    ``source_line`` is supplied only for the frame that names the bug (see
+    :func:`_extract_stack_anchor`). Two bugs can share a function, and then the
+    line is the only thing telling them apart, but every line below the bug
+    belongs to unrelated code that shifts whenever that code is edited, so
+    carrying the whole chain's lines would refile one bug on every commit that
+    touched anything above it in the call stack.
     """
     if not source_path:
         return func
@@ -271,6 +276,11 @@ def _extract_stack_anchor(lines: list[str]) -> str:
     identical after count scrubbing (e.g. same "definitely lost" shape but
     allocated from debugCommand vs clusterCommand). Returns "" when the
     error has no stack frames (assertions, startup failures).
+
+    Only the first frame carries its line number. That frame is the bug; the
+    ones below it are its callers, whose lines move whenever unrelated code in
+    them is edited. Keeping the whole chain's lines refiled one leak every time
+    any caller shifted, which is most commits.
     """
     frames: list[str] = []
     in_stack = False
@@ -282,7 +292,9 @@ def _extract_stack_anchor(lines: list[str]) -> str:
             source_path = match.group("file") or match.group("san_file") or ""
             source_line = match.group("line") or match.group("san_line") or ""
             if not is_plumbing_frame(func, source_path):
-                frames.append(_frame_anchor(func, source_path, source_line))
+                frames.append(_frame_anchor(
+                    func, source_path, source_line if not frames else "",
+                ))
                 if len(frames) >= 8:
                     break
         elif in_stack:

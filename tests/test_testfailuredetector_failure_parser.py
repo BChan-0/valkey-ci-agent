@@ -751,18 +751,39 @@ class TestValgrindLeakIdentity:
         assert len(identities) == 1
 
 
-def _asan_uaf(line: int, root: str = "/home/runner/work/valkey/valkey") -> str:
+def _asan_uaf(
+    line: int,
+    root: str = "/home/runner/work/valkey/valkey",
+    caller_line: int = 3942,
+) -> str:
     return (
         "==1==ERROR: AddressSanitizer: heap-use-after-free\n"
         f"    #1 0x55 in zslDeleteNode {root}/src/t_zset.c:{line}:9\n"
+        f"    #2 0x55 in call {root}/src/server.c:{caller_line}:5\n"
     )
 
 
 class TestSourceLocationInStackAnchor:
-    """The stack anchor carries each frame's source location, so two bugs in
-    one function stay distinct, while the runner's workspace layout stays out
-    of the identity so one bug does not become an issue per platform.
+    """The stack anchor carries the source location of the frame that names the
+    bug, so two bugs in one function stay distinct, while the caller lines and
+    the runner's workspace layout stay out of the identity so one bug does not
+    become a fresh issue per commit or per platform.
     """
+
+    def test_caller_line_drift_does_not_split_one_bug(self) -> None:
+        """Frames below the bug are its callers. Their lines move whenever
+        unrelated code in them is edited, which is most commits, so carrying
+        them would refile one leak against every such commit.
+        """
+        first = normalize_error_identity(_asan_uaf(1200, caller_line=3933))
+        second = normalize_error_identity(_asan_uaf(1200, caller_line=3942))
+        assert first == second
+
+    def test_bug_frame_keeps_its_line_and_callers_do_not(self) -> None:
+        identity = normalize_error_identity(_asan_uaf(1200, caller_line=3942))
+        assert "t_zset.c:1200" in identity
+        assert "server.c)" in identity
+        assert "3942" not in identity
 
     def test_same_function_different_line_stays_distinct(self) -> None:
         first = normalize_error_identity(_asan_uaf(1200))
