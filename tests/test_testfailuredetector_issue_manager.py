@@ -1196,10 +1196,30 @@ class TestMacosLeaksTitle:
     def test_title_uses_leaks_totals_line(self) -> None:
         f = self._failure(_macos_leaks_error(9443, 1, 48, "0x953074d20"))
         title = title_for(f)
-        assert title == (
-            "[MEMORY-LEAK] 1 leak for 48 total leaked bytes"
-            " in tests/unit/multi.tcl"
+        assert title == "[MEMORY-LEAK] 1 leak for 48 total leaked bytes"
+
+    def test_title_omits_the_test_file(self) -> None:
+        """A leak in shared code is reported after whichever test file exposed
+        it, and the fingerprint keys on the leak site rather than the file. If
+        the title carried the file, one issue's title would be rewritten each
+        time the same leak surfaced elsewhere."""
+        site = "<malloc in sdsnewlen 0x953074d20>"
+        under_multi = UniqueFailure(
+            test_name="", test_file="tests/unit/multi.tcl",
+            failure_type=FailureType.MEMORY_LEAK,
+            error=_macos_leaks_error(9443, 1, 48, site),
+            jobs=[JobReference(job="test-macos-latest", suite="valkey", url="u")],
         )
+        under_expire = UniqueFailure(
+            test_name="", test_file="tests/unit/expire.tcl",
+            failure_type=FailureType.MEMORY_LEAK,
+            error=_macos_leaks_error(7211, 1, 48, site),
+            jobs=[JobReference(job="test-macos-latest", suite="valkey", url="u")],
+        )
+        # One fingerprint, so one issue; therefore one stable title.
+        assert fingerprint_for(under_multi) == fingerprint_for(under_expire)
+        assert title_for(under_multi) == title_for(under_expire)
+        assert "multi.tcl" not in title_for(under_multi)
 
     def test_title_stable_across_pids_and_addresses(self) -> None:
         t1 = title_for(self._failure(_macos_leaks_error(9443, 1, 48, "0x953074d20")))

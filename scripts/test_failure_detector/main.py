@@ -15,6 +15,7 @@ from scripts.test_failure_detector.download import (
     download_all_test_failures,
     get_job_info,
     get_latest_daily_run,
+    get_run_conclusion,
 )
 from scripts.test_failure_detector.manage_issues import process_failures
 from scripts.test_failure_detector.parse_failures import (
@@ -135,6 +136,9 @@ def run(
         run_conclusion = daily_run.conclusion
     else:
         logger.info("Using specified run ID: %d", run_id)
+        # An explicitly named run needs its conclusion looked up, or the
+        # missing-artifact branch below cannot tell a red run from a clean one.
+        run_conclusion = get_run_conclusion(gh, repo_full_name, run_id)
 
     # Step 2: Download the all-test-failures artifact
     logger.info("Downloading all-test-failures artifact from run %d...", run_id)

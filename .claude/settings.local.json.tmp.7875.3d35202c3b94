@@ -1,0 +1,35 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c ' *)",
+      "Bash(grep -n \"test_name\\\\|test_file\\\\|class UniqueFailure\\\\|@dataclass\" /tmp/wip_review_snapshot/scripts_test_failure_detector_parse_failures.py | head -40)",
+      "Read(//tmp/wip_review_snapshot/**)",
+      "Bash(grep -o '\"raw_count\":[0-9]*' __TRACKED_VAR__/journal.jsonl)",
+      "Bash(python3 - __TRACKED_VAR__/journal.jsonl)",
+      "Read(//home/bonniecv/workplace/valkey-ci-agent/tests/**)",
+      "Read(//workplace/bonniecv/valkey-ci-agent/tests/**)",
+      "Bash(python3 -c 'import json *)",
+      "Read(//workplace/bonniecv/release-notes-ai/scripts/release_notes/**)",
+      "Read(//workplace/bonniecv/valkey/tests/**)",
+      "Bash(gh api *)",
+      "Bash(gh issue *)",
+      "Bash(sed -n '215,235p' /workplace/bonniecv/valkey-ci-agent/.venv/lib/python*/site-packages/urllib3/util/retry.py)",
+      "Bash(.venv/bin/python -m pytest tests/ -q)",
+      "Bash(cd /tmp/sweep-29969161569 && grep -n \"FAILED\" 89087144668.log | head -20 && echo === && sed -n '10955,10975p' 89087144668.log)",
+      "Read(//tmp/sweep-29969161569/**)",
+      "Bash(cd /tmp/hunt-3 && ls -la; grep -c \"\" 80457913046.txt; grep -niE \"err|fail\" 80457913046.txt | head -10)",
+      "Read(//tmp/hunt-3/**)",
+      "Bash(python -c ' *)",
+      "Bash(.venv/bin/python *)",
+      "Bash(git ls-tree *)",
+      "Bash(grep -c \"^+.*[ \t]$\")",
+      "Bash(git add *)",
+      "Bash(git commit -q -m 'Keep leak issue titles stable and flag red runs missing artifacts *)"
+    ],
+    "additionalDirectories": [
+      "/home/bonniecv/workplace/valkey-ci-agent",
+      "/workplace/bonniecv/valkey-ci-agent",
+      "/workplace/bonniecv/valkey-ci-agent/.venv/lib/python*/site-packages/urllib3/util"
+    ]
+  }
+}

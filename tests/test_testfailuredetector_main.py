@@ -28,7 +28,7 @@ class TestRunArtifactJSONGuard:
     def test_malformed_artifact_returns_nonzero_and_reports(
         self, _mock_gh, _mock_client, mock_download, mock_emit,
     ) -> None:
-        # A truncated/invalid artifact body — json.loads would raise.
+        # A truncated/invalid artifact body: json.loads would raise.
         mock_download.return_value = b"{not valid json"
 
         rc = detector_main.run(
@@ -134,6 +134,48 @@ class TestRunProcessingErrorsExitCode:
         mock_process.return_value = {
             "created": 1, "updated": 1, "skipped": 0, "errors": 0,
         }
+
+        rc = detector_main.run(
+            github_token="t", repo_full_name="valkey-io/valkey", run_id=123,
+        )
+
+        assert rc == 0
+
+
+class TestExplicitRunIdMissingArtifact:
+    """A red run with no artifact must be reported as a problem even when the
+    run was named with --run-id rather than discovered. That is the path used
+    to triage a run whose consolidate step died, so treating it as a clean pass
+    would hide the failure behind a green sweep."""
+
+    @patch("scripts.test_failure_detector.main.emit_job_summary")
+    @patch("scripts.test_failure_detector.main.get_run_conclusion")
+    @patch("scripts.test_failure_detector.main.download_all_test_failures")
+    @patch("scripts.test_failure_detector.main.ArtifactClient")
+    @patch("scripts.test_failure_detector.main.Github")
+    def test_failed_run_without_artifact_is_reported(
+        self, _mock_gh, _mock_client, mock_download, mock_conclusion, mock_emit,
+    ) -> None:
+        mock_download.return_value = None
+        mock_conclusion.return_value = "failure"
+
+        rc = detector_main.run(
+            github_token="t", repo_full_name="valkey-io/valkey", run_id=123,
+        )
+
+        assert rc == 1
+        assert "uploaded no" in mock_emit.call_args.args[0]
+
+    @patch("scripts.test_failure_detector.main.emit_job_summary")
+    @patch("scripts.test_failure_detector.main.get_run_conclusion")
+    @patch("scripts.test_failure_detector.main.download_all_test_failures")
+    @patch("scripts.test_failure_detector.main.ArtifactClient")
+    @patch("scripts.test_failure_detector.main.Github")
+    def test_green_run_without_artifact_is_still_a_clean_pass(
+        self, _mock_gh, _mock_client, mock_download, mock_conclusion, mock_emit,
+    ) -> None:
+        mock_download.return_value = None
+        mock_conclusion.return_value = "success"
 
         rc = detector_main.run(
             github_token="t", repo_full_name="valkey-io/valkey", run_id=123,

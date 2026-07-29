@@ -418,12 +418,13 @@ def _error_summary_line(error: str) -> str:
 
 
 # Nameless failure types whose fingerprint keys on test_file, so the file is
-# stable identity and belongs in the title. TIMEOUT keys on the file directly;
-# MEMORY_LEAK keys on the report text, which carries the file. For the other
-# nameless types (sanitizer, valgrind, startup, exception) the file is the
-# volatile detection context the fingerprint discards, so putting it in the
-# title would rewrite the title of one issue on every recurrence.
-_TITLE_SHOWS_FILE = frozenset({FailureType.TIMEOUT, FailureType.MEMORY_LEAK})
+# stable identity and belongs in the title. Only TIMEOUT qualifies: it keys on
+# the file directly (see fingerprint_for). Every other nameless type keys on the
+# normalized error, which discards the file, so putting the file in the title
+# would rewrite one issue's title whenever the same bug surfaced under a
+# different file. Memory leaks are the case that makes this concrete: one leak in
+# shared code is reported after whichever test file happened to expose it.
+_TITLE_SHOWS_FILE = frozenset({FailureType.TIMEOUT})
 
 
 def _build_title(failure: UniqueFailure) -> str:

@@ -145,6 +145,37 @@ def download_all_test_failures(
     logger.info("Extracted %s from artifact zip", _FAILURES_JSON_NAME)
     return content
 
+def get_run_conclusion(
+    gh: Github,
+    repo_full_name: str,
+    run_id: int,
+) -> str | None:
+    """A workflow run's conclusion, or None if it cannot be determined.
+
+    Used when the run was named explicitly rather than discovered, so the
+    caller can still tell a red run apart from a clean one. Returns None on
+    any API failure: the conclusion only sharpens an error message, so it must
+    not turn a usable run into a hard failure.
+    """
+    try:
+        repo = retry_github_call(
+            lambda: gh.get_repo(repo_full_name),
+            retries=3,
+            description=f"get repo {repo_full_name}",
+        )
+        run = retry_github_call(
+            lambda: repo.get_workflow_run(run_id),
+            retries=3,
+            description=f"get run {run_id}",
+        )
+    except Exception:
+        logger.warning(
+            "Could not fetch conclusion for run %d", run_id, exc_info=True,
+        )
+        return None
+    return run.conclusion
+
+
 @dataclass(frozen=True)
 class JobInfo:
     """URL map and failed-job names derived from a workflow run's job list."""
