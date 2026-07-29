@@ -10,6 +10,7 @@ from scripts.test_failure_detector.parse_failures import (
     UniqueFailure,
     normalize_error_identity,
     parse_and_deduplicate,
+    scrub_volatile_tokens,
 )
 
 # --- Fixture data mimicking real all-test-failures.json ---
@@ -748,6 +749,44 @@ class TestValgrindLeakIdentity:
             )
             identities.add(normalize_error_identity(report))
         assert len(identities) == 1
+
+
+class TestParenthesizedCountScrubbing:
+    """LeakSanitizer writes its counts as "41 byte(s)" and "1 allocation(s)".
+    A trailing word boundary cannot match after ")", and a bare "bytes?"
+    branch would match the "byte" inside "byte(s)" first, so these forms need
+    their own alternative or their digits reach the identity and drift.
+    """
+
+    def test_parenthesized_units_scrub_completely(self) -> None:
+        for text in (
+            "41 byte(s)", "1 object(s)", "1 allocation(s)", "2 leak(s)",
+        ):
+            assert scrub_volatile_tokens(text).strip() == "", text
+
+    def test_no_stranded_plural_suffix(self) -> None:
+        scrubbed = scrub_volatile_tokens(
+            "SUMMARY: AddressSanitizer: 41 byte(s) leaked in 1 allocation(s)."
+        )
+        assert "(s)" not in scrubbed
+        assert "41" not in scrubbed
+
+    def test_bare_units_still_scrub(self) -> None:
+        for text in ("41 bytes", "1 blocks", "1 leak", "2 leaks", "1 byte"):
+            assert scrub_volatile_tokens(text).strip() == "", text
+
+    def test_sanitizer_leak_size_drift_keeps_one_identity(self) -> None:
+        def report(size: str, objects: str, allocs: str) -> str:
+            return (
+                " Sanitizer error: \n"
+                "==6144==ERROR: LeakSanitizer: detected memory leaks\n"
+                f"Direct leak of {size} in {objects} allocated from:\n"
+                "    #4 0x55 in debugCommand /src/debug.c:569:9\n"
+                f"SUMMARY: AddressSanitizer: {size} leaked in {allocs}.\n"
+            )
+        first = report("41 byte(s)", "1 object(s)", "1 allocation(s)")
+        second = report("52 byte(s)", "2 object(s)", "2 allocation(s)")
+        assert normalize_error_identity(first) == normalize_error_identity(second)
 
 
 def _asan_leak(frames: str) -> str:

@@ -79,9 +79,14 @@ _BOILERPLATE_SUBSTRINGS = (
 # /usr/bin/leaks "1 leak for 48 total leaked bytes".
 _VOLATILE_COUNT_PATTERNS = (
     re.compile(r"\bin loss record \d[\d,]* of \d[\d,]*"),
+    # The "(s)" forms are a separate alternative, not extra branches alongside
+    # the bare words: a trailing \b cannot match after ")" (the next character
+    # is punctuation or end of line, so there is no word boundary there), and
+    # "bytes?" would otherwise match the "byte" inside "byte(s)" first and
+    # strand "(s)" in the identity.
     re.compile(
-        r"\b\d[\d,]*\s+"
-        r"(?:bytes?|blocks?|byte\(s\)|object\(s\)|allocation\(s\)|leaks?)\b"
+        r"\b\d[\d,]*\s+(?:byte|object|allocation|leak)\(s\)"
+        r"|\b\d[\d,]*\s+(?:bytes?|blocks?|leaks?)\b"
     ),
     # Any remaining thousands-separated number is a count/size.
     re.compile(r"\b\d{1,3}(?:,\d{3})+\b"),
