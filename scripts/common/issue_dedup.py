@@ -23,7 +23,8 @@ Search API. The list endpoint draws on the core rate limit (thousands of
 requests per hour) instead of the Search API's 30-per-minute budget, which
 a batch of failures could exhaust, and it is strongly consistent where
 search results can lag the index or silently omit matches. Listings are
-fetched once per publisher and reused across upserts in the same batch.
+fetched once per publisher, so callers that upsert several findings against
+one namespace should reuse a single publisher to share the cache.
 
 Callers supply rendered title, body, and comment via a render callback;
 this module owns only the dedup machinery. Listing failures are propagated
@@ -325,15 +326,31 @@ class IssueDedupPublisher:
         # A legacy issue carries an older (or no) marker, so the marker match
         # misses it. Fall back to an exact title match, mirroring the open-issue
         # migration path, so a just-closed legacy issue is not duplicated.
+        #
+        # The claimed check mirrors _find_by_title and matters more here: titles
+        # are summarized and truncated, so two different bugs can share one, and
+        # suppressing creation is silent. An issue already stamped with a marker
+        # from this namespace belongs to a different fingerprint, so matching it
+        # by title would discard this failure instead of filing it.
         if title_fallback is None:
             return None
+        claimed = _fingerprint_marker_re(self._ns)
         for issue in closed_issues:
-            if issue.title == title_fallback:
+            if issue.title != title_fallback:
+                continue
+            already_claimed = claimed.search(issue.body or "")
+            if already_claimed:
                 logger.info(
-                    "Matched recently closed legacy issue #%s via title fallback",
-                    issue.number,
+                    "Not suppressing via closed issue #%s: its title matches but "
+                    "it is claimed by fingerprint %s",
+                    issue.number, already_claimed.group(1),
                 )
-                return issue
+                continue
+            logger.info(
+                "Matched recently closed legacy issue #%s via title fallback",
+                issue.number,
+            )
+            return issue
         return None
 
     def _reload(self, repo: Any, number: int) -> Any:

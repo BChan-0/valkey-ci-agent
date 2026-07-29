@@ -476,6 +476,34 @@ def test_recently_closed_legacy_issue_matched_via_title_fallback():
     mock_repo.create_issue.assert_not_called()
 
 
+def test_recently_closed_claimed_issue_does_not_suppress_a_different_bug():
+    """Titles are summarized and truncated, so two different bugs can share
+    one. A closed issue already stamped with a marker from this namespace
+    belongs to a different fingerprint, so matching it by title would discard
+    the current failure instead of filing it, and silently: suppression writes
+    nothing anywhere.
+    """
+    claimed_closed = _mock_issue(
+        13,
+        body=f"<!-- {NAMESPACE}:aaaaaaaaaaaaaaaaaaaa -->\nsome other bug",
+        title="[SANITIZER] heap-use-after-free in zslDeleteNode",
+        closed_at=_recent(),
+    )
+    mock_gh, mock_repo = _mock_gh(closed_issues=[claimed_closed])
+    mock_repo.create_issue.return_value = _mock_issue(1)
+
+    publisher = IssueDedupPublisher(
+        mock_gh, marker_namespace=NAMESPACE, closed_lookback=timedelta(days=1),
+    )
+    action, _ = publisher.upsert(
+        "o/r", fingerprint="bbbbbbbbbbbbbbbbbbbb", render=_render_static(),
+        title_fallback="[SANITIZER] heap-use-after-free in zslDeleteNode",
+    )
+
+    assert action == "created"
+    mock_repo.create_issue.assert_called_once()
+
+
 def test_recently_closed_title_fallback_requires_exact_match():
     """A near-miss title in the closed listing must not suppress creation."""
     near_miss = _mock_issue(

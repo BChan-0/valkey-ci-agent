@@ -98,6 +98,12 @@ def process_failures(
 
     failures = _merge_same_fingerprint_failures(failures)
 
+    # One publisher per marker namespace, reused across the failures that share
+    # it. The publisher caches the issue listing for its lifetime, so building a
+    # fresh one per failure would re-list the repository's issues for every
+    # failure in the batch.
+    publishers: dict[str, IssueDedupPublisher] = {}
+
     for failure in failures:
         # Isolate each failure: a raised exception (e.g. a GitHub API error that
         # outlasts retries, or an unexpected upsert action) must not abort the
@@ -108,12 +114,16 @@ def process_failures(
             # get distinct issue search scopes and cannot collide. The
             # recently-closed suppression must be carried over here too, or a
             # failure fixed since the Daily run would be re-filed.
-            publisher = IssueDedupPublisher(
-                gh,
-                marker_namespace=issue_renderer.marker_namespace_for(failure),
-                closed_lookback=CLOSED_ISSUE_LOOKBACK,
-                filter_label=issue_renderer.label_for(failure),
-            )
+            namespace = issue_renderer.marker_namespace_for(failure)
+            publisher = publishers.get(namespace)
+            if publisher is None:
+                publisher = IssueDedupPublisher(
+                    gh,
+                    marker_namespace=namespace,
+                    closed_lookback=CLOSED_ISSUE_LOOKBACK,
+                    filter_label=issue_renderer.label_for(failure),
+                )
+                publishers[namespace] = publisher
 
             # The render and body_transform hooks are coupled (they share the
             # set of newly failing environments), so they come from one renderer.

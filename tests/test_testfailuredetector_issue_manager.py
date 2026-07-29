@@ -300,6 +300,63 @@ def _make_valgrind_failure(size: str, job: str) -> UniqueFailure:
     )
 
 
+class TestPublisherReuse:
+    """The publisher caches the issue listing for its lifetime, so failures
+    sharing a marker namespace must share one publisher. A fresh publisher per
+    failure re-lists every issue in the repository for every failure.
+    """
+
+    def test_one_listing_per_namespace_not_per_failure(self) -> None:
+        listings = []
+
+        mock_repo = MagicMock()
+        mock_repo.get_issues.side_effect = lambda **kw: listings.append(kw) or []
+        created = MagicMock()
+        created.number = 1
+        created.html_url = "https://x/1"
+        mock_repo.create_issue.return_value = created
+        mock_gh = MagicMock()
+        mock_gh.get_repo.return_value = mock_repo
+
+        failures = [
+            _make_failure(test_name=f"test {i}", test_file="t.tcl")
+            for i in range(6)
+        ]
+        result = process_failures(mock_gh, "o/r", failures, run_id=1)
+
+        assert result["created"] == 6
+        # Two listings for the one shared publisher: open, and recently closed.
+        assert len(listings) == 2
+
+    def test_each_namespace_gets_its_own_publisher(self) -> None:
+        listings = []
+
+        mock_repo = MagicMock()
+        mock_repo.get_issues.side_effect = lambda **kw: listings.append(kw) or []
+        created = MagicMock()
+        created.number = 1
+        created.html_url = "https://x/1"
+        mock_repo.create_issue.return_value = created
+        mock_gh = MagicMock()
+        mock_gh.get_repo.return_value = mock_repo
+
+        failures = [
+            UniqueFailure(
+                test_name=f"test {ftype.value}", test_file="t.tcl",
+                failure_type=ftype, error="boom",
+                jobs=[JobReference(job="j", suite="s", url="u")],
+            )
+            for ftype in (
+                FailureType.ASSERTION, FailureType.TIMEOUT, FailureType.UNITTEST,
+            )
+        ]
+        result = process_failures(mock_gh, "o/r", failures, run_id=1)
+
+        assert result["created"] == 3
+        # Three distinct namespaces, two listings each.
+        assert len(listings) == 6
+
+
 class TestMergeSameFingerprintFailures:
     """Same-run failures that hash to one fingerprint must publish as one
     issue carrying every job, not race for it (the run-id idempotency key
