@@ -41,8 +41,12 @@ _VOLATILE_PATTERNS = (
     re.compile(r"/tmp/[^\s:]+"),
     # PID/port annotations: pid 12345, port=6379, port 6379
     re.compile(r"\b(?:pid|port)[=\s]+\d+", re.IGNORECASE),
-    # Bare large numbers (>=4 digits) that are likely PIDs/timestamps/addresses
-    re.compile(r"\b\d{4,}\b"),
+    # Bare large numbers (>=4 digits) that are likely PIDs/timestamps/addresses.
+    # A number directly behind a source file extension is a line number, not
+    # noise: it is often the only thing distinguishing two bugs in one function
+    # (a use-after-free at cluster_legacy.c:3421 versus one at :5109), and a
+    # four-digit line is common in this codebase.
+    re.compile(r"(?<!\.c:)(?<!\.h:)(?<!\.cc:)(?<!\.cpp:)(?<!\.hpp:)\b\d{4,}\b"),
 )
 
 # Lines containing these keywords are considered "significant" for identity.
@@ -77,6 +81,13 @@ _BOILERPLATE_SUBSTRINGS = (
 # each words its counts differently: valgrind "41 bytes in 1 blocks",
 # LeakSanitizer "41 byte(s) in 1 object(s)" and "1 allocation(s)", and
 # /usr/bin/leaks "1 leak for 48 total leaked bytes".
+# The width of a bad access ("Invalid read of size 4"). One out-of-bounds
+# access is reported at whatever width the compiler chose for that load, so the
+# same bug reads as size 4 in one build and size 8 in another. The width is
+# dropped but the diagnostic is kept, since it names the error class; the stack
+# site below is what identifies which access it was.
+_ACCESS_WIDTH_RE = re.compile(r"\b(Invalid (?:read|write) of size)\s+\d+")
+
 _VOLATILE_COUNT_PATTERNS = (
     re.compile(r"\bin loss record \d[\d,]* of \d[\d,]*"),
     # The "(s)" forms are a separate alternative, not extra branches alongside
@@ -163,11 +174,13 @@ def startup_reason_from_lines(lines: list[str]) -> str:
 # A stack frame after volatile stripping. Valgrind: "at : malloc (...)" or
 # "by : sdsdup (sds.c:190)". Sanitizer: "#1  in ztrymalloc_usable_internal
 # /.../zmalloc.c:172" (the "#N 0xADDR in func" shape with the address
-# scrubbed). The function names are the stable identity anchor; addresses,
-# sizes, and loss records around them are not.
+# scrubbed). The function name plus its source location is the stable identity
+# anchor; addresses, sizes, and loss records around them are not.
 _STACK_FRAME_RE = re.compile(
-    r"^(?:at|by)\s*:\s*(?P<func>[^\s(]+)\s*(?:\((?P<file>[^():]+):)?"
-    r"|^#\d+\s+in\s+(?P<san_func>\S+)(?:\s+(?P<san_file>\S+?):\d+)?"
+    r"^(?:at|by)\s*:\s*(?P<func>[^\s(]+)\s*"
+    r"(?:\((?P<file>[^():]+):(?P<line>\d+)?)?"
+    r"|^#\d+\s+in\s+(?P<san_func>\S+)"
+    r"(?:\s+(?P<san_file>\S+?):(?P<san_line>\d+))?"
 )
 
 # Allocation plumbing and sanitizer interceptors that every heap operation
@@ -232,9 +245,27 @@ def _extract_root_leak_anchor(lines: list[str]) -> str:
     return "roots: " + " > ".join(sorted(sites))
 
 
+def _frame_anchor(func: str, source_path: str, source_line: str) -> str:
+    """One frame's identity: "func (file.c:120)", or just "func".
+
+    The file is reduced to its basename so the runner's workspace layout
+    ("/home/runner/work/..." on Linux, "/Users/runner/..." on macOS, "/__w/..."
+    in a container) cannot split one bug into an issue per platform. The line
+    number is kept: two bugs can share a function, and then it is the only
+    thing telling them apart.
+    """
+    if not source_path:
+        return func
+    source_file = source_path.rstrip(":").rsplit("/", 1)[-1]
+    if not source_file:
+        return func
+    if not source_line:
+        return f"{func} ({source_file})"
+    return f"{func} ({source_file}:{source_line})"
+
+
 def _extract_stack_anchor(lines: list[str]) -> str:
-    """Function-name chain of the first stack block in a valgrind or
-    sanitizer report.
+    """Frame chain of the first stack block in a valgrind or sanitizer report.
 
     Distinguishes two different leaks whose report lines are otherwise
     identical after count scrubbing (e.g. same "definitely lost" shape but
@@ -249,8 +280,9 @@ def _extract_stack_anchor(lines: list[str]) -> str:
             in_stack = True
             func = match.group("func") or match.group("san_func")
             source_path = match.group("file") or match.group("san_file") or ""
+            source_line = match.group("line") or match.group("san_line") or ""
             if not is_plumbing_frame(func, source_path):
-                frames.append(func)
+                frames.append(_frame_anchor(func, source_path, source_line))
                 if len(frames) >= 8:
                     break
         elif in_stack:
@@ -286,6 +318,7 @@ def scrub_volatile_tokens(text: str) -> str:
     bug must compare equal there, or every recurrence posts a redundant
     "new error stack trace".
     """
+    text = _ACCESS_WIDTH_RE.sub(r"\1", text)
     for pattern in _VOLATILE_COUNT_PATTERNS:
         text = pattern.sub("", text)
     for pattern in _VOLATILE_PATTERNS:

@@ -751,6 +751,72 @@ class TestValgrindLeakIdentity:
         assert len(identities) == 1
 
 
+def _asan_uaf(line: int, root: str = "/home/runner/work/valkey/valkey") -> str:
+    return (
+        "==1==ERROR: AddressSanitizer: heap-use-after-free\n"
+        f"    #1 0x55 in zslDeleteNode {root}/src/t_zset.c:{line}:9\n"
+    )
+
+
+class TestSourceLocationInStackAnchor:
+    """The stack anchor carries each frame's source location, so two bugs in
+    one function stay distinct, while the runner's workspace layout stays out
+    of the identity so one bug does not become an issue per platform.
+    """
+
+    def test_same_function_different_line_stays_distinct(self) -> None:
+        first = normalize_error_identity(_asan_uaf(1200))
+        second = normalize_error_identity(_asan_uaf(3455))
+        assert first != second
+        assert "t_zset.c:1200" in first
+        assert "t_zset.c:3455" in second
+
+    def test_runner_workspace_layout_does_not_split_one_bug(self) -> None:
+        identities = {
+            normalize_error_identity(_asan_uaf(1200, root))
+            for root in (
+                "/home/runner/work/valkey/valkey",
+                "/__w/valkey/valkey",
+                "/Users/runner/work/valkey/valkey",
+            )
+        }
+        assert len(identities) == 1
+
+    def test_four_digit_line_survives_the_bare_number_scrub(self) -> None:
+        """A line number is not noise. The bare-number pattern drops runs of
+        four or more digits, which would erase exactly the line numbers that
+        tell two bugs in one function apart.
+        """
+        assert "t_zset.c:3455" in scrub_volatile_tokens(_asan_uaf(3455))
+
+    def test_pids_are_still_scrubbed(self) -> None:
+        """The line-number carve-out must not spare a genuine PID."""
+        scrubbed = scrub_volatile_tokens("server started with pid 12345 ok")
+        assert "12345" not in scrubbed
+
+
+class TestAccessWidthScrubbing:
+    """One out-of-bounds access is reported at whatever width the compiler
+    chose for that load, so the width drifts between builds of one bug while
+    the diagnostic and the stack site identify it.
+    """
+
+    def test_access_width_does_not_split_one_bug(self) -> None:
+        def report(size: str) -> str:
+            return (
+                f"==1== Invalid read of size {size}\n"
+                "==1==    at 0xA: dictResize (dict.c:100)"
+            )
+        assert normalize_error_identity(report("4")) == normalize_error_identity(
+            report("8")
+        )
+
+    def test_diagnostic_text_is_kept(self) -> None:
+        scrubbed = scrub_volatile_tokens("Invalid read of size 4")
+        assert "Invalid read of size" in scrubbed
+        assert "4" not in scrubbed
+
+
 class TestParenthesizedCountScrubbing:
     """LeakSanitizer writes its counts as "41 byte(s)" and "1 allocation(s)".
     A trailing word boundary cannot match after ")", and a bare "bytes?"

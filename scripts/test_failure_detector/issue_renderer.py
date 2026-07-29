@@ -87,8 +87,14 @@ def fingerprint_for(failure: UniqueFailure) -> str:
     it would collapse unrelated timeouts in different files into one issue.
 
     For other nameless failures (sanitizer/valgrind/startup): hash of
-    (type_namespace,) with the normalized error as shapes input. This means the
-    same bug detected after different test files produces the same fingerprint.
+    (type_namespace, normalized_error). This means the same bug detected after
+    different test files produces the same fingerprint. The identity goes in
+    ``namespace`` for the same reason the pair above does: ``shapes`` replaces
+    every run of digits with "_", which would erase the source line numbers
+    that are the only thing telling two bugs in one function apart, collapsing
+    a use-after-free at cluster_legacy.c:3421 and one at :5109 into a single
+    issue. normalize_error_identity has already removed the volatile digits,
+    so the ones that survive to here are identity.
 
     Known granularity limit: a macOS /usr/bin/leaks blob whose root-leak
     lines are unsymbolicated (bare addresses, no site names) normalizes to
@@ -111,8 +117,8 @@ def fingerprint_for(failure: UniqueFailure) -> str:
     else:
         error_identity = normalize_error_identity(failure.error)
         return compute_fingerprint(
-            namespace=(ns,),
-            shapes=(error_identity,),
+            namespace=(ns, error_identity),
+            shapes=(),
         )
 
 
