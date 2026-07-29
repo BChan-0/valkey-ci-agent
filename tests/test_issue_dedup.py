@@ -313,6 +313,29 @@ def test_title_fallback_requires_exact_title_match():
     mock_repo.create_issue.assert_called_once()
 
 
+def test_title_fallback_does_not_adopt_another_fingerprints_issue():
+    """Titles are summarized and truncated, so two different bugs can share one.
+    Adopting an issue already claimed by another fingerprint would retarget this
+    fingerprint onto it and leave the current failure with no issue at all."""
+    claimed = _mock_issue(
+        9,
+        body=f"<!-- {NAMESPACE}:a1b2c3d4e5f60718293a -->\n"
+             f"<!-- {NAMESPACE}:occurrences:1 -->",
+        title="[TEST-FAILURE] PSYNC2 in t.tcl",
+    )
+    mock_gh, mock_repo = _mock_gh(open_issues=[claimed])
+    mock_repo.create_issue.return_value = _mock_issue(1, title="new")
+
+    publisher = IssueDedupPublisher(mock_gh, marker_namespace=NAMESPACE)
+    action, url = publisher.upsert(
+        "o/r", fingerprint="b9c8d7e6f5a41328495b", render=_render_static(),
+        title_fallback="[TEST-FAILURE] PSYNC2 in t.tcl",
+    )
+    assert action == "created"
+    assert url == "https://x/issues/1"
+    claimed.edit.assert_not_called()
+
+
 def test_title_fallback_matches_titles_unsafe_for_search_syntax():
     """Local matching handles titles that used to require query sanitizing
     (quotes, colons, HTML-comment arrows) with a plain exact comparison."""

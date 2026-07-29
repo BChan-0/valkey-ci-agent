@@ -813,7 +813,32 @@ class TestStartupFailureIdentity:
 
     def test_blob_without_error_section_falls_back_to_first_line(self) -> None:
         identity = normalize_error_identity("Can't start /path/to/valkey-server")
-        assert identity == "Can't start /path/to/valkey-server"
+        assert identity == "Can't start valkey-server"
+
+    def test_identity_ignores_the_runners_workspace_layout(self) -> None:
+        """The exe path is the runner's layout, not the bug: the same failure is
+        under /home/runner on Linux, /Users/runner on macOS, and /__w in a
+        container job. Keeping it files one issue per platform."""
+        reason = (
+            "*** FATAL CONFIG FILE ERROR (Version 9.0.0) ***\n"
+            "Bad directive or wrong number of arguments"
+        )
+        identities = {
+            normalize_error_identity(
+                _startup_blob(reason).replace("/path/to/valkey-server", exe)
+            )
+            for exe in (
+                "/home/runner/work/valkey/valkey/src/valkey-server",
+                "/Users/runner/work/valkey/valkey/src/valkey-server",
+                "/__w/valkey/valkey/src/valkey-server",
+            )
+        }
+        assert len(identities) == 1
+
+    def test_identity_still_separates_different_executables(self) -> None:
+        server = _startup_blob("Unable to bind unix socket: Permission denied")
+        sentinel = server.replace("valkey-server", "valkey-sentinel")
+        assert normalize_error_identity(server) != normalize_error_identity(sentinel)
 
 
 def _leaks_blob(pid: int, root_site: str) -> str:

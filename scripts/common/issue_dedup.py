@@ -280,14 +280,29 @@ class IssueDedupPublisher:
         return None
 
     def _find_by_title(self, repo: Any, repo_name: str, title: str) -> Any:
-        """Find an open issue whose title exactly equals ``title``, or None.
+        """Find an open unclaimed issue whose title exactly equals ``title``, or None.
 
-        Migration fallback for when the marker match misses. The comparison
-        is exact and case-sensitive.
+        Migration fallback for when the marker match misses. The comparison is
+        exact and case-sensitive.
+
+        Titles are summarized and truncated, so two different bugs can share
+        one. An issue already stamped with a marker from this namespace belongs
+        to a different fingerprint and must not be adopted: doing so would
+        retarget this fingerprint onto that issue and leave the current failure
+        with no issue of its own.
         """
+        claimed = _fingerprint_marker_re(self._ns)
         for issue in self._open_issues_for(repo, repo_name):
-            if issue.title == title:
-                return self._reload(repo, issue.number)
+            if issue.title != title:
+                continue
+            already_claimed = claimed.search(issue.body or "")
+            if already_claimed:
+                logger.info(
+                    "Not adopting issue #%s by title: already claimed by fingerprint %s",
+                    issue.number, already_claimed.group(1),
+                )
+                continue
+            return self._reload(repo, issue.number)
         return None
 
     def _find_recently_closed(
@@ -344,6 +359,17 @@ def _drop_pull_requests(issues: list[Any]) -> list[Any]:
 def _occurrence_re(namespace: str) -> re.Pattern[str]:
     """A namespaced occurrence-counter regex: ``<!-- <ns>:occurrences:<n> -->``."""
     return re.compile(rf"<!-- {re.escape(namespace)}:occurrences:(\d+) -->")
+
+
+def _fingerprint_marker_re(namespace: str) -> re.Pattern[str]:
+    """A namespaced fingerprint marker regex: ``<!-- <ns>:<hex> -->``.
+
+    Matches only the hex digest written by ``compute_fingerprint``, so it does
+    not collide with the namespace's other markers (``occurrences``,
+    ``last-key``) or with a legacy marker in some older, non-hex format;
+    those must stay adoptable by title.
+    """
+    return re.compile(rf"<!-- {re.escape(namespace)}:([0-9a-f]{{8,}}) -->")
 
 
 def _last_key_marker(namespace: str, key: str) -> str:

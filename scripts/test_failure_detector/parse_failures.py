@@ -97,6 +97,15 @@ _STARTUP_CONFIG_SECTION_RE = re.compile(
     r"\nCONFIGURATION:\n.*?\nERROR:\n", re.DOTALL
 )
 
+# The startup blob opens with the server executable's absolute path, which is
+# the runner's workspace layout rather than anything about the bug: the same
+# failure reads "/home/runner/work/..." on a Linux runner, "/Users/runner/..."
+# on macOS, and "/__w/..." in a container job. Left verbatim it splits one
+# startup bug into an issue per platform. Only the path is reduced; the
+# "Can't start" prefix stays, since it is what marks the blob as a startup
+# failure downstream.
+_STARTUP_EXE_PATH_RE = re.compile(r"(Can't start )\S*/([^/\s]+)")
+
 # The startup blob's captured stderr is prefixed with runner and server
 # progress lines that carry no cause: the harness's "### Starting server for
 # test" marker, the "*** FATAL CONFIG FILE ERROR ***" banner (identical for
@@ -261,6 +270,7 @@ def normalize_error_identity(error: str) -> str:
     the same normalized identity.
     """
     text = _STARTUP_CONFIG_SECTION_RE.sub("\nERROR:\n", error)
+    text = _STARTUP_EXE_PATH_RE.sub(r"\1\2", text)
     for pattern in _VOLATILE_PATTERNS:
         text = pattern.sub("", text)
     for pattern in _VOLATILE_COUNT_PATTERNS:
