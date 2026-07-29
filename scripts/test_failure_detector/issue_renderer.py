@@ -46,8 +46,6 @@ _TYPE_NAMESPACE: dict[FailureType, str] = {
     FailureType.UNITTEST: "valkey-ci-agent:unittest-failure",
 }
 
-_LABEL_NAME = "test-failure"
-
 # Title prefix per failure type.
 _TYPE_TITLE_PREFIX: dict[FailureType, str] = {
     FailureType.ASSERTION: "[TEST-FAILURE]",
@@ -67,8 +65,13 @@ def marker_namespace_for(failure: UniqueFailure) -> str:
 
 
 def label_for(failure: UniqueFailure) -> str:
-    """Return the issue label. All failure types use the same label."""
-    return _LABEL_NAME
+    """Return the issue label. All failure types use the same label.
+
+    The title prefix ([SANITIZER], [VALGRIND], and so on) already names the
+    category, so one label keeps the tracker filter simple and needs no new
+    labels created on the target repo.
+    """
+    return LABEL_NAME
 
 
 def fingerprint_for(failure: UniqueFailure) -> str:
