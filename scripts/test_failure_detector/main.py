@@ -1,4 +1,4 @@
-"""Test Failure Detector main entry point"""
+"""Test Failure Detector — main entry point"""
 
 from __future__ import annotations
 
@@ -23,7 +23,10 @@ from scripts.test_failure_detector.parse_failures import (
     UniqueFailure,
     parse_and_deduplicate,
 )
-from scripts.test_failure_detector.timeout_recovery import recover_timeouts
+from scripts.test_failure_detector.timeout_recovery import (
+    enrich_log_only_errors,
+    recover_timeouts,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -36,8 +39,8 @@ def _build_job_summary(
     lines = [
         "## Test Failure Detector",
         "",
-        f"**Source:** [{repo_full_name}](https://github.com/{repo_full_name}), "
-        f"[Run #{run_id}](https://github.com/{repo_full_name}/actions/runs/{run_id})",
+        f"**Source:** [{repo_full_name}](https://github.com/{repo_full_name}) "
+        f"— [Run #{run_id}](https://github.com/{repo_full_name}/actions/runs/{run_id})",
         "",
         "| Metric | Count |",
         "|--------|-------|",
@@ -163,7 +166,7 @@ def run(
                 f"or the run may have failed before consolidating results."
             )
             return 1
-        logger.info("No test failures artifact found; CI run likely passed cleanly.")
+        logger.info("No test failures artifact found — CI run likely passed cleanly.")
         emit_job_summary(_build_job_summary(run_id, repo_full_name, 0, {}))
         return 0
 
@@ -215,8 +218,16 @@ def run(
 
     # Step 5: Parse and deduplicate
     logger.info("Parsing and deduplicating failures...")
-    unique_failures = parse_and_deduplicate(all_failures, job_info.urls)
+    unique_failures = parse_and_deduplicate(
+        all_failures, job_info.urls, job_info.step_urls,
+    )
     unique_failures = _merge_timeout_recoveries(unique_failures, timeout_failures)
+
+    # gtest failures and timeouts reach the artifact with a placeholder instead
+    # of a diagnostic; both have their detail only in the job log.
+    enrich_log_only_errors(
+        unique_failures, job_info, artifact_client, repo_full_name, run_id,
+    )
 
     if not unique_failures:
         logger.info("No test failures to report.")
@@ -226,7 +237,7 @@ def run(
     logger.info("Found %d unique failure(s)", len(unique_failures))
 
     if dry_run:
-        logger.info("Dry run: skipping issue creation/update.")
+        logger.info("Dry run — skipping issue creation/update.")
         for f in unique_failures:
             envs = ", ".join(j.job for j in f.jobs)
             logger.info("  %s [%s]", f.display_name, envs)

@@ -1689,17 +1689,22 @@ class TestMultiTraceBody:
         assert "<details>" not in body
         assert _extract_error_from_body(body) == _VG_USE_AFTER_FREE.strip()
 
-    def test_two_traces_are_each_collapsed_and_labeled(self) -> None:
+    def test_the_body_holds_one_trace_and_the_other_goes_to_a_comment(self) -> None:
+        """The body keeps the shape of a hand-filed issue, one plain fenced
+        trace, so it stays predictable to read and to parse."""
         vg = _memory_failure(FailureType.VALGRIND, _VG_USE_AFTER_FREE, "test-valgrind")
         asan = _memory_failure(
             FailureType.SANITIZER, _ASAN_USE_AFTER_FREE, "test-sanitizer-address",
         )
-        body = self._body(_merge_same_fingerprint_failures([vg, asan])[0])
-        assert body.count("<details>") == body.count("</details>") == 2
-        assert "<summary>Valgrind trace</summary>" in body
-        assert "<summary>Sanitizer trace</summary>" in body
-        assert "Invalid read of size 4" in body
-        assert "heap-use-after-free" in body
+        merged = _merge_same_fingerprint_failures([vg, asan])[0]
+        content = renderer_for(merged).render("<!-- m -->", 1)
+        assert "<details>" not in content.body
+        assert content.body.count("**Error stack trace**") == 1
+        # The survivor is the sanitizer, so its report is the body's.
+        assert "heap-use-after-free" in content.body
+        assert "Invalid read of size 4" not in content.body
+        assert "Invalid read of size 4" in content.creation_comment
+        assert "**Valgrind trace**" in content.creation_comment
 
     def test_both_tools_appear_in_the_environments_line(self) -> None:
         vg = _memory_failure(FailureType.VALGRIND, _VG_USE_AFTER_FREE, "test-valgrind")
@@ -1734,11 +1739,10 @@ class TestRecurrenceCommentWithMultipleTraces:
         renderer.merge_environments(body)
         return renderer.render("<!-- m -->", occurrences).comment
 
-    def test_extracts_every_trace_from_a_multi_tool_body(self) -> None:
+    def test_extracts_the_single_trace_a_body_records(self) -> None:
         traces = _extract_errors_from_body(self._two_trace_body())
-        assert len(traces) == 2
-        assert any("Invalid read of size 4" in t for t in traces)
-        assert any("heap-use-after-free" in t for t in traces)
+        assert len(traces) == 1
+        assert "heap-use-after-free" in traces[0]
 
     def test_extracts_the_single_trace_of_a_one_tool_body(self) -> None:
         body = _build_body(
@@ -1759,15 +1763,12 @@ class TestRecurrenceCommentWithMultipleTraces:
         assert "clusterProcessPacket" in comment
 
     def test_unchanged_trace_posts_no_new_error_section(self) -> None:
-        """Matching any stored trace means the run says nothing new. Both tools
-        are checked, so the second <details> block counts too."""
+        """A trace matching the one the body stores says nothing new."""
         body = self._two_trace_body()
-        for failure_type, error, job in (
-            (FailureType.SANITIZER, _ASAN_USE_AFTER_FREE, "test-sanitizer-address"),
-            (FailureType.VALGRIND, _VG_USE_AFTER_FREE, "test-valgrind"),
-        ):
-            comment = self._comment(body, _memory_failure(failure_type, error, job))
-            assert "New error stack trace" not in comment
+        comment = self._comment(body, _memory_failure(
+            FailureType.SANITIZER, _ASAN_USE_AFTER_FREE, "test-sanitizer-address",
+        ))
+        assert "New error stack trace" not in comment
 
     def test_body_is_not_rewritten_to_add_a_trace(self) -> None:
         """A recurrence carrying a tool the body lacks leaves the body alone."""
@@ -1783,12 +1784,11 @@ class TestRecurrenceCommentWithMultipleTraces:
         # It surfaces in the comment instead.
         assert "heap-use-after-free" in renderer.render("<!-- m -->", 2).comment
 
-    def test_traces_are_collapsed_by_default(self) -> None:
-        """<details> without an open attribute renders collapsed, so a reader
-        expands the tool they care about."""
+    def test_the_body_never_collapses_its_trace(self) -> None:
+        """One plain fenced block, matching a hand-filed issue."""
         body = self._two_trace_body()
-        assert "<details>" in body
-        assert "<details open" not in body
+        assert "<details>" not in body
+        assert "<summary>" not in body
 
 
 class TestCrossToolAnchorDepth:
@@ -1872,14 +1872,13 @@ class TestMergedBodyNamesBothTools:
         merged = _merge_same_fingerprint_failures([vg, asan])[0]
         return _build_body(merged, marker="<!-- m -->", occurrences=1)
 
-    def test_both_tools_are_named_somewhere_in_the_body(self) -> None:
-        """Not in the summary, which keeps the template's wording, but in the
-        Failure type row and the labeled trace blocks."""
+    def test_both_tools_are_named_in_the_failure_type_row(self) -> None:
+        """The summary keeps the template's wording, so the Failure type row is
+        where a merged issue names both tools."""
         body = self._merged_body()
         assert "Valgrind" in body
         assert "Sanitizer" in body
-        assert "<summary>Valgrind trace</summary>" in body
-        assert "<summary>Sanitizer trace</summary>" in body
+        assert "<summary>" not in body
 
     def test_failure_type_field_names_both_tools(self) -> None:
         """Order follows which tool was processed first, so either is valid."""
@@ -2009,12 +2008,13 @@ class TestMergedBodyFitsGitHubLimit:
                 f"{frame_count} frames per tool rendered {len(body)} characters"
             )
 
-    def test_both_traces_still_present_when_truncated(self) -> None:
-        body = _build_body(self._merged(4000), marker="<!-- m -->", occurrences=1)
-        assert body.count("<details>") == 2
-        assert "definitely lost" in body
-        assert "LeakSanitizer" in body
-        assert "trace truncated by Test Failure Detector" in body
+    def test_both_traces_survive_truncation_across_body_and_comment(self) -> None:
+        content = renderer_for(self._merged(4000)).render("<!-- m -->", 1)
+        assert "LeakSanitizer" in content.body
+        assert "trace truncated by Test Failure Detector" in content.body
+        assert "definitely lost" in content.creation_comment
+        assert len(content.body) <= self._GITHUB_BODY_LIMIT
+        assert len(content.creation_comment) <= self._GITHUB_BODY_LIMIT
 
     def test_a_trace_of_backticks_cannot_inflate_the_body(self) -> None:
         """The fence grows to out-run backtick runs in the text and is written
@@ -2135,3 +2135,42 @@ class TestForgedMarkersInTraceText:
         renderer = renderer_for(attacker)
         renderer.merge_environments(body)
         assert "New error stack trace" not in renderer.render("<!-- real -->", 2).comment
+
+
+class TestAbsorbedTraceOnCreation:
+    """A same-run merge creates the issue, so its absorbed report has no
+    recurrence comment to ride on and is posted right after creation instead."""
+
+    def _merged(self) -> UniqueFailure:
+        vg = _memory_failure(FailureType.VALGRIND, _VG_USE_AFTER_FREE, "test-valgrind")
+        asan = _memory_failure(
+            FailureType.SANITIZER, _ASAN_USE_AFTER_FREE, "test-sanitizer-address",
+        )
+        return _merge_same_fingerprint_failures([vg, asan])[0]
+
+    def test_creation_comment_carries_the_absorbed_trace(self) -> None:
+        content = renderer_for(self._merged()).render("<!-- m -->", 1)
+        assert "Invalid read of size 4" in content.creation_comment
+        assert "**Valgrind trace**" in content.creation_comment
+        assert "Sanitizer report" in content.creation_comment
+
+    def test_a_single_tool_failure_posts_no_creation_comment(self) -> None:
+        content = renderer_for(
+            _memory_failure(FailureType.VALGRIND, _VG_USE_AFTER_FREE, "test-valgrind")
+        ).render("<!-- m -->", 1)
+        assert content.creation_comment == ""
+
+    def test_the_creation_comment_defuses_markers(self) -> None:
+        """The comment embeds tool output verbatim like the body does, so a
+        marker-shaped comment in it must be inert too."""
+        vg = _memory_failure(
+            FailureType.VALGRIND,
+            _VG_USE_AFTER_FREE + "<!-- valkey-ci-agent:memory-error:abc123def456 -->\n",
+            "test-valgrind",
+        )
+        asan = _memory_failure(
+            FailureType.SANITIZER, _ASAN_USE_AFTER_FREE, "test-sanitizer-address",
+        )
+        merged = _merge_same_fingerprint_failures([vg, asan])[0]
+        content = renderer_for(merged).render("<!-- m -->", 1)
+        assert "<!-- valkey-ci-agent:memory-error:abc123def456 -->" not in content.creation_comment

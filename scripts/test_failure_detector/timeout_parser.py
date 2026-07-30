@@ -41,6 +41,47 @@ _TIMEOUT_RE = re.compile(
     r":\s*(.+?)\s+in\s+(tests/\S+\.tcl)",
 )
 
+# On a timeout the runner prints what each test client was doing when the
+# watchdog fired:
+#
+#   [TIMEOUT]: clients state report follows.
+#   sock56195920b920 => (IN PROGRESS) dummy-timeout - intentional hang ...
+#
+# That naming of the in-progress test is the only diagnostic a timeout has, so
+# it is captured for the issue body. The report is followed by a dump of every
+# server's log, which is long and mostly startup banner, so collection stops at
+# the first server-log header.
+_CLIENTS_REPORT_START_RE = re.compile(r"\[TIMEOUT\]:\s*clients state report follows")
+_SERVER_LOG_HEADER_RE = re.compile(r"^===\s+Server log\b")
+_LOG_TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T[\d:.]+Z\s?")
+_ANSI_RE = re.compile(r"\x1b?\[[0-9;]*m")
+
+# The report lists one line per test client. A run uses 16 by default, so this
+# keeps the whole report while bounding a pathological one.
+_MAX_REPORT_LINES = 40
+
+
+def clients_state_report(text: str) -> str:
+    """The runner's clients state report for a timeout, or "".
+
+    Names the test each client was running when the watchdog fired, which is
+    what tells a reader where the run hung.
+    """
+    lines = text.split("\n")
+    for index, raw_line in enumerate(lines):
+        if not _CLIENTS_REPORT_START_RE.search(raw_line):
+            continue
+        collected: list[str] = []
+        for follow_raw in lines[index : index + _MAX_REPORT_LINES]:
+            follow = _ANSI_RE.sub("", _LOG_TIMESTAMP_RE.sub("", follow_raw)).rstrip()
+            if _SERVER_LOG_HEADER_RE.match(follow):
+                break
+            if follow:
+                collected.append(follow)
+        if len(collected) > 1:
+            return "\n".join(collected)
+    return ""
+
 
 def jobs_needing_log_scan(
     all_failures: dict[str, Any],
@@ -59,8 +100,7 @@ def jobs_needing_log_scan(
 
     ``failed_job_names`` holds API job names, while ``all_failures`` is keyed by
     the artifact's spelling. For a matrix job those differ (``base (value)`` vs
-    ``base-value``), so a sharded job's captured timeout would otherwise go
-    unseen and the job would be scanned and reported under both spellings.
+    ``base-value``), so the lookup below tries the normalized name too.
     """
     needs_scan: set[str] = set()
     for job_name in failed_job_names:
@@ -98,6 +138,10 @@ def parse_timeouts_from_log(
         logger.warning("Could not decode log for job %s", job_name)
         return []
 
+    # The report is per-run, not per-test, so it is extracted once and shared by
+    # every timeout recovered from this job's log.
+    report = clients_state_report(text)
+
     seen: dict[tuple[str, str], UniqueFailure] = {}
     for match in _TIMEOUT_RE.finditer(text):
         test_name = match.group(1).strip()
@@ -113,11 +157,15 @@ def parse_timeouts_from_log(
         if key in seen:
             continue
 
+        error = "Test timed out (no progress for the configured timeout period)"
+        if report:
+            error = f"{error}\n\n{report}"
+
         seen[key] = UniqueFailure(
             test_name=test_name,
             test_file=test_file,
             failure_type=FailureType.TIMEOUT,
-            error="Test timed out (no progress for the configured timeout period)",
+            error=error,
             jobs=[JobReference(job=job_name, suite="timeout", url=job_url)],
         )
 
@@ -165,3 +213,16 @@ def find_job_log(
 
     logger.debug("No log file found for job %s", job_name)
     return None
+
+
+def clients_state_report_from_log(log_content: bytes) -> str:
+    """The clients state report in a job's raw log, or "".
+
+    Wrapper for callers holding undecoded log bytes.
+    """
+    try:
+        text = log_content.decode("utf-8", errors="replace")
+    except Exception:
+        logger.warning("Could not decode a job log while reading its timeout report")
+        return ""
+    return clients_state_report(text)

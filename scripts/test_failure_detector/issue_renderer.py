@@ -205,6 +205,7 @@ class _FailureRenderer:
                 new_error=self._new_error,
             ),
             labels=(label_for(self._failure),),
+            creation_comment=_build_absorbed_trace_comment(self._failure),
         )
 
     def merge_environments(self, existing_body: str) -> str:
@@ -639,37 +640,14 @@ def _fenced(text: str) -> list[str]:
 
 
 def _render_traces(failure: UniqueFailure) -> list[str]:
-    """Render a failure's trace, or every tool's trace when more than one.
+    """Render the failure's own trace as a single fenced block.
 
-    A single trace is rendered as a plain fenced block. When two tools reported
-    the same bug their traces are each collapsed behind a summary naming the
-    tool: together they are long enough to bury the rest of the issue, and a
-    reader usually wants only the one from the tool they are debugging.
-
-    The per-trace budget is divided by the number of traces, so adding a second
-    tool's report cannot push the body past the size GitHub accepts. Without
-    that, two traces at the single-trace cap exceeded the limit on their own and
-    the create call was rejected, leaving the bug both tools found as the one
-    with no issue at all.
+    The body carries exactly one trace, in the same shape as an issue filed by
+    hand from the repository's template, so the section stays predictable to
+    read and to parse. A second tool's report of the same bug goes to a comment
+    instead (see :meth:`_FailureRenderer._detect_new_error`).
     """
-    traces = [(trace_label_for(failure), failure.error), *failure.extra_traces]
-    budget = _MAX_TRACE_CHARS // len(traces)
-    if len(traces) == 1:
-        label, trace = traces[0]
-        return _fenced(_truncate_trace(trace, budget) or "N/A")
-
-    blocks: list[str] = []
-    for label, trace in traces:
-        blocks.extend([
-            "<details>",
-            f"<summary>{label} trace</summary>",
-            "",
-            *_fenced(_truncate_trace(trace, budget) or "N/A"),
-            "",
-            "</details>",
-            "",
-        ])
-    return blocks[:-1]
+    return _fenced(_truncate_trace(failure.error) or "N/A")
 
 
 def _fence_for(text: str) -> str:
@@ -716,6 +694,34 @@ def _truncate_trace(trace: str, budget: int = _MAX_TRACE_CHARS) -> str:
         return trace
     keep = max(0, (budget - len(_TRUNCATION_NOTICE)) // 2)
     return f"{trace[:keep]}{_TRUNCATION_NOTICE}{trace[-keep:]}"
+
+
+def _build_absorbed_trace_comment(failure: UniqueFailure) -> str:
+    """A comment carrying the reports of other tools that found the same bug.
+
+    The body holds one trace so it keeps the shape of a hand-filed issue, which
+    also keeps it parseable. When two tools reported one bug the second report
+    goes here: it says things the first does not (each tool names details the
+    other omits), and discarding it would lose the reason the two were merged.
+
+    Returns "" for the ordinary single-tool failure, which posts no comment.
+    """
+    if not failure.extra_traces:
+        return ""
+    own = trace_label_for(failure)
+    lines = [
+        f"The same bug was also reported by "
+        f"{', '.join(label for label, _ in failure.extra_traces)}. "
+        f"The issue body holds the {own} report.",
+    ]
+    budget = _MAX_TRACE_CHARS // (len(failure.extra_traces) + 1)
+    for label, trace in failure.extra_traces:
+        text = _truncate_trace(trace, budget) or "N/A"
+        fence = _fence_for(_defuse_markers(text))
+        lines.append(
+            f"\n**{label} trace**\n\n{fence}\n{_defuse_markers(text)}\n{fence}"
+        )
+    return "\n".join(lines)
 
 
 def _build_comment(

@@ -51,6 +51,11 @@ class IssueContent:
     body: str
     comment: str
     labels: tuple[str, ...] = ()
+    # Posted as a comment right after the issue is created. The body holds one
+    # trace by design, so a caller with a second one (a valgrind and a sanitizer
+    # report of one bug) puts it here rather than losing it. Empty for the usual
+    # single-trace case, which posts no comment on creation.
+    creation_comment: str = ""
 
 
 class IssueDedupPublisher:
@@ -174,6 +179,20 @@ class IssueDedupPublisher:
             # repeated fingerprint or title updates it instead of filing a
             # duplicate. _find_existing above guarantees the cache entry exists.
             self._open_issues[repo_name].append(issue)
+            if content.creation_comment:
+                # Best-effort: the issue exists and records the failure, so a
+                # comment that cannot be posted must not turn a successful
+                # creation into an error.
+                try:
+                    retry_github_call(
+                        lambda: issue.create_comment(body=content.creation_comment),
+                        retries=2, description=f"comment on new issue #{issue.number}",
+                    )
+                except Exception:
+                    logger.warning(
+                        "Could not post the creation comment on issue #%s",
+                        issue.number, exc_info=True,
+                    )
             logger.info("Created issue #%s for %s", issue.number, fingerprint)
             return "created", issue.html_url
 
