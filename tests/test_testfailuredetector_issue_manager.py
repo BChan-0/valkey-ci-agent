@@ -294,7 +294,7 @@ def _make_valgrind_failure(size: str, job: str) -> UniqueFailure:
     normalizer to collapse.
     """
     return UniqueFailure(
-        test_name="", test_file="tests/unit/dummy.tcl",
+        test_name="", test_file="tests/unit/other.tcl",
         failure_type=FailureType.VALGRIND,
         error=(
             f"==1== Invalid read of size {size}\n"
@@ -588,7 +588,7 @@ class TestTypeSpecificFingerprint:
                 f"{extra_tail}"
             )
             return UniqueFailure(
-                test_name="", test_file="tests/unit/dummy-memory.tcl",
+                test_name="", test_file="tests/unit/other.tcl",
                 failure_type=FailureType.VALGRIND, error=error,
                 jobs=[JobReference(job="j", suite="s", url="u")],
             )
@@ -663,7 +663,7 @@ class TestTypeSpecificRendering:
             assert title_for(f).startswith("[TEST-FAILURE]")
 
     def test_valgrind_leak_title_format(self) -> None:
-        # Issue #91/#93: the Memcheck banner is the first line of every
+        # The Memcheck banner is the first line of every
         # valgrind report, so a first-line title gives all valgrind issues
         # the same name. A leak title leads with the leak kind, then the
         # size and the first non-plumbing source frame:
@@ -679,7 +679,7 @@ class TestTypeSpecificRendering:
             "==6554==    by 0x1E8076: debugCommand (debug.c:569)\n"
         )
         f = UniqueFailure(
-            test_name="", test_file="tests/unit/dummy-memory.tcl",
+            test_name="", test_file="tests/unit/other.tcl",
             failure_type=FailureType.VALGRIND,
             error=error,
             jobs=[JobReference(job="j", suite="s", url="u")],
@@ -703,7 +703,7 @@ class TestTypeSpecificRendering:
                 f"=={pid}==    by 0x1E8076: debugCommand (debug.c:569)\n"
             )
             return UniqueFailure(
-                test_name="", test_file="tests/unit/dummy-memory.tcl",
+                test_name="", test_file="tests/unit/other.tcl",
                 failure_type=FailureType.VALGRIND, error=error,
                 jobs=[JobReference(job="j", suite="s", url="u")],
             )
@@ -721,7 +721,7 @@ class TestTypeSpecificRendering:
                 f"==1==    by 0x1E8076: {site}\n"
             )
             return UniqueFailure(
-                test_name="", test_file="tests/unit/dummy-memory.tcl",
+                test_name="", test_file="tests/unit/other.tcl",
                 failure_type=FailureType.VALGRIND, error=error,
                 jobs=[JobReference(job="j", suite="s", url="u")],
             )
@@ -835,7 +835,7 @@ class TestTypeSpecificRendering:
 
 class TestVolatileTimeoutFingerprint:
     """Nameless timeouts (volatile PID demoted) must have a stable fingerprint
-    keyed by file, not by the generic error text (#82, #86)."""
+    keyed by file, not by the generic error text."""
 
     def test_nameless_timeout_fingerprint_stable_across_pids(self) -> None:
         f1 = UniqueFailure(
@@ -873,7 +873,7 @@ class TestVolatileTimeoutFingerprint:
 class TestValgrindBannerTitle:
     """The valgrind runner prepends a banner ('Valgrind error: Memcheck, a
     memory error detector') that every valgrind issue would share. The title
-    must surface the real diagnostic line instead (#91)."""
+    must surface the real diagnostic line instead."""
 
     def test_title_uses_diagnostic_not_banner(self) -> None:
         error = (
@@ -885,7 +885,7 @@ class TestValgrindBannerTitle:
             "==6554==    at 0x4846828: malloc (...)\n"
         )
         f = UniqueFailure(
-            test_name="", test_file="tests/unit/dummy-memory.tcl",
+            test_name="", test_file="tests/unit/other.tcl",
             failure_type=FailureType.VALGRIND, error=error,
             jobs=[JobReference(job="j", suite="s", url="u")],
         )
@@ -910,7 +910,7 @@ class TestValgrindBannerTitle:
             "==6554==    by 0x1E8076: debugCommand (debug.c:569)\n"
         )
         f = UniqueFailure(
-            test_name="", test_file="tests/unit/dummy-memory.tcl",
+            test_name="", test_file="tests/unit/other.tcl",
             failure_type=FailureType.VALGRIND, error=error,
             jobs=[JobReference(job="j", suite="s", url="u")],
         )
@@ -931,7 +931,7 @@ class TestValgrindBannerTitle:
                 f"==6554==    by 0x1E8076: {site_func} ({site_loc})\n"
             )
             return UniqueFailure(
-                test_name="", test_file="tests/unit/dummy-memory.tcl",
+                test_name="", test_file="tests/unit/other.tcl",
                 failure_type=FailureType.VALGRIND, error=error,
                 jobs=[JobReference(job="j", suite="s", url="u")],
             )
@@ -1024,7 +1024,7 @@ class TestValgrindBannerTitle:
             "SUMMARY: AddressSanitizer: 41 byte(s) leaked in 1 allocation(s).\n"
         )
         f = UniqueFailure(
-            test_name="", test_file="tests/unit/dummy-memory.tcl",
+            test_name="", test_file="tests/unit/other.tcl",
             failure_type=FailureType.SANITIZER, error=error,
             jobs=[JobReference(job="j", suite="s", url="u")],
         )
@@ -1087,7 +1087,7 @@ class TestStartupFailureTitle:
             f"CONFIGURATION:\n{config}\nERROR:\n{reason}"
         )
         return UniqueFailure(
-            test_name="", test_file="tests/unit/dummy-startup.tcl",
+            test_name="", test_file="tests/unit/introspection.tcl",
             failure_type=FailureType.STARTUP, error=error,
             jobs=[JobReference(job="j", suite="s", url="u")],
         )
@@ -1238,7 +1238,7 @@ class TestValgrindRecurrenceStaysQuiet:
         """
         def report(footprint: str) -> str:
             return (
-                "Check for memory leaks in tests/unit/dummy-memory.tcl\n"
+                "Check for memory leaks in tests/unit/other.tcl\n"
                 f"Physical footprint:         {footprint}\n"
                 f"Physical footprint (peak):  {footprint}\n"
                 "Process 9761: 1 leak for 48 total leaked bytes.\n"
@@ -1295,11 +1295,11 @@ class TestTraceTruncation:
 class TestExceptionTitle:
     """Uncaught test-client exceptions arrive wrapped in the runner's
     "Executing test client: <message>" prefix. The title must surface the
-    message, not the wrapper (#116)."""
+    message, not the wrapper."""
 
     def _failure(self, error: str) -> UniqueFailure:
         return UniqueFailure(
-            test_name="", test_file="tests/unit/dummy-exception.tcl",
+            test_name="", test_file="tests/unit/networking.tcl",
             failure_type=FailureType.EXCEPTION, error=error,
             jobs=[JobReference(job="j", suite="s", url="u")],
         )
@@ -1307,7 +1307,7 @@ class TestExceptionTitle:
     def test_strips_executing_test_client_prefix(self) -> None:
         error = (
             " Executing test client: Intentional runtime exception for detector testing.\n"
-            " in error at tests/unit/dummy-exception.tcl:12\n"
+            " in error at tests/unit/networking.tcl:12\n"
             " in test at tests/support/test.tcl:262\n"
         )
         title = title_for(self._failure(error))
@@ -1328,7 +1328,7 @@ class TestExceptionTitle:
 
 def _macos_leaks_error(pid: int, leaks: int, leaked_bytes: int, address: str) -> str:
     """A macOS /usr/bin/leaks failure blob as recorded in the artifact
-    (real shape from valkey-io Daily run 29461435670, test-macos-latest)."""
+    (the real shape emitted by /usr/bin/leaks on the macOS jobs)."""
     return (
         f" Check for memory leaks (pid {pid}) in tests/unit/multi.tcl\n"
         f"Expected '*0 leaks*' to equal or match 'Process:         valkey-server [{pid}]\n"
@@ -1350,7 +1350,7 @@ def _macos_leaks_error(pid: int, leaks: int, leaked_bytes: int, address: str) ->
 class TestMacosLeaksTitle:
     """macOS /usr/bin/leaks failures (the memory-leak type). Their first line
     is the Tcl test name with a volatile PID; the title must surface the
-    report's totals line instead (#92)."""
+    report's totals line instead."""
 
     def _failure(self, error: str) -> UniqueFailure:
         return UniqueFailure(
@@ -1551,8 +1551,11 @@ class TestCrossToolMerge:
         merged = _merge_same_fingerprint_failures([vg, asan])
         assert len(merged) == 1
         survivor = merged[0]
-        assert [label for label, _ in survivor.extra_traces] == ["Sanitizer"]
-        assert survivor.extra_traces[0][1] == _ASAN_USE_AFTER_FREE
+        # The survivor is chosen by type, not by artifact order, so the absorbed
+        # trace is the valgrind one regardless of which job came first.
+        assert survivor.failure_type == FailureType.SANITIZER
+        assert [label for label, _ in survivor.extra_traces] == ["Valgrind"]
+        assert survivor.extra_traces[0][1] == _VG_USE_AFTER_FREE
         assert {j.job for j in survivor.jobs} == {"test-valgrind", "test-sanitizer-address"}
 
     def test_merge_is_independent_of_processing_order(self) -> None:
@@ -1571,7 +1574,15 @@ class TestCrossToolMerge:
         forward = merge([vg, asan])
         vg2, asan2 = pair()
         reverse = merge([asan2, vg2])
-        assert len(forward.extra_traces) == len(reverse.extra_traces) == 1
+        # The published title comes from the survivor and the publisher
+        # re-titles on every update, so an order-dependent survivor made one
+        # issue alternate between the two tools' wording run to run.
+        assert title_for(forward) == title_for(reverse)
+        assert forward.failure_type == reverse.failure_type
+        assert (
+            [label for label, _ in forward.extra_traces]
+            == [label for label, _ in reverse.extra_traces]
+        )
         assert {j.job for j in forward.jobs} == {j.job for j in reverse.jobs}
 
     def test_same_tool_twice_does_not_duplicate_the_trace(self) -> None:
@@ -1950,3 +1961,177 @@ class TestBodyShapeMatchesLegacyAcrossTypes:
         assert "- CI link(s):\n    - `job-a`: [CI link](https://example.com/a)" in body
         assert "    - `job-b`: [CI link](https://example.com/b)" in body
         assert "\n- `job-a`" not in body
+
+
+class TestMergedBodyFitsGitHubLimit:
+    """GitHub rejects a body over 65536 characters with a 422.
+
+    A merged failure renders one trace per tool, so a per-trace cap sized for a
+    single trace let two oversized traces exceed the limit on their own. The
+    create call was rejected, which meant the bug both tools found was the one
+    that got no issue.
+    """
+
+    _GITHUB_BODY_LIMIT = 65536
+
+    def _frames(self, count: int, sanitizer: bool) -> str:
+        if sanitizer:
+            return "".join(
+                f"    #{i} 0x55ba1234 in someFunctionName{i} "
+                f"/home/runner/work/valkey/valkey/src/somefile{i}.c:{i}:9\n"
+                for i in range(count)
+            )
+        return "".join(
+            f"==6554==    by 0x1E80{i:02d}: someFunctionName{i} "
+            f"(src/somefile{i}.c:{i})\n"
+            for i in range(count)
+        )
+
+    def _merged(self, frame_count: int) -> UniqueFailure:
+        vg = _memory_failure(
+            FailureType.VALGRIND,
+            "==6554== 49 bytes in 1 blocks are definitely lost\n"
+            + self._frames(frame_count, sanitizer=False),
+            "test-valgrind",
+        )
+        asan = _memory_failure(
+            FailureType.SANITIZER,
+            "==1==ERROR: LeakSanitizer: detected memory leaks\n"
+            + self._frames(frame_count, sanitizer=True),
+            "test-sanitizer-address",
+        )
+        return _merge_same_fingerprint_failures([vg, asan])[0]
+
+    def test_two_oversized_traces_fit(self) -> None:
+        for frame_count in (400, 800, 4000):
+            body = _build_body(self._merged(frame_count), marker="<!-- m -->", occurrences=1)
+            assert len(body) <= self._GITHUB_BODY_LIMIT, (
+                f"{frame_count} frames per tool rendered {len(body)} characters"
+            )
+
+    def test_both_traces_still_present_when_truncated(self) -> None:
+        body = _build_body(self._merged(4000), marker="<!-- m -->", occurrences=1)
+        assert body.count("<details>") == 2
+        assert "definitely lost" in body
+        assert "LeakSanitizer" in body
+        assert "trace truncated by Test Failure Detector" in body
+
+    def test_a_trace_of_backticks_cannot_inflate_the_body(self) -> None:
+        """The fence grows to out-run backtick runs in the text and is written
+        twice per block, so an unbounded one multiplied the body past the
+        limit."""
+        bomb = "`" * 40_000
+        vg = _memory_failure(FailureType.VALGRIND, bomb, "test-valgrind")
+        asan = _memory_failure(FailureType.SANITIZER, bomb, "test-sanitizer-address")
+        merged = _merge_same_fingerprint_failures([vg, asan])[0]
+        body = _build_body(merged, marker="<!-- m -->", occurrences=1)
+        assert len(body) <= self._GITHUB_BODY_LIMIT
+
+    def test_a_comment_of_backticks_cannot_inflate_the_comment(self) -> None:
+        renderer = renderer_for(
+            _memory_failure(FailureType.VALGRIND, "`" * 40_000, "test-valgrind")
+        )
+        renderer._new_error = "`" * 40_000
+        comment = renderer.render("<!-- m -->", 2).comment
+        assert len(comment) <= self._GITHUB_BODY_LIMIT
+
+
+class TestAbsorbedTraceReachesTheIssue:
+    """A tool's report must not be lost when its issue already exists.
+
+    The publisher's update path writes the body it was handed by
+    body_transform, not the freshly rendered one, so a trace added to the render
+    never reaches an existing issue. The comment is the only channel that path
+    publishes, and the recurrence check considered only the surviving failure's
+    own trace, so the absorbed tool's report went nowhere at all.
+    """
+
+    def _valgrind_only_body(self) -> str:
+        return _build_body(
+            _memory_failure(FailureType.VALGRIND, _VG_USE_AFTER_FREE, "test-valgrind"),
+            marker="<!-- m -->", occurrences=1,
+        )
+
+    def _merged(self) -> UniqueFailure:
+        vg = _memory_failure(FailureType.VALGRIND, _VG_USE_AFTER_FREE, "test-valgrind")
+        asan = _memory_failure(
+            FailureType.SANITIZER, _ASAN_USE_AFTER_FREE, "test-sanitizer-address",
+        )
+        return _merge_same_fingerprint_failures([vg, asan])[0]
+
+    def test_absorbed_trace_is_reported_in_the_comment(self) -> None:
+        renderer = renderer_for(self._merged())
+        renderer.merge_environments(self._valgrind_only_body())
+        comment = renderer.render("<!-- m -->", 2).comment
+        assert "heap-use-after-free" in comment
+        assert "Sanitizer trace:" in comment
+
+    def test_a_trace_the_issue_already_stores_is_not_repeated(self) -> None:
+        renderer = renderer_for(self._merged())
+        renderer.merge_environments(self._valgrind_only_body())
+        comment = renderer.render("<!-- m -->", 2).comment
+        assert "Invalid read of size 4" not in comment
+
+    def test_the_same_trace_is_not_reported_on_every_later_run(self) -> None:
+        """The body keeps only its first-seen trace, so without a record of what
+        was already published the comment would repeat every run."""
+        body = self._valgrind_only_body()
+        posted = []
+        for occurrence in range(2, 7):
+            renderer = renderer_for(self._merged())
+            body = renderer.merge_environments(body)
+            comment = renderer.render("<!-- m -->", occurrence).comment
+            posted.append("heap-use-after-free" in comment)
+        assert posted[0] is True
+        assert not any(posted[1:]), "absorbed trace was reported more than once"
+
+    def test_the_body_is_never_given_the_absorbed_trace(self) -> None:
+        body = self._valgrind_only_body()
+        for occurrence in range(2, 5):
+            renderer = renderer_for(self._merged())
+            body = renderer.merge_environments(body)
+            renderer.render("<!-- m -->", occurrence)
+        assert "heap-use-after-free" not in body
+        assert body.count("<details>") == 0
+
+
+class TestForgedMarkersInTraceText:
+    """Trace text is producer-controlled and embedded in the body verbatim.
+
+    The publisher finds an issue by searching a whole body for its marker, so a
+    report containing a marker-shaped comment would be read as claiming that
+    fingerprint, and an unrelated failure would be absorbed into its issue and
+    silently dropped.
+    """
+
+    def _failure_with_forged_marker(self) -> tuple[UniqueFailure, str]:
+        victim = _memory_failure(
+            FailureType.SANITIZER, _ASAN_USE_AFTER_FREE, "test-sanitizer-address",
+        )
+        forged = f"<!-- {marker_namespace_for(victim)}:{fingerprint_for(victim)} -->"
+        attacker = _memory_failure(
+            FailureType.SANITIZER,
+            _ASAN_USE_AFTER_FREE.replace("lookupKey", "unrelatedFunction") + forged,
+            "test-sanitizer-address",
+        )
+        return attacker, forged
+
+    def test_a_marker_in_trace_text_is_defused(self) -> None:
+        attacker, forged = self._failure_with_forged_marker()
+        body = _build_body(attacker, marker="<!-- real -->", occurrences=1)
+        assert forged not in body
+        assert "<!-- real -->" in body
+
+    def test_the_trace_is_still_readable(self) -> None:
+        attacker, _ = self._failure_with_forged_marker()
+        body = _build_body(attacker, marker="<!-- real -->", occurrences=1)
+        assert "unrelatedFunction" in body
+
+    def test_defusing_does_not_make_a_trace_look_new_every_run(self) -> None:
+        """The stored trace was defused when published, so the comparison has to
+        defuse too or the recurrence check would never match it."""
+        attacker, _ = self._failure_with_forged_marker()
+        body = _build_body(attacker, marker="<!-- real -->", occurrences=1)
+        renderer = renderer_for(attacker)
+        renderer.merge_environments(body)
+        assert "New error stack trace" not in renderer.render("<!-- real -->", 2).comment

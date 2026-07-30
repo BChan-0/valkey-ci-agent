@@ -6,7 +6,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from scripts.common.issue_dedup import IssueContent, IssueDedupPublisher
+from scripts.common.issue_dedup import (
+    IssueContent,
+    IssueDedupPublisher,
+    _fingerprint_marker_re,
+)
 
 NAMESPACE = "valkey-ci-agent:test"
 
@@ -621,3 +625,41 @@ def test_closed_lookback_custom_duration():
     assert closed_call.kwargs["since"] == datetime(
         2026, 7, 21, 6, 0, 0, tzinfo=timezone.utc,
     )
+
+
+class TestClaimGuardSpansSiblingNamespaces:
+    """An issue claimed under one namespace must look claimed to its siblings.
+
+    Namespaces are per-failure-type while titles are summarized and shared
+    across types, so a publisher that only recognized its own namespace's
+    marker would adopt a sibling's issue by title, retargeting its fingerprint
+    onto an unrelated bug and leaving its own failure unfiled.
+    """
+
+    def test_a_sibling_namespaces_claim_is_recognized(self) -> None:
+        body = "<!-- valkey-ci-agent:valgrind-error:abc123def456 -->\n**Summary**\n"
+        assert _fingerprint_marker_re("valkey-ci-agent:memory-error").search(body)
+
+    def test_own_namespaces_claim_is_recognized(self) -> None:
+        body = "<!-- valkey-ci-agent:memory-error:abc123def456 -->\n"
+        assert _fingerprint_marker_re("valkey-ci-agent:memory-error").search(body)
+
+    def test_bookkeeping_markers_are_not_claims(self) -> None:
+        """Only a fingerprint digest claims an issue. The occurrence counter and
+        idempotency key live in the same namespace and must not be mistaken for
+        one, or every issue would read as claimed."""
+        for marker in (
+            "<!-- valkey-ci-agent:memory-error:occurrences:3 -->",
+            # A workflow run id is all digits, so it satisfies the digest
+            # pattern; without excluding the key segment every updated issue
+            # would read as claimed.
+            "<!-- valkey-ci-agent:memory-error:last-key:30499308370 -->",
+            "<!-- valkey-ci-agent:memory-error:last-key:abc123def456 -->",
+            "<!-- valkey-ci-agent:reported-traces:Sanitizer,Valgrind -->",
+        ):
+            assert not _fingerprint_marker_re("valkey-ci-agent:memory-error").search(marker)
+
+    def test_an_unmarked_body_is_unclaimed(self) -> None:
+        assert not _fingerprint_marker_re("valkey-ci-agent:memory-error").search(
+            "**Summary**\nno markers here\n"
+        )

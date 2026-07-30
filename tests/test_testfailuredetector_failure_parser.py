@@ -567,7 +567,7 @@ class TestParseWithTypes:
 class TestVolatileTestNameDemotion:
     """Volatile test names (pid:NNN, hang) are runner-state artifacts, not real
     test identities. They must be demoted to nameless so every run with a
-    different PID does not mint a new issue (#82, #86)."""
+    different PID does not mint a new issue."""
 
     def test_pid_colon_number_demoted(self) -> None:
         data = {
@@ -999,7 +999,7 @@ class TestStartupFailureIdentity:
 def _leaks_blob(pid: int, root_site: str) -> str:
     """A macOS /usr/bin/leaks failure as the test proc reports it."""
     return (
-        f"Check for memory leaks (pid {pid}) in tests/unit/dummy-memory.tcl\n"
+        f"Check for memory leaks (pid {pid}) in tests/unit/other.tcl\n"
         f"Expected '*0 leaks*' to equal or match 'Process {pid}: 1 leak for 48 total leaked bytes.\n"
         f"leaks Report Version: 4.0\n"
         f"Process {pid}: 1 leak for 48 total leaked bytes.\n"

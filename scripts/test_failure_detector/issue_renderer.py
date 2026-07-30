@@ -211,42 +211,75 @@ class _FailureRenderer:
         """The ``body_transform`` callback: fold this failure's environments
         into the existing issue body, preserving environments recorded by
         earlier runs and recording which ones are newly failing.
+
+        Also records which tools' traces the issue has reported, so a trace
+        published in a comment is not published again on every later run. The
+        recorded traces are a marker, not content: the body's own trace section
+        is left as first published.
         """
         self._new_error = self._detect_new_error(existing_body)
-        existing_envs = _extract_environments_from_body(existing_body)
+        body = existing_body
+        if self._new_error is not None:
+            body = _record_reported_tools(body, _tool_labels_for(self._failure))
+        existing_envs = _extract_environments_from_body(body)
         self._newly_failing = [
             j.job for j in self._failure.jobs if j.job not in existing_envs
         ]
         if not self._newly_failing:
-            return existing_body
+            return body
         return _update_environments_in_body(
-            existing_body, existing_envs + self._newly_failing,
+            body, existing_envs + self._newly_failing,
         )
 
     def _detect_new_error(self, existing_body: str) -> str | None:
-        """Return the failure's error trace when it meaningfully differs from
-        every trace stored on the issue, else None.
+        """Return this run's traces that are not already recorded on the issue,
+        or None when it carries nothing new.
 
-        An issue can record a trace per tool (a valgrind and a sanitizer report
-        of one bug), and a recurrence brings only one tool's. Matching any
-        stored trace means this run says nothing new; matching none means it
-        does, whether because the trace changed or because this tool's trace is
-        not on the issue yet. The body is never rewritten to add it, so the
-        comment is the only place it appears.
+        Every trace the failure holds is considered, not just its own: a failure
+        that absorbed another tool's report carries both, and the absorbed one is
+        the whole point of the merge. The update path publishes only the body it
+        was given plus this comment, so a trace the issue lacks reaches a reader
+        here or not at all.
+
+        A trace matching any stored one says nothing new. One matching none is
+        new, whether because it changed or because that tool's report has not
+        appeared on this issue before.
         """
-        # The stored traces were truncated when published, so the fresh trace
-        # must be compared in its truncated form too, or every recurrence of
-        # an oversized trace would register as a new error.
-        new_error = _truncate_trace(self._failure.error)
-        if not new_error.strip():
-            return None
-        stored = [t for t in _extract_errors_from_body(existing_body) if t.strip()]
+        stored = [
+            _normalize_trace(t)
+            for t in _extract_errors_from_body(existing_body)
+            if t.strip()
+        ]
         if not stored:
             return None
-        normalized_new = _normalize_trace(new_error)
-        if any(_normalize_trace(t) == normalized_new for t in stored):
+
+        # A tool whose trace was already published in an earlier comment is not
+        # published again: the body keeps only its first-seen trace, so without
+        # this the same comment would repeat on every later run.
+        reported = _reported_tools_in_body(existing_body)
+        traces = [
+            (trace_label_for(self._failure), self._failure.error),
+            *self._failure.extra_traces,
+        ]
+        budget = _MAX_TRACE_CHARS // len(traces)
+        fresh: list[str] = []
+        for label, trace in traces:
+            if label in reported:
+                continue
+            # The stored traces were truncated when published, so a fresh trace
+            # must be compared in its truncated form too, or every recurrence of
+            # an oversized trace would register as new.
+            candidate = _truncate_trace(trace, budget)
+            if not candidate.strip():
+                continue
+            if _normalize_trace(candidate) in stored:
+                continue
+            fresh.append(
+                candidate if len(traces) == 1 else f"{label} trace:\n{candidate}"
+            )
+        if not fresh:
             return None
-        return new_error
+        return "\n\n".join(fresh)
 
 
 # Keywords that mark a line as carrying diagnostic content rather than
@@ -585,7 +618,22 @@ def trace_label_for(failure: UniqueFailure) -> str:
     return failure.failure_type.value.replace("-", " ").title()
 
 
+# An HTML comment opener inside trace text. The dedup machinery finds an issue
+# by searching its whole body for a marker, and the body embeds a tool's report
+# verbatim, so a report that happens to contain a marker-shaped comment would be
+# read as one. Defusing the opener keeps the trace readable while making it inert
+# to that search. Applied to the trace only, never to a marker this module
+# writes itself.
+_HTML_COMMENT_OPEN_RE = re.compile(r"<!--")
+
+
+def _defuse_markers(trace: str) -> str:
+    """Make marker-shaped comments in tool output inert."""
+    return _HTML_COMMENT_OPEN_RE.sub("<! --", trace)
+
+
 def _fenced(text: str) -> list[str]:
+    text = _defuse_markers(text)
     fence = _fence_for(text)
     return [fence, text, fence]
 
@@ -597,19 +645,26 @@ def _render_traces(failure: UniqueFailure) -> list[str]:
     the same bug their traces are each collapsed behind a summary naming the
     tool: together they are long enough to bury the rest of the issue, and a
     reader usually wants only the one from the tool they are debugging.
+
+    The per-trace budget is divided by the number of traces, so adding a second
+    tool's report cannot push the body past the size GitHub accepts. Without
+    that, two traces at the single-trace cap exceeded the limit on their own and
+    the create call was rejected, leaving the bug both tools found as the one
+    with no issue at all.
     """
-    own_label = trace_label_for(failure)
-    own_trace = _truncate_trace(failure.error) or "N/A"
-    if not failure.extra_traces:
-        return _fenced(own_trace)
+    traces = [(trace_label_for(failure), failure.error), *failure.extra_traces]
+    budget = _MAX_TRACE_CHARS // len(traces)
+    if len(traces) == 1:
+        label, trace = traces[0]
+        return _fenced(_truncate_trace(trace, budget) or "N/A")
 
     blocks: list[str] = []
-    for label, trace in [(own_label, own_trace), *failure.extra_traces]:
+    for label, trace in traces:
         blocks.extend([
             "<details>",
             f"<summary>{label} trace</summary>",
             "",
-            *_fenced(_truncate_trace(trace) or "N/A"),
+            *_fenced(_truncate_trace(trace, budget) or "N/A"),
             "",
             "</details>",
             "",
@@ -625,26 +680,41 @@ def _fence_for(text: str) -> str:
     close the block early (and the round-trip in _extract_error_from_body
     would return a truncated trace, triggering a spurious new-error comment
     on every recurrence).
+
+    A trace can itself be a long run of backticks, so the length is clamped:
+    the fence is written twice per block, and an unbounded one multiplied the
+    body past the size GitHub accepts on its own. At the clamp the fence can no
+    longer out-run the text, but the text is truncated well below it, so a run
+    long enough to reach the clamp cannot survive to be rendered.
     """
     longest = max((len(m.group()) for m in re.finditer(r"`+", text)), default=0)
-    return "`" * max(3, longest + 1)
+    return "`" * min(max(3, longest + 1), _MAX_FENCE_CHARS)
 
 
 # GitHub rejects issue bodies and comments over 65536 characters. A full
 # valgrind or sanitizer log can be several times that; the create call would
-# 422 and the failure would never get an issue. The cap leaves ample room for
-# the surrounding body (markers, links, environments). Head and tail are both
-# kept: the head names the error, the tail holds the summary totals.
+# 422 and the failure would never get an issue. This is the budget for all of a
+# body's traces together, divided among them, so it leaves room for the
+# surrounding body (markers, links, environments) no matter how many tools
+# reported the bug.
 _MAX_TRACE_CHARS = 40_000
+
+# Longest code fence that may be emitted. See _fence_for: the fence grows to
+# out-run backtick runs in the text, and is written twice per block.
+_MAX_FENCE_CHARS = 64
 
 _TRUNCATION_NOTICE = "\n... [trace truncated by Test Failure Detector] ...\n"
 
 
-def _truncate_trace(trace: str) -> str:
-    """Cap a trace to fit a GitHub issue body, keeping its head and tail."""
-    if len(trace) <= _MAX_TRACE_CHARS:
+def _truncate_trace(trace: str, budget: int = _MAX_TRACE_CHARS) -> str:
+    """Cap a trace to *budget* characters, keeping its head and tail.
+
+    Head and tail are both kept: the head names the error, the tail holds the
+    summary totals.
+    """
+    if len(trace) <= budget:
         return trace
-    keep = (_MAX_TRACE_CHARS - len(_TRUNCATION_NOTICE)) // 2
+    keep = max(0, (budget - len(_TRUNCATION_NOTICE)) // 2)
     return f"{trace[:keep]}{_TRUNCATION_NOTICE}{trace[-keep:]}"
 
 
@@ -669,6 +739,34 @@ def _build_comment(
         lines.append(f"\n**New error stack trace**\n\n{fence}\n{new_error}\n{fence}")
     lines.append(f"\n**Failed in:**\n{ci_links}")
     return "\n".join(lines)
+
+
+# Tools whose traces this issue has already published, recorded so a trace sent
+# in a comment is not sent again on every later run. A marker rather than prose:
+# it must survive a maintainer editing the body, and it carries no content.
+_REPORTED_TOOLS_MARKER = "valkey-ci-agent:reported-traces"
+_REPORTED_TOOLS_RE = re.compile(
+    rf"<!-- {re.escape(_REPORTED_TOOLS_MARKER)}:([^>]*) -->"
+)
+
+
+def _reported_tools_in_body(body: str) -> set[str]:
+    """Tool labels whose traces the issue has already reported."""
+    match = _REPORTED_TOOLS_RE.search(body)
+    if not match:
+        return set()
+    return {part.strip() for part in match.group(1).split(",") if part.strip()}
+
+
+def _record_reported_tools(body: str, labels: list[str]) -> str:
+    """Add *labels* to the issue's record of reported traces."""
+    recorded = _reported_tools_in_body(body) | set(labels)
+    marker = (
+        f"<!-- {_REPORTED_TOOLS_MARKER}:{','.join(sorted(recorded))} -->"
+    )
+    if _REPORTED_TOOLS_RE.search(body):
+        return _REPORTED_TOOLS_RE.sub(marker, body, count=1)
+    return f"{body}\n{marker}"
 
 
 def _extract_environments_from_body(body: str) -> list[str]:
@@ -738,7 +836,13 @@ _TRACE_NOISE_RES = (
 
 
 def _normalize_trace(text: str) -> str:
-    """Normalize a trace for comparison by scrubbing run-specific noise."""
+    """Normalize a trace for comparison by scrubbing run-specific noise.
+
+    Defusing runs here too: the stored trace was defused when published, so a
+    fresh trace must be compared in the same form or a report carrying a
+    marker-shaped comment would look new on every recurrence.
+    """
+    text = _defuse_markers(text)
     for noise in _TRACE_NOISE_RES:
         text = noise.sub("", text)
     return " ".join(scrub_volatile_tokens(text).split())

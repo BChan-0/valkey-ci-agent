@@ -377,14 +377,26 @@ def _occurrence_re(namespace: str) -> re.Pattern[str]:
 
 
 def _fingerprint_marker_re(namespace: str) -> re.Pattern[str]:
-    """A namespaced fingerprint marker regex: ``<!-- <ns>:<hex> -->``.
+    """A fingerprint marker regex: ``<!-- <ns>:<hex> -->``.
 
     Matches only the hex digest written by ``compute_fingerprint``, so it does
     not collide with the namespace's other markers (``occurrences``,
     ``last-key``) or with a legacy marker in some older, non-hex format;
     those must stay adoptable by title.
+
+    The namespace's own prefix up to its last segment is matched rather than the
+    namespace itself, so an issue claimed under a sibling namespace still reads
+    as claimed. One publisher must not adopt another's issue by title: the
+    namespaces are per-failure-type and titles are summarized and shared across
+    types, so a title collision across two of them would retarget this
+    fingerprint onto an unrelated bug's issue and leave this failure unfiled.
+
+    The segment before the digest must not itself contain a colon, which is what
+    keeps ``last-key`` out: a workflow run id is all digits, so it satisfies the
+    digest pattern and would otherwise make every updated issue read as claimed.
     """
-    return re.compile(rf"<!-- {re.escape(namespace)}:([0-9a-f]{{8,}}) -->")
+    prefix = namespace.rsplit(":", 1)[0] if ":" in namespace else namespace
+    return re.compile(rf"<!-- {re.escape(prefix)}:[^\s:>]*:?([0-9a-f]{{8,}}) -->")
 
 
 def _last_key_marker(namespace: str, key: str) -> str:

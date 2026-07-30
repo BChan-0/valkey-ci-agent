@@ -43,10 +43,16 @@ def _merge_same_fingerprint_failures(
     A merge across tools (a valgrind and a sanitizer report of one bug) also
     carries the absorbed failure's trace onto the survivor, so the issue shows
     what each tool said rather than only whichever was processed first.
+
+    Failures are ordered by type before merging, so which one survives does not
+    depend on the order the jobs appear in the artifact. The survivor supplies
+    the issue title, and the publisher re-titles on every update, so an
+    order-dependent survivor made one issue's title alternate between the two
+    tools' wording from run to run.
     """
     merged: dict[str, UniqueFailure] = {}
     unmergeable: list[UniqueFailure] = []
-    for failure in failures:
+    for failure in sorted(failures, key=lambda f: f.failure_type.value):
         try:
             fingerprint = issue_renderer.fingerprint_for(failure)
         except Exception:

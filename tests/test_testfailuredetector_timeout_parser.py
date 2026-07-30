@@ -170,7 +170,7 @@ class TestParseTimeoutsFromLog:
 
     def test_volatile_pid_name_demoted(self) -> None:
         """Log-recovered timeout with a volatile PID name gets demoted to
-        nameless so it produces a stable fingerprint (#82, #86)."""
+        nameless so it produces a stable fingerprint."""
         log = b"[TIMEOUT]: pid:92663 in tests/integration/replication.tcl\n"
         results = parse_timeouts_from_log(log, "job")
         assert len(results) == 1
