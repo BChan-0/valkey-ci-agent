@@ -361,7 +361,15 @@ _LEAKS_TOTAL_RE = re.compile(
 # in sdsnewlen 0x600001d1c100>"). A leaks blob has no stack frames, so this is
 # the only thing in it that says which code path leaked, and the identity keys
 # on it for the same reason.
-_LEAKS_ROOT_SITE_RE = re.compile(r"ROOT LEAK:\s*<[^>]*?\bin\s+(?P<func>\S+)")
+# Anchored on the allocation line's leading count ("1 (64 bytes) ROOT LEAK:").
+# With stack logging enabled the report also prints a heading that quotes the
+# same text ("STACK OF 1 INSTANCE OF 'ROOT LEAK: <malloc in _sdsnewlen>':"), and
+# an unanchored match took the function from there, carrying the heading's
+# trailing quote into the title.
+_LEAKS_ROOT_SITE_RE = re.compile(
+    r"^\s*\d+\s+\([^)]*\)\s+ROOT LEAK:\s*<[^>]*?\bin\s+(?P<func>[^\s>]+)",
+    re.MULTILINE,
+)
 
 
 # Root sites named in a title before it is cut short. A report with more sites

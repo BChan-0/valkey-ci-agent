@@ -127,7 +127,13 @@ _VOLATILE_COUNT_PATTERNS = (
 # that name the allocation site, so they are the identity anchor that keeps
 # two different leaks in the same test file as two issues. Addresses and
 # sizes around the symbol are scrubbed before this is applied.
-_ROOT_LEAK_RE = re.compile(r"ROOT LEAK:\s*(?P<site>[^\[]+)")
+# Anchored on the allocation line's leading count ("1 (48 bytes) ROOT LEAK:").
+# When the server runs with stack logging the report also prints a heading
+# quoting the same text ("STACK OF 1 INSTANCE OF 'ROOT LEAK: <...>':"), which an
+# unanchored match read as a second, differently-spelled site.
+_ROOT_LEAK_RE = re.compile(
+    r"^\s*\d+\s+\([^)]*\)\s+ROOT LEAK:\s*(?P<site>[^\[]+)", re.MULTILINE
+)
 
 # The startup blob's config dump: "Can't start <exe>\nCONFIGURATION:\n<full
 # config file>\nERROR:\n<reason>". The config is dozens of lines shared by
@@ -390,13 +396,13 @@ def stack_anchor(error: str) -> str:
     return _extract_stack_anchor(lines)
 
 
-# Frames nearest the bug used to match one bug across tools. Only the innermost
-# one: valgrind and the sanitizers unwind to different depths on the same stack
-# and the jobs build at different optimization levels, so any chain long enough
-# to include a caller disagrees between the two and never matches. That frame
-# carries its file and line (see _frame_anchor), which with the error class is
-# specific enough to identify the bug on its own.
-_CROSS_TOOL_ANCHOR_FRAMES = 1
+# Frames nearest the bug used to match one bug across tools. Two is the only
+# width that satisfies both constraints: valgrind and the sanitizers unwind to
+# different depths, so a longer chain disagrees between them and never matches,
+# while one frame alone merges two distinct bugs that allocate through a shared
+# constructor. Plumbing frames are dropped before this applies, so the two are
+# real code.
+_CROSS_TOOL_ANCHOR_FRAMES = 2
 
 
 def cross_tool_identity(

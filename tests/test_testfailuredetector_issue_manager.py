@@ -2522,3 +2522,71 @@ class TestCommentsUseOnlyTemplateWording:
         body = _build_body(self._merged(), marker="<!-- m -->", occurrences=1)
         for phrase in self._INVENTED:
             assert phrase not in body
+
+
+# The shape /usr/bin/leaks emits when the server runs with MallocStackLogging
+# enabled, captured from a macos-latest runner. The heading quotes the same
+# "ROOT LEAK: <...>" text as the allocation line below it, so a pattern that
+# does not anchor on the allocation line's leading count reads the heading and
+# carries its trailing quote into the identity and the title.
+_SYMBOLICATED_LEAKS_REPORT = """\
+leaks Report Version: 4.0, multi-line stacks
+Process 17415: 14782 nodes malloced for 1552 KB
+Process 17415: 1 leak for 64 total leaked bytes.
+
+STACK OF 1 INSTANCE OF 'ROOT LEAK: <malloc in _sdsnewlen>':
+3   valkey-server                         0x100416628 call + 992
+2   valkey-server                         0x10031ac18 debugCommand + 2592
+1   valkey-server                         0x1003ebe9c _sdsnewlen + 168
+0   libsystem_malloc.dylib                0x18b4a4178 _malloc_zone_malloc + 152
+====
+    1 (64 bytes) ROOT LEAK: <malloc in _sdsnewlen 0xa1cc41080> [64]
+"""
+
+
+class TestSymbolicatedMacosLeaksReport:
+    """A symbolicated macOS leaks report keys on its allocation site.
+
+    Verified against a macos-latest runner: with MallocStackLogging enabled the
+    report names the leaking function, which is what lets one leak be one issue
+    however many test files expose it. Without it the roots are bare addresses
+    and the file becomes the identity instead.
+    """
+
+    def _failure(self, test_file: str) -> UniqueFailure:
+        return UniqueFailure(
+            test_name="", test_file=test_file,
+            failure_type=FailureType.MEMORY_LEAK,
+            error=(
+                f"Check for memory leaks (pid 17415) in {test_file}\n"
+                f"{_SYMBOLICATED_LEAKS_REPORT}"
+            ),
+            jobs=[JobReference(job="test-macos-latest", suite="valkey", url="u")],
+        )
+
+    def test_the_title_names_the_leaking_function(self) -> None:
+        assert title_for(self._failure("tests/unit/other.tcl")) == (
+            "[TEST-FAILURE] Leaked memory in _sdsnewlen"
+        )
+
+    def test_the_heading_does_not_leak_into_the_title(self) -> None:
+        """The heading ends in "'>':", which an unanchored match carried over."""
+        title = title_for(self._failure("tests/unit/other.tcl"))
+        assert ">" not in title
+        assert "'" not in title
+        assert "STACK OF" not in title
+
+    def test_one_leak_is_one_issue_across_test_files(self) -> None:
+        """The file is not identity once the report names a site, so a leak in
+        shared code does not become an issue per file that exposes it."""
+        first = self._failure("tests/unit/dump.tcl")
+        second = self._failure("tests/unit/geo.tcl")
+        assert fingerprint_for(first) == fingerprint_for(second)
+        assert title_for(first) == title_for(second)
+        assert "tests/unit" not in title_for(first)
+
+    def test_the_identity_names_the_site_once(self) -> None:
+        identity = normalize_error_identity(
+            self._failure("tests/unit/other.tcl").error
+        )
+        assert identity.count("_sdsnewlen") == 1
