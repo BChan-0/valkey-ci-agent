@@ -29,10 +29,29 @@ class FailureType(str, Enum):
     UNITTEST = "unittest"
 
 
+# The datestamp a server log line opens with, in either of the two shapes the
+# server emits: "943:C 29 Jul 04:15:32.117" and "2026-07-29 04:15:32.117". None
+# of it has a run of four digits for the bare-number pattern below to catch, so
+# without this a startup failure whose reason is a log line (the runner hands
+# over the whole log when the server never came up) gets a fresh identity, and a
+# fresh issue, every night.
+#
+# Exported: the title has to scrub at least what the identity does, or one issue
+# is retitled on every recurrence.
+TIMESTAMP_PATTERNS = (
+    re.compile(r"\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?"),
+    # A log line's "<pid>:<role> <day> <month> <clock>" prefix.
+    re.compile(
+        r"\b\d+:[A-Za-z]\s+\d{1,2}\s+[A-Z][a-z]{2}\s+\d{1,2}:\d{2}:\d{2}(?:\.\d+)?"
+    ),
+    re.compile(r"\b\d{1,2}:\d{2}:\d{2}(?:\.\d+)?\b"),
+)
+
 # Patterns stripped from error text to produce a stable identity across runs.
 _VOLATILE_PATTERNS = (
     # ANSI escape codes
     re.compile(r"\033\[[0-9;]*m"),
+    *TIMESTAMP_PATTERNS,
     # Valgrind PID annotations: ==12345==
     re.compile(r"==\d+==\s*"),
     # Hex addresses: 0xDEADBEEF
@@ -233,6 +252,9 @@ _CLASS_BUFFER_OVERFLOW = "buffer-overflow"
 _CLASS_UNINITIALIZED = "uninitialized"
 _CLASS_INVALID_FREE = "invalid-free"
 _CLASS_RUNTIME_ERROR = "runtime-error"
+# A null or wild pointer: the address was never a heap block. Distinct from a
+# use after free, and from an overflow of a real block.
+_CLASS_WILD_POINTER = "wild-pointer"
 
 # Sanitizer diagnostics name their class outright, so a substring is enough.
 # Ordered: the longer, more specific names come first so "use-after-poison" is
@@ -270,6 +292,15 @@ _VALGRIND_CLASS_TOKENS: tuple[tuple[str, str], ...] = (
 
 _VALGRIND_ACCESS_RE = re.compile(r"\bInvalid (?:read|write)\b")
 
+# Valgrind's address descriptions. The unallocated form has to be tested first:
+# it contains the word "free'd" while meaning the address was never a heap
+# block, so matching on that word alone files a null dereference as a use after
+# free and merges it into an unrelated bug's issue.
+_VALGRIND_UNALLOCATED_RE = re.compile(
+    r"is not stack'd, malloc'd or \(recently\) free'd"
+)
+_VALGRIND_FREED_RE = re.compile(r"\bfree'd\b")
+
 # Valgrind's address description follows the offending access and its stack,
 # and is the only thing distinguishing a use-after-free ("... free'd") from an
 # overflow ("... after a block of size N alloc'd"). It appears within a few
@@ -285,11 +316,53 @@ def _valgrind_access_class(lines: list[str], start: int) -> str | None:
     keeps the failure on its per-tool identity rather than guessing a class.
     """
     for line in lines[start + 1 : start + 1 + _VALGRIND_ADDRESS_LOOKAHEAD]:
-        if "free'd" in line:
+        # "not stack'd, malloc'd or (recently) free'd" contains "free'd" but
+        # means the opposite: the address was never a heap block at all, which
+        # is a null or wild pointer rather than a use after free.
+        if _VALGRIND_UNALLOCATED_RE.search(line):
+            return _CLASS_WILD_POINTER
+        if _VALGRIND_FREED_RE.search(line):
             return _CLASS_USE_AFTER_FREE
         if "after a block" in line or "before a block" in line:
             return _CLASS_BUFFER_OVERFLOW
     return None
+
+
+def _classified_diagnostics(
+    error: str, failure_type: FailureType,
+) -> list[tuple[str, int]]:
+    """Every classifiable diagnostic in *error*, as ``(class, line index)``.
+
+    The index is where the diagnostic was found, so a caller can take the stack
+    that belongs to it rather than whichever stack comes first in the buffer.
+    """
+    if failure_type == FailureType.VALGRIND:
+        tokens = _VALGRIND_CLASS_TOKENS
+    elif failure_type == FailureType.SANITIZER:
+        tokens = _SANITIZER_CLASS_TOKENS
+    else:
+        return []
+
+    found: list[tuple[str, int]] = []
+    lines = [line.strip() for line in scrub_volatile_tokens(error).split("\n")]
+    for index, line in enumerate(lines):
+        if not line or any(bp in line for bp in _BOILERPLATE_SUBSTRINGS):
+            continue
+        matched = next((cls for token, cls in tokens if token in line), None)
+        if matched is None and failure_type == FailureType.VALGRIND:
+            if _VALGRIND_ACCESS_RE.search(line):
+                matched = _valgrind_access_class(lines, index)
+        if matched is not None:
+            found.append((matched, index))
+    return found
+
+
+def _classified_diagnostic(
+    error: str, failure_type: FailureType,
+) -> tuple[str, int] | None:
+    """The first classifiable diagnostic, or None when there is none."""
+    found = _classified_diagnostics(error, failure_type)
+    return found[0] if found else None
 
 
 def error_class(error: str, failure_type: FailureType) -> str | None:
@@ -298,32 +371,12 @@ def error_class(error: str, failure_type: FailureType) -> str | None:
     Only valgrind and sanitizer errors are classified; every other type keeps
     its own identity and never participates in a cross-tool merge.
 
-    The report is scanned in order and the first line that maps wins, because
-    the runner hands over the tool's whole stderr buffer: a report opened by an
-    invalid access also carries a leak summary at exit, and the class has to
-    describe the same error the stack anchor does (the first stack block).
-
     None is returned rather than a catch-all class whenever the vocabulary is
     unrecognized, so an unclassifiable report stays separate instead of
     merging on a guess.
     """
-    if failure_type == FailureType.VALGRIND:
-        tokens = _VALGRIND_CLASS_TOKENS
-    elif failure_type == FailureType.SANITIZER:
-        tokens = _SANITIZER_CLASS_TOKENS
-    else:
-        return None
-
-    lines = [line.strip() for line in scrub_volatile_tokens(error).split("\n")]
-    for index, line in enumerate(lines):
-        if not line or any(bp in line for bp in _BOILERPLATE_SUBSTRINGS):
-            continue
-        for token, cls in tokens:
-            if token in line:
-                return cls
-        if failure_type == FailureType.VALGRIND and _VALGRIND_ACCESS_RE.search(line):
-            return _valgrind_access_class(lines, index)
-    return None
+    classified = _classified_diagnostic(error, failure_type)
+    return None if classified is None else classified[0]
 
 
 def stack_anchor(error: str) -> str:
@@ -337,16 +390,83 @@ def stack_anchor(error: str) -> str:
     return _extract_stack_anchor(lines)
 
 
-# Frames nearest the bug used to match one bug across tools. Valgrind and the
-# sanitizers unwind to different depths on the same stack: on one observed leak
-# valgrind stopped at readQueryFromClient while the sanitizer continued two
-# frames further into the event loop, and the jobs also build at different
-# optimization levels, so the outer frames disagree on how far they reach.
-# Comparing whole chains therefore never matched a real pair. The frames closest
-# to the bug are the ones both tools agree on and the ones that identify it;
-# outer frames are the generic command/event-loop path shared by most of the
-# codebase, so they add little and cost every match.
-_CROSS_TOOL_ANCHOR_FRAMES = 3
+# Frames nearest the bug used to match one bug across tools. Only the innermost
+# one: valgrind and the sanitizers unwind to different depths on the same stack
+# and the jobs build at different optimization levels, so any chain long enough
+# to include a caller disagrees between the two and never matches. That frame
+# carries its file and line (see _frame_anchor), which with the error class is
+# specific enough to identify the bug on its own.
+_CROSS_TOOL_ANCHOR_FRAMES = 1
+
+
+def cross_tool_identity(
+    error: str, failure_type: FailureType,
+) -> tuple[str, str] | None:
+    """A valgrind/sanitizer report's ``(class, anchor)`` identity, or None.
+
+    Both halves are read from the same diagnostic, and a report whose
+    diagnostics disagree on the class is refused. A tool hands over its whole
+    stderr buffer, so a report can describe several errors, and there is then no
+    single bug for one identity to name: two distinct use-after-frees whose
+    buffers both opened with a shared uninitialised-value warning reduced to the
+    same identity, which collapsed them into one issue and discarded a report
+    entirely. Such a report keeps its per-tool identity instead.
+
+    Agreeing diagnostics are not refused. A leak report names its leak once per
+    loss record and again in the summary breakdown, so a single bug routinely
+    classifies several times; requiring exactly one match rejected every real
+    valgrind leak.
+
+    Returns None when no diagnostic classifies, when they disagree, or when the
+    first one has no stack.
+
+    Refusing a mixed buffer only keeps it out of the cross-tool pool. The
+    per-tool identity it falls back to anchors on the first stack block too, so
+    two such reports whose leading error is the same still group together; that
+    is the pre-existing granularity of normalize_error_identity, not something
+    the merge introduces.
+    """
+    diagnostics = _classified_diagnostics(error, failure_type)
+    if not diagnostics:
+        return None
+    if len({cls for cls, _ in diagnostics}) > 1:
+        return None
+    cls, index = diagnostics[0]
+
+    lines = [line.strip() for line in scrub_volatile_tokens(error).split("\n")]
+    # Take the stack that follows the classified diagnostic. Valgrind prints the
+    # frames under the diagnostic line; the sanitizers print a line or two of
+    # detail first, which _extract_stack_anchor skips over.
+    anchor = _extract_stack_anchor([line for line in lines[index:] if line])
+    if not anchor:
+        return None
+    frames = _leading_frames(anchor)
+    # A stripped build names no function, so every such report reduces to the
+    # same "??? > ???" chain and unrelated bugs would share one identity.
+    if not _names_any_symbol(frames):
+        return None
+    return cls, frames
+
+
+# A frame valgrind could not symbolicate. The chain is built from these when the
+# build carries no symbols, and they identify nothing.
+_UNSYMBOLICATED_FRAME = "???"
+
+
+def _names_any_symbol(anchor: str) -> bool:
+    """Whether *anchor* names at least one real function."""
+    _, _, chain = anchor.partition(": ")
+    return any(
+        frame.split(" (")[0] != _UNSYMBOLICATED_FRAME
+        for frame in chain.split(" > ")
+    )
+
+
+def _leading_frames(anchor: str) -> str:
+    """The leading :data:`_CROSS_TOOL_ANCHOR_FRAMES` frames of *anchor*."""
+    prefix, _, chain = anchor.partition(": ")
+    frames = chain.split(" > ")[:_CROSS_TOOL_ANCHOR_FRAMES]
+    return f"{prefix}: " + " > ".join(frames)
 
 
 def cross_tool_anchor(error: str) -> str:

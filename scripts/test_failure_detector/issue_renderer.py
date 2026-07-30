@@ -22,10 +22,10 @@ from datetime import datetime, timezone
 from scripts.common.incidents import compute_fingerprint
 from scripts.common.issue_dedup import IssueContent
 from scripts.test_failure_detector.parse_failures import (
+    TIMESTAMP_PATTERNS,
     FailureType,
     UniqueFailure,
-    cross_tool_anchor,
-    error_class,
+    cross_tool_identity,
     is_plumbing_frame,
     normalize_error_identity,
     scrub_volatile_tokens,
@@ -79,13 +79,7 @@ def _cross_tool_identity(failure: UniqueFailure) -> tuple[str, str] | None:
     """
     if failure.failure_type not in _CROSS_TOOL_TYPES:
         return None
-    cls = error_class(failure.error, failure.failure_type)
-    if cls is None:
-        return None
-    anchor = cross_tool_anchor(failure.error)
-    if not anchor:
-        return None
-    return cls, anchor
+    return cross_tool_identity(failure.error, failure.failure_type)
 
 
 def marker_namespace_for(failure: UniqueFailure) -> str:
@@ -103,9 +97,8 @@ def marker_namespace_for(failure: UniqueFailure) -> str:
 def label_for(failure: UniqueFailure) -> str:
     """Return the issue label. All failure types use the same label.
 
-    The title prefix ([SANITIZER], [VALGRIND], and so on) already names the
-    category, so one label keeps the tracker filter simple and needs no new
-    labels created on the target repo.
+    One label keeps the tracker filter simple and needs no new labels created on
+    the target repo. The type is named in the body instead.
     """
     return LABEL_NAME
 
@@ -113,41 +106,18 @@ def label_for(failure: UniqueFailure) -> str:
 def fingerprint_for(failure: UniqueFailure) -> str:
     """Stable dedup key for a failure.
 
-    For failures with a test_name: hash of (type_namespace, test_name, test_file).
-    The pair goes in ``namespace`` (joined in order, never normalized) rather
-    than ``shapes``, which keeps digits significant so PSYNC2 and PSYNC3 stay
-    distinct and preserves order so a name/file swap cannot collide.
+    Keyed on (test_name, test_file) when the failure names a test, on test_file
+    for a nameless timeout (every timeout shares one generic error text), on
+    (class, stack anchor) for a valgrind/sanitizer report with a cross-tool
+    identity, and on the normalized error otherwise.
 
-    For nameless timeouts: hash of (type_namespace, test_file). The error text
-    is always a generic "Test timed out" shared by all timeouts, so including
-    it would collapse unrelated timeouts in different files into one issue.
+    Identity components go in ``namespace``, never ``shapes``: shapes collapses
+    every run of digits, which would merge PSYNC2 with PSYNC3 and a
+    use-after-free at cluster_legacy.c:3421 with one at :5109.
 
-    For other nameless failures (sanitizer/valgrind/startup): hash of
-    (type_namespace, normalized_error). This means the same bug detected after
-    different test files produces the same fingerprint. The identity goes in
-    ``namespace`` for the same reason the pair above does: ``shapes`` replaces
-    every run of digits with "_", which would erase the source line numbers
-    that are the only thing telling two bugs in one function apart, collapsing
-    a use-after-free at cluster_legacy.c:3421 and one at :5109 into a single
-    issue. normalize_error_identity has already removed the volatile digits,
-    so the ones that survive to here are identity.
-
-    For a valgrind/sanitizer failure with a cross-tool identity: hash of
-    (shared_namespace, error_class, stack_anchor), so one bug reported by both
-    tools resolves to one fingerprint despite their reports sharing no text.
-
-    Known granularity limit: a macOS /usr/bin/leaks blob whose root-leak
-    lines are unsymbolicated (bare addresses, no site names) normalizes to
-    the boilerplate shared by every leak in that test file, so two such
-    distinct leaks collapse into one issue. Symbolicated roots stay distinct
-    via the root-site anchor in normalize_error_identity.
-
-    The cross-tool path has a matching limit in the other direction: it keys on
-    the frames nearest the bug (see cross_tool_anchor), so two same-class bugs
-    reached through those same frames but diverging further out hash together.
-    The outer frames cannot be included, since the two tools do not unwind to
-    the same depth on one stack. It is the accepted cost of matching across two
-    tools whose only common ground is the frame chain.
+    A report whose stack is entirely unsymbolicated has no identity to key on
+    and stays on its per-tool text, which for a macOS leaks blob is shared by
+    every leak in the test file.
     """
     ns = marker_namespace_for(failure)
 
@@ -290,9 +260,12 @@ _TITLE_KEYWORDS = (
     "Invalid", "definitely lost", "indirectly lost",
     "heap-buffer-overflow", "heap-use-after-free",
     "stack-buffer-overflow", "use-after-poison",
-    "uninitialized", "runtime error",
+    # Valgrind spells it the British way; the sanitizers do not.
+    "uninitialized", "uninitialised", "runtime error",
     "detected memory leaks", "LEAK SUMMARY",
     "fishy", "overlap", "Mismatched",
+    "possibly lost", "Jump to the invalid address",
+    "Process terminating with default action of signal",
 )
 
 
@@ -314,15 +287,25 @@ _COUNT_RE = re.compile(r"\b\d[\d,]*(\s+(?:bytes?|blocks?|byte\(s\)|object\(s\)))
 _ASAN_ADDR_NOISE_RE = re.compile(r"\s+on address 0x[0-9a-fA-F]+.*$")
 
 # Volatile run-specific tokens in generic title candidates: ports, PIDs, hex
-# addresses, temp paths, and long bare numbers. The fingerprint scrubs these
-# for identity, so one recurring failure keeps one issue; the title must scrub
-# them too, or the publisher rewrites the title with the new port/PID on every
-# recurrence. Leak titles are exempt: their sizes are triage signal and
-# refreshing them is intentional.
+# addresses, temp paths, timestamps, and long bare numbers. The publisher
+# re-titles on every update, so a token the fingerprint scrubs but the title
+# keeps rewrites one issue's title on each recurrence. Anything added to
+# scrub_volatile_tokens for identity needs a counterpart here.
 _TITLE_VOLATILE_SUBS: tuple[tuple[re.Pattern, str], ...] = (
     (re.compile(r"0x[0-9a-fA-F]+"), "0xN"),
     (re.compile(r"/tmp/[^\s:]+"), "/tmp/..."),
     (re.compile(r"\b(pid|port)([=\s]+)\d+", re.IGNORECASE), r"\1\2N"),
+    # The timestamps the identity drops, shared from there so the two cannot
+    # drift apart: a datestamp the title keeps but the identity scrubs retitles
+    # one issue on every recurrence.
+    *((pattern, "<time>") for pattern in TIMESTAMP_PATTERNS),
+    # The access width of a valgrind invalid read/write. The same bug reads as
+    # size 4 in one build and size 8 in another, and the identity scrubs it.
+    (re.compile(r"\b(Invalid (?:read|write) of size )\d+"), r"\1N"),
+    # The runner's absolute path to the server binary. It differs per platform
+    # ("/home/runner/..." on Linux, "/Users/runner/..." on macOS) while naming
+    # the same executable, and the identity reduces it to the basename.
+    (re.compile(r"(?:/[^\s/]+)*/(valkey-server|redis-server)\b"), r"\1"),
     (re.compile(r"\b\d{4,}\b"), "N"),
 )
 
@@ -383,13 +366,23 @@ def _leak_site(error: str) -> str:
     (debugCommand (debug.c:569)) rather than the allocator every leak passes
     through. Falls back to the first source frame when the whole stack is
     plumbing, so a title is never left empty.
+
+    Only the first stack is considered. A later stack belongs to a different
+    record, and taking a site from it made the title of one issue depend on what
+    else the tool happened to report in the same buffer.
     """
     first_source_site = ""
+    in_stack = False
     for line in error.split("\n"):
         line = re.sub(r"==\d+==\s*", "", line).strip()
         match = _SOURCE_FRAME_RE.match(line) or _SAN_SOURCE_FRAME_RE.match(line)
         if not match:
+            # Frames run consecutively, so the first non-blank non-frame line
+            # after one ends the block.
+            if in_stack and line:
+                break
             continue
+        in_stack = True
         source_path = match.group("file")
         source_file = source_path.rsplit("/", 1)[-1]
         func = match.group("func")
@@ -419,6 +412,37 @@ def _startup_reason(error: str) -> str:
     return startup_reason_from_lines([line.strip() for line in tail.split("\n")])
 
 
+# Longest error summary a title carries. GitHub truncates a title past 256
+# characters, which would leave the stored title unequal to the rendered one and
+# break the publisher's exact-match title fallback for good. This leaves room for
+# the prefix and an appended stack site.
+_MAX_SUMMARY_CHARS = 120
+
+
+def _title_text(summary: str) -> str:
+    """Scrub, collapse, and cap a summary for use in a title.
+
+    Newlines are collapsed because GitHub rewrites them in a title, which would
+    leave the stored title unequal to the one rendered and permanently break the
+    exact-match title fallback in the dedup publisher.
+    """
+    collapsed = " ".join(_scrub_volatile_title_tokens(summary).split())
+    return collapsed[:_MAX_SUMMARY_CHARS]
+
+
+def _with_site(summary: str, site: str) -> str:
+    """Join a summary and its stack site, truncating only the summary.
+
+    The site is the token that tells two bugs with one diagnostic line apart, so
+    it is appended whole: capping the joined string instead cut the site off and
+    left the two sharing a title.
+    """
+    text = _title_text(summary)
+    if not site:
+        return text
+    return f"{text} in {site}"
+
+
 def _error_summary_line(error: str) -> str:
     """Extract a short summary from an error for the title.
 
@@ -436,26 +460,27 @@ def _error_summary_line(error: str) -> str:
     error = error.strip()
 
     if error.startswith("Can't start"):
+        # A reason is not always parseable: on the "server never came up" path
+        # the runner hands over the whole log instead of a fatal-error blob.
+        # Name the failure anyway rather than falling through to a title built
+        # from the log's first line.
         reason = _startup_reason(error)
-        if reason:
-            return f"Can't start server: {reason}"[:80]
+        return _title_text(f"Can't start server: {reason}" if reason
+                           else "Can't start server")
 
     # A macOS leaks report's first line is the Tcl test name with a volatile
     # PID ("Check for memory leaks (pid 9443) in ..."); the payload is the
     # totals line.
     leaks_total = _LEAKS_TOTAL_RE.search(error)
     if leaks_total:
-        return leaks_total.group("phrase")[:60]
+        return _title_text(_COUNT_RE.sub(r"N\1", leaks_total.group("phrase")))
 
     # Lead with the size, then the leaking code path, so two sanitizer leaks
     # stay distinct in a title list.
     sanitizer_leak = _SANITIZER_LEAK_RE.search(error)
     if sanitizer_leak:
-        summary = f"Leaked {sanitizer_leak.group('size')}"
-        site = _leak_site(error)
-        if site:
-            summary = f"{summary} in {site}"
-        return summary[:80]
+        size = _COUNT_RE.sub(r"N\1", sanitizer_leak.group("size"))
+        return _with_site(f"Leaked {size}", _leak_site(error))
 
     clean = re.sub(r"\033\[[0-9;]*m", "", error)
     clean = re.sub(r"==\d+==\s*", "", clean)
@@ -484,28 +509,24 @@ def _error_summary_line(error: str) -> str:
         if any(kw in line for kw in _TITLE_KEYWORDS):
             leak = _LEAK_RECORD_RE.search(line)
             if leak:
-                # Lead with the leak kind, then size and site: "Definitely
-                # lost: 49 bytes in debugCommand (debug.c:569)".
-                summary = f"{leak.group('kind').capitalize()} lost: {leak.group('size')}"
-                site = _leak_site(error)
-                if site:
-                    summary = f"{summary} in {site}"
-                # 80 instead of the generic 60: the site is the
-                # distinguishing token and must survive truncation.
-                return summary[:80]
+                # "Definitely lost: N bytes in debugCommand (debug.c:569)". The
+                # size is shown as N: it drifts run to run for one leak, and the
+                # publisher would rewrite the title on every recurrence.
+                size = _COUNT_RE.sub(r"N\1", leak.group("size"))
+                kind = leak.group("kind").capitalize()
+                return _with_site(f"{kind} lost: {size}", _leak_site(error))
             summary = _LOSS_RECORD_RE.sub("", line)
             summary = _COUNT_RE.sub(r"N\1", summary)
             summary = _ASAN_ADDR_NOISE_RE.sub("", summary)
             summary = _scrub_volatile_title_tokens(summary)
             site = _leak_site(error)
-            if site and site not in summary:
-                summary = f"{summary} in {site}"
-            return summary[:60]
+            func = site.split(" (")[0] if site else ""
+            return _with_site(summary, "" if func and func in summary else site)
 
     if candidates:
-        return _scrub_volatile_title_tokens(candidates[0])[:60]
+        return _title_text(candidates[0])
     stripped = clean.strip()
-    return _scrub_volatile_title_tokens(stripped)[:60] if stripped else "unknown error"
+    return _title_text(stripped) if stripped else "unknown error"
 
 
 # Nameless failure types whose fingerprint keys on test_file, so the file is
@@ -518,13 +539,21 @@ def _error_summary_line(error: str) -> str:
 _TITLE_SHOWS_FILE = frozenset({FailureType.TIMEOUT})
 
 
+# GitHub silently truncates an issue title past this, which would leave the
+# stored title unequal to the rendered one and break the title fallback.
+_MAX_TITLE_CHARS = 256
+
+
 def _build_title(failure: UniqueFailure) -> str:
     if failure.has_test_identity:
-        return f"{TITLE_PREFIX} {failure.test_name} in {failure.test_file}"
-    summary = _error_summary_line(failure.error)
-    if failure.test_file and failure.failure_type in _TITLE_SHOWS_FILE:
-        return f"{TITLE_PREFIX} {summary} in {failure.test_file}"
-    return f"{TITLE_PREFIX} {summary}"
+        title = f"{TITLE_PREFIX} {failure.test_name} in {failure.test_file}"
+    else:
+        summary = _error_summary_line(failure.error)
+        if failure.test_file and failure.failure_type in _TITLE_SHOWS_FILE:
+            title = f"{TITLE_PREFIX} {summary} in {failure.test_file}"
+        else:
+            title = f"{TITLE_PREFIX} {summary}"
+    return " ".join(title.split())[:_MAX_TITLE_CHARS]
 
 
 def _tool_labels_for(failure: UniqueFailure) -> list[str]:
@@ -534,45 +563,41 @@ def _tool_labels_for(failure: UniqueFailure) -> list[str]:
     return labels
 
 
-def _type_label_for(failure: UniqueFailure) -> str:
-    """The failure type, naming every tool when more than one reported the bug.
+# Stands in for a field the failure has no value for. A failure without a test
+# name (a memory error, a startup failure) still fills every row the template
+# defines, so one body shape parses for every type.
+_MISSING_FIELD = "[no test]"
 
-    A merged failure carries one type of its own but a trace per tool, so
-    reporting only its own type would credit the bug to whichever tool happened
-    to be processed first.
-    """
-    return " + ".join(_tool_labels_for(failure))
+
+def _test_name_for(failure: UniqueFailure) -> str:
+    """The failing test's name, or the filler when the failure names none."""
+    return failure.test_name or _MISSING_FIELD
+
+
+def _test_file_for(failure: UniqueFailure) -> str:
+    """The failing test's file, or the filler when the failure names none."""
+    return failure.test_file or _MISSING_FIELD
 
 
 def _summary_sentence_for(failure: UniqueFailure) -> str:
     """The one-line summary opening the issue body.
 
-    Every type gets the same shape as a named test failure, "<what> in <where>
-    is failing in CI", so an issue reads the same whichever type it came from.
-    A nameless failure has no test name to be the subject, so its error summary
-    (the same one the title carries) stands in. Which tools reported it is left
-    to the Failure type row and the labeled trace blocks, keeping the sentence
-    to the template's wording.
+    Always "<test> in <file> is failing in CI.", the wording an issue filed from
+    the repository's template uses. A failure with no test name puts its error
+    summary there instead, since that is what identifies it, and a missing file
+    is filled rather than dropped so the sentence keeps its shape.
     """
-    if failure.has_test_identity:
-        return f"`{failure.test_name}` in `{failure.test_file}` is failing in CI."
-
-    summary = _error_summary_line(failure.error)
-    if failure.test_file:
-        return f"`{summary}` in `{failure.test_file}` is failing in CI."
-    return f"`{summary}` is failing in CI."
+    subject = failure.test_name or _error_summary_line(failure.error)
+    return f"`{subject}` in `{_test_file_for(failure)}` is failing in CI."
 
 
 def _build_body(failure: UniqueFailure, marker: str, *, occurrences: int) -> str:
     """Build the issue body for a test failure."""
     ns = marker_namespace_for(failure)
-    # Indented one level so the links read as children of the "CI link(s):"
-    # bullet they follow rather than as siblings of it.
     ci_links = "\n".join(
-        f"    - `{j.job}`: [CI link]({j.url})" for j in failure.jobs
+        f"- `{j.job}`: [CI link]({j.url})" for j in failure.jobs
     )
     env_list = ", ".join(f"`{j.job}`" for j in failure.jobs)
-    type_label = _type_label_for(failure)
 
     lines = [
         marker,
@@ -586,16 +611,11 @@ def _build_body(failure: UniqueFailure, marker: str, *, occurrences: int) -> str
         "",
     ]
 
-    # A nameless failure has no test name, and its file is the context the error
-    # surfaced under rather than a failing test, so those rows are omitted
-    # instead of carrying an empty or misleading value.
-    if failure.has_test_identity:
-        lines.append(f"- Test name: `{failure.test_name}`")
-        lines.append(f"- Test file: `{failure.test_file}`")
-    elif failure.test_file:
-        lines.append(f"- Test file context: `{failure.test_file}`")
+    # Every type fills the same rows, so one body shape parses for all of them.
+    # A failure that names no test gets the filler rather than a missing row.
     lines.extend([
-        f"- Failure type: `{type_label}`",
+        f"- Test name: `{_test_name_for(failure)}`",
+        f"- Test file: `{_test_file_for(failure)}`",
         "- CI link(s):",
         ci_links,
     ])
@@ -771,7 +791,9 @@ def _record_reported_tools(body: str, labels: list[str]) -> str:
         f"<!-- {_REPORTED_TOOLS_MARKER}:{','.join(sorted(recorded))} -->"
     )
     if _REPORTED_TOOLS_RE.search(body):
-        return _REPORTED_TOOLS_RE.sub(marker, body, count=1)
+        # Escaped: a tool label is data, and a backslash in one would read as a
+        # group reference.
+        return _REPORTED_TOOLS_RE.sub(marker.replace("\\", r"\\"), body, count=1)
     return f"{body}\n{marker}"
 
 
@@ -855,6 +877,14 @@ def _normalize_trace(text: str) -> str:
 
 
 def _update_environments_in_body(body: str, all_envs: list[str]) -> str:
-    """Replace the Environments line in the issue body with an updated list."""
+    """Replace the issue body's Environments line with an updated list.
+
+    Only the first occurrence: a trace that quotes the line would otherwise be
+    rewritten too. The replacement is escaped because a job name is data, and a
+    backslash in one is a group reference to ``re.sub``.
+    """
     new_env_line = f"**Environments:** {', '.join(f'`{e}`' for e in all_envs)}"
-    return re.sub(r"\*\*Environments:\*\*\s*.+", new_env_line, body)
+    return re.sub(
+        r"\*\*Environments:\*\*\s*.+", new_env_line.replace("\\", r"\\"), body,
+        count=1,
+    )

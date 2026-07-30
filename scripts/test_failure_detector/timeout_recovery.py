@@ -1,11 +1,9 @@
 """Recover timeout failures from CI console logs.
 
-The Tcl test runner excludes timeouts from the structured artifact (and its
-watchdog may kill the process before ``write_test_failures`` runs at all), so
-a timed-out job's artifact carries no timeout entry regardless of what else it
-captured. This module identifies failed jobs without a captured timeout,
-downloads their console logs, and extracts [TIMEOUT] failures that would
-otherwise be invisible to the detector.
+The runner's watchdog can kill the process before ``write_test_failures`` runs,
+leaving a timed-out job with no timeout entry in the artifact. This module
+identifies failed jobs without a captured timeout, downloads their console logs,
+and extracts [TIMEOUT] failures that would otherwise be invisible.
 
 It also attaches gtest console output to unit-test failures, whose artifact
 entries carry only a verdict, for the same reason: the diagnostic exists only

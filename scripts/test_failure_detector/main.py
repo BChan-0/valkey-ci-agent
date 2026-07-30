@@ -172,9 +172,11 @@ def run(
 
     try:
         all_failures = json.loads(artifact_content)
-    except json.JSONDecodeError as exc:
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         # A malformed or truncated artifact must not crash the run before we
         # report; surface it in the job summary and exit non-zero instead.
+        # UnicodeDecodeError is separate: an artifact written in the system
+        # encoding rather than UTF-8 fails in the decode before the parse.
         logger.error(
             "Could not parse all-test-failures artifact from run %d: %s", run_id, exc,
         )

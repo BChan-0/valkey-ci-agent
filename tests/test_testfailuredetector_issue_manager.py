@@ -667,7 +667,7 @@ class TestTypeSpecificRendering:
         # valgrind report, so a first-line title gives all valgrind issues
         # the same name. A leak title leads with the leak kind, then the
         # size and the first non-plumbing source frame:
-        # "Definitely lost: 49 bytes in debugCommand (debug.c:569)".
+        # "Definitely lost: N bytes in debugCommand (debug.c:569)".
         error = (
             " Valgrind error: ==6554== Memcheck, a memory error detector\n"
             "==6554== Copyright (C) 2002-2022, and GNU GPL'd, by Julian Seward et al.\n"
@@ -688,14 +688,12 @@ class TestTypeSpecificRendering:
         # fingerprint on the error, not the file), so it is not in the title.
         title = title_for(f)
         assert title == (
-            "[TEST-FAILURE] Definitely lost: 49 bytes in debugCommand (debug.c:569)"
+            "[TEST-FAILURE] Definitely lost: N bytes in debugCommand (debug.c:569)"
         )
 
     def test_valgrind_leak_title_ignores_loss_record_and_pid_drift(self) -> None:
         # Loss-record coordinates and PIDs drift between runs of the same
-        # leak and must not affect the title. The size is shown as-is (the
-        # publisher refreshes the title on recurrence; dedup is owned by the
-        # fingerprint, which scrubs sizes).
+        # leak and must not affect the title.
         def leak(record: str, pid: str) -> UniqueFailure:
             error = (
                 f" Valgrind error: =={pid}== Memcheck, a memory error detector\n"
@@ -805,9 +803,10 @@ class TestTypeSpecificRendering:
         assert "**Failing test(s)**" in body
         assert "**Error details**" not in body
         assert "is failing in CI." in body
-        assert "- Failure type: `Sanitizer`" in body
-        assert "- Test file context: `tests/unit/expire.tcl`" in body
-        assert "- Test name:" not in body
+        # Every row the template defines is filled, so one shape parses for all
+        # types; a failure naming no test gets the filler.
+        assert "- Test name: `[no test]`" in body
+        assert "- Test file: `tests/unit/expire.tcl`" in body
 
     def test_named_body_has_failure_type_field(self) -> None:
         """Named failures include a Failure type line in the body."""
@@ -819,7 +818,9 @@ class TestTypeSpecificRendering:
             jobs=[JobReference(job="j", suite="s", url="u")],
         )
         body = _build_body(f, marker="<!-- m -->", occurrences=1)
-        assert "Failure type: `Timeout`" in body
+        assert "- Test name: `PSYNC2 test`" in body
+        assert "- Test file: `tests/integration/replication-psync.tcl`" in body
+        assert "Failure type:" not in body
 
     def test_type_specific_namespace_in_body(self) -> None:
         """Body uses type-specific namespace for the occurrences marker."""
@@ -870,6 +871,118 @@ class TestVolatileTimeoutFingerprint:
         assert "replication.tcl" in title
 
 
+class TestTitleFollowsFingerprint:
+    """The publisher re-titles on every update, so two reports of one bug (equal
+    fingerprints) must render one title. A token that is volatile in the title
+    but scrubbed from the identity rewrites the same issue's title every run.
+    """
+
+    # (label, failure type, run-1 error, run-2 error) for one bug seen twice,
+    # each pair differing only in tokens the identity treats as noise.
+    _RECURRENCES = (
+        (
+            "valgrind leak size and loss record drift",
+            FailureType.VALGRIND,
+            "Valgrind error: 49 bytes in 1 blocks are definitely lost in loss "
+            "record 900 of 1,109\n"
+            "   at 0x484A2F3: malloc (vg_replace_malloc.c:381)\n"
+            "   by 0x1E9111: debugCommand (debug.c:569)\n",
+            "Valgrind error: 52 bytes in 1 blocks are definitely lost in loss "
+            "record 913 of 1,120\n"
+            "   at 0x484A2F3: malloc (vg_replace_malloc.c:381)\n"
+            "   by 0x1E9111: debugCommand (debug.c:569)\n",
+        ),
+        (
+            "valgrind access width differs between builds",
+            FailureType.VALGRIND,
+            "Valgrind error: Invalid read of size 4\n"
+            "   at 0x1E9111: lookupKey (db.c:120)\n",
+            "Valgrind error: Invalid read of size 8\n"
+            "   at 0x1E9111: lookupKey (db.c:120)\n",
+        ),
+        (
+            "sanitizer leak size drift",
+            FailureType.SANITIZER,
+            "Sanitizer error: ERROR: LeakSanitizer: detected memory leaks\n"
+            "    #1 0x55bc22 in debugCommand /home/runner/src/debug.c:569:9\n"
+            "SUMMARY: AddressSanitizer: 41 byte(s) leaked in 1 allocation(s).\n",
+            "Sanitizer error: ERROR: LeakSanitizer: detected memory leaks\n"
+            "    #1 0x55bc22 in debugCommand /home/runner/src/debug.c:569:9\n"
+            "SUMMARY: AddressSanitizer: 48 byte(s) leaked in 1 allocation(s).\n",
+        ),
+        (
+            "asan address and registers differ every run",
+            FailureType.SANITIZER,
+            "Sanitizer error: ERROR: AddressSanitizer: heap-use-after-free on "
+            "address 0x60300000eff8 at pc 0x55b1a2 bp 0x7ffd sp 0x7ffc\n"
+            "    #1 0x55bb11 in lookupKey /home/runner/src/db.c:412\n",
+            "Sanitizer error: ERROR: AddressSanitizer: heap-use-after-free on "
+            "address 0x60300000abcd at pc 0x55b9f3 bp 0x7ff1 sp 0x7ff0\n"
+            "    #1 0x55bb11 in lookupKey /home/runner/src/db.c:412\n",
+        ),
+        (
+            "startup log reason carries a clock and a runner path",
+            FailureType.STARTUP,
+            "Can't start /home/runner/work/valkey/valkey/src/valkey-server\n"
+            "CONFIGURATION:\nport 21111\nERROR:\n"
+            "943:C 29 Jul 04:15:32.117 * Valkey is starting\n",
+            "Can't start /Users/runner/work/valkey/valkey/src/valkey-server\n"
+            "CONFIGURATION:\nport 22345\nERROR:\n"
+            "987:C 30 Jul 11:02:07.882 * Valkey is starting\n",
+        ),
+        (
+            "macos leaks pid drift",
+            FailureType.MEMORY_LEAK,
+            "Check for memory leaks (pid 9443) in tests/unit/dump.tcl\n"
+            "Process 9443: 1 leak for 48 total leaked bytes.\n",
+            "Check for memory leaks (pid 9871) in tests/unit/dump.tcl\n"
+            "Process 9871: 1 leak for 48 total leaked bytes.\n",
+        ),
+    )
+
+    @pytest.mark.parametrize(
+        "label,failure_type,first,second",
+        _RECURRENCES,
+        ids=[case[0] for case in _RECURRENCES],
+    )
+    def test_equal_fingerprints_render_equal_titles(
+        self, label: str, failure_type: FailureType, first: str, second: str,
+    ) -> None:
+        def failure(error: str) -> UniqueFailure:
+            return UniqueFailure(
+                test_name="", test_file="tests/unit/other.tcl",
+                failure_type=failure_type, error=error,
+                jobs=[JobReference(job="j", suite="s", url="u")],
+            )
+
+        f1, f2 = failure(first), failure(second)
+        assert fingerprint_for(f1) == fingerprint_for(f2), (
+            f"{label}: the two reports should be one bug"
+        )
+        assert title_for(f1) == title_for(f2), f"{label}: title churns"
+
+    def test_title_stays_within_the_length_github_accepts(self) -> None:
+        # A Tcl test description is unbounded, and GitHub truncates past 256,
+        # which would break the publisher's exact-match title fallback.
+        f = UniqueFailure(
+            test_name="x" * 400, test_file="tests/unit/" + "y" * 200 + ".tcl",
+            failure_type=FailureType.ASSERTION, error="boom",
+            jobs=[JobReference(job="j", suite="s", url="u")],
+        )
+        assert len(title_for(f)) <= 256
+
+    def test_title_has_no_newlines(self) -> None:
+        # GitHub rewrites a newline in a title, so the stored title would differ
+        # from the rendered one and never match the fallback again.
+        f = UniqueFailure(
+            test_name="", test_file="tests/unit/other.tcl",
+            failure_type=FailureType.EXCEPTION,
+            error="Executing test client: boom\n    while executing\n\"$r read\"",
+            jobs=[JobReference(job="j", suite="s", url="u")],
+        )
+        assert "\n" not in title_for(f)
+
+
 class TestValgrindBannerTitle:
     """The valgrind runner prepends a banner ('Valgrind error: Memcheck, a
     memory error detector') that every valgrind issue would share. The title
@@ -893,7 +1006,7 @@ class TestValgrindBannerTitle:
         assert "Memcheck" not in title
         # No source frame in this trace (only the malloc interceptor), so the
         # title is kind + size without a site.
-        assert "Definitely lost: 49 bytes" in title
+        assert "Definitely lost: N bytes" in title
 
     def test_title_names_leaking_code_path_not_the_allocator(self) -> None:
         """Valgrind resolves its malloc interceptor to a source file inside the
@@ -1030,7 +1143,7 @@ class TestValgrindBannerTitle:
         )
         title = title_for(f)
         assert "detected memory leaks" not in title
-        assert "Leaked 41 byte(s)" in title
+        assert "Leaked N byte(s)" in title
         # The site skips the allocator wrappers (zmalloc.c/sds.c) and names the
         # code path that leaked.
         assert "debugCommand (debug.c:569)" in title
@@ -1049,7 +1162,7 @@ class TestValgrindBannerTitle:
             failure_type=FailureType.SANITIZER, error=error,
             jobs=[JobReference(job="j", suite="s", url="u")],
         )
-        assert "Leaked 96 byte(s)" in title_for(f)
+        assert "Leaked N byte(s)" in title_for(f)
 
     def test_sanitizer_leak_site_skips_interceptor_frame(self) -> None:
         """GCC's ASan interceptor frame carries a real file:line into the
@@ -1856,56 +1969,34 @@ class TestCrossToolAnchorDepth:
         assert marker_namespace_for(f) == MEMORY_ERROR_NAMESPACE
 
 
-class TestMergedBodyNamesBothTools:
-    """A merged issue must credit every tool that reported the bug.
+class TestMergedIssueRecordsBothTools:
+    """A merged issue keeps the legacy body shape, so which tools reported the
+    bug is recorded in the comment rather than in an extra body row."""
 
-    The surviving failure carries one type of its own, so reporting that alone
-    would name whichever tool happened to be processed first and read as though
-    the other never fired.
-    """
-
-    def _merged_body(self) -> str:
+    def _merged(self) -> UniqueFailure:
         vg = _memory_failure(FailureType.VALGRIND, _VG_USE_AFTER_FREE, "test-valgrind")
         asan = _memory_failure(
             FailureType.SANITIZER, _ASAN_USE_AFTER_FREE, "test-sanitizer-address",
         )
-        merged = _merge_same_fingerprint_failures([vg, asan])[0]
-        return _build_body(merged, marker="<!-- m -->", occurrences=1)
+        return _merge_same_fingerprint_failures([vg, asan])[0]
 
-    def test_both_tools_are_named_in_the_failure_type_row(self) -> None:
-        """The summary keeps the template's wording, so the Failure type row is
-        where a merged issue names both tools."""
-        body = self._merged_body()
-        assert "Valgrind" in body
-        assert "Sanitizer" in body
-        assert "<summary>" not in body
+    def test_the_body_carries_only_the_template_rows(self) -> None:
+        body = _build_body(self._merged(), marker="<!-- m -->", occurrences=1)
+        assert "- Test name:" in body
+        assert "- Test file:" in body
+        assert "- CI link(s):" in body
+        assert "Failure type:" not in body
+        assert "<details>" not in body
 
-    def test_failure_type_field_names_both_tools(self) -> None:
-        """Order follows which tool was processed first, so either is valid."""
-        body = self._merged_body()
-        assert (
-            "- Failure type: `Valgrind + Sanitizer`" in body
-            or "- Failure type: `Sanitizer + Valgrind`" in body
-        )
+    def test_the_other_tool_is_named_in_the_comment(self) -> None:
+        content = renderer_for(self._merged()).render("<!-- m -->", 1)
+        assert "Valgrind" in content.creation_comment
+        assert "Invalid read of size 4" in content.creation_comment
 
-    def test_single_tool_is_named_only_in_the_failure_type_row(self) -> None:
-        body = _build_body(
-            _memory_failure(FailureType.VALGRIND, _VG_USE_AFTER_FREE, "test-valgrind"),
-            marker="<!-- m -->", occurrences=1,
-        )
-        assert "- Failure type: `Valgrind`" in body
-
-    def test_named_failure_body_is_unchanged(self) -> None:
-        """Failures with a test name use the test-identity branch, which names
-        one type because they never merge across tools."""
-        f = UniqueFailure(
-            test_name="DictTest.BasicOps", test_file="src/unit/valkey-unit-gtests",
-            failure_type=FailureType.UNITTEST, error="gtest FAIL",
-            jobs=[JobReference(job="j", suite="s", url="u")],
-        )
-        assert "- Failure type: `Unittest`" in _build_body(
-            f, marker="<!-- m -->", occurrences=1,
-        )
+    def test_both_jobs_are_recorded(self) -> None:
+        body = _build_body(self._merged(), marker="<!-- m -->", occurrences=1)
+        assert "`test-valgrind`" in body
+        assert "`test-sanitizer-address`" in body
 
 
 class TestBodyShapeMatchesLegacyAcrossTypes:
@@ -1957,9 +2048,8 @@ class TestBodyShapeMatchesLegacyAcrossTypes:
             ("job-a", "suite", "https://example.com/a"),
             ("job-b", "suite", "https://example.com/b"),
         ]))
-        assert "- CI link(s):\n    - `job-a`: [CI link](https://example.com/a)" in body
-        assert "    - `job-b`: [CI link](https://example.com/b)" in body
-        assert "\n- `job-a`" not in body
+        assert "- CI link(s):\n- `job-a`: [CI link](https://example.com/a)" in body
+        assert "- `job-b`: [CI link](https://example.com/b)" in body
 
 
 class TestMergedBodyFitsGitHubLimit:
@@ -2174,3 +2264,60 @@ class TestAbsorbedTraceOnCreation:
         merged = _merge_same_fingerprint_failures([vg, asan])[0]
         content = renderer_for(merged).render("<!-- m -->", 1)
         assert "<!-- valkey-ci-agent:memory-error:abc123def456 -->" not in content.creation_comment
+
+
+class TestBodyMatchesTheHandFiledFormat:
+    """The body reproduces the format of an issue filed from the repository's
+    test-failure template, field for field, so a reader or a parser sees one
+    shape whichever type the failure came from.
+
+    Reference: the rows are Test name, Test file, CI link(s), followed by the
+    trace and the environments line. No row is added, dropped, or renamed.
+    """
+
+    _EXPECTED_ROWS = ("- Test name: ", "- Test file: ", "- CI link(s):")
+
+    def test_every_type_fills_every_row(self) -> None:
+        for failure_type in FailureType:
+            body = _build_body(
+                _memory_failure(
+                    failure_type, _VG_USE_AFTER_FREE, "job",
+                    test_file="tests/unit/other.tcl",
+                ),
+                marker="<!-- m -->", occurrences=1,
+            )
+            for row in self._EXPECTED_ROWS:
+                assert row in body, f"{failure_type.value} is missing {row!r}"
+
+    def test_a_failure_with_no_test_name_is_filled_not_dropped(self) -> None:
+        body = _build_body(
+            _memory_failure(FailureType.SANITIZER, _ASAN_USE_AFTER_FREE, "job"),
+            marker="<!-- m -->", occurrences=1,
+        )
+        assert "- Test name: `[no test]`" in body
+
+    def test_a_failure_with_no_test_file_is_filled_not_dropped(self) -> None:
+        f = UniqueFailure(
+            test_name="", test_file="", failure_type=FailureType.EXCEPTION,
+            error="Intentional runtime exception", jobs=[
+                JobReference(job="j", suite="s", url="u"),
+            ],
+        )
+        body = _build_body(f, marker="<!-- m -->", occurrences=1)
+        assert "- Test file: `[no test]`" in body
+        assert "in `[no test]` is failing in CI." in body
+
+    def test_no_row_the_template_does_not_define_is_added(self) -> None:
+        body = _build_body(
+            _memory_failure(FailureType.VALGRIND, _VG_USE_AFTER_FREE, "job"),
+            marker="<!-- m -->", occurrences=1,
+        )
+        for absent in ("Failure type:", "Test file context:", "**Error details**"):
+            assert absent not in body
+
+    def test_ci_links_sit_at_the_template_indentation(self) -> None:
+        body = _build_body(
+            _make_failure(jobs=[("job-a", "suite", "https://example.com/a")]),
+            marker="<!-- m -->", occurrences=1,
+        )
+        assert "- CI link(s):\n- `job-a`: [CI link](https://example.com/a)" in body

@@ -217,7 +217,9 @@ class IssueDedupPublisher:
         count = int(m.group(1)) + 1 if m else 2
         marker_occurrences = f"<!-- {self._ns}:occurrences:{count} -->"
         new_body = (
-            _occurrence_re(self._ns).sub(marker_occurrences, body)
+            # First occurrence only: the body embeds tool output, and a second
+            # marker pasted into it must not be rewritten as a counter.
+            _occurrence_re(self._ns).sub(marker_occurrences, body, count=1)
             if m else f"{body}\n{marker_occurrences}"
         )
         if idempotency_key is not None:
@@ -235,8 +237,22 @@ class IssueDedupPublisher:
             lambda: existing.create_comment(body=content.comment),
             retries=2, description=f"comment on issue #{existing.number}",
         )
+        self._record_body(repo_name, existing.number, new_body)
         logger.info("Updated issue #%s (occurrence %d)", existing.number, count)
         return "updated", existing.html_url
+
+    def _record_body(self, repo_name: str, number: int, body: str) -> None:
+        """Write an updated body back onto the cached listing entry.
+
+        ``edit`` updates only the reloaded handle, so without this the cached
+        entry keeps its pre-update body. A second fingerprint whose title matches
+        would then read the issue as unclaimed, adopt it, and overwrite the first
+        failure's marker while filing no issue of its own.
+        """
+        for issue in self._open_issues.get(repo_name, []):
+            if issue.number == number:
+                issue.body = body
+                return
 
     def _open_issues_for(self, repo: Any, repo_name: str) -> list[Any]:
         """Open issues of the repo, fetched once and cached.

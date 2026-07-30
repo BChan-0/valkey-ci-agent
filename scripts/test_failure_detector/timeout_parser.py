@@ -1,9 +1,8 @@
 """Parse test timeouts from CI console logs.
 
-The Valkey Tcl test runner's ``write_test_failures`` deliberately excludes
-timeout failures from the structured JSON artifact (see ``test_helper.tcl``,
-line matching ``*[*TIMEOUT*]*``). The timeout information only appears in the
-CI console output, printed as::
+The runner records timeouts in the artifact, but its watchdog can kill the run
+before ``write_test_failures`` executes, leaving a timed-out job with no timeout
+entry. This module recovers those from the console log, where they appear as::
 
     [TIMEOUT]: clients state report follows.
     ...
@@ -12,9 +11,6 @@ CI console output, printed as::
 and later in the summary::
 
     *** [TIMEOUT]: <test_name> in <test_file>
-
-This module recovers those failures by scanning the console logs of failed
-jobs whose artifact carries no timeout entry.
 """
 
 from __future__ import annotations
