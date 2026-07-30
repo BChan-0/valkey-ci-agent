@@ -10,6 +10,7 @@ import pytest
 try:
     from scripts.test_failure_detector.download import (
         download_all_test_failures,
+        get_job_info,
         get_job_urls,
         get_latest_daily_run,
     )
@@ -477,3 +478,79 @@ class TestGetJobUrls:
 
         result = get_job_urls(mock_gh, "owner/repo", 123)
         assert result == {}
+
+
+def _step(number, name, conclusion="success"):
+    step = MagicMock()
+    step.number = number
+    step.name = name
+    step.conclusion = conclusion
+    return step
+
+
+class TestGetJobInfoStepUrls:
+    @patch("scripts.test_failure_detector.download.retry_github_call")
+    def test_anchors_each_suite_to_its_step(self, mock_retry) -> None:
+        """A suite links to the step that ran it, not the job's first failure."""
+        job = MagicMock()
+        job.name = "test-ubuntu-jemalloc"
+        job.html_url = "https://example.com/job/1"
+        job.conclusion = "failure"
+        job.steps = [
+            _step(9, "test"),
+            _step(10, "module api test"),
+            _step(11, "sentinel tests"),
+            _step(12, "unittest", "failure"),
+        ]
+
+        mock_run = MagicMock()
+        mock_run.jobs.return_value = [job]
+        mock_repo = MagicMock()
+        mock_repo.get_workflow_run.return_value = mock_run
+        mock_retry.side_effect = lambda op, **kwargs: op()
+        mock_gh = MagicMock()
+        mock_gh.get_repo.return_value = mock_repo
+
+        info = get_job_info(mock_gh, "owner/repo", 123)
+        assert info.url_for("test-ubuntu-jemalloc", "valkey") == "https://example.com/job/1#step:9:1"
+        assert info.url_for("test-ubuntu-jemalloc", "unittest") == "https://example.com/job/1#step:12:1"
+
+    @patch("scripts.test_failure_detector.download.retry_github_call")
+    def test_unmapped_suite_falls_back_to_plain_job_url(self, mock_retry) -> None:
+        """A suite with no step mapping keeps the plain job URL."""
+        job = MagicMock()
+        job.name = "test-ubuntu-jemalloc"
+        job.html_url = "https://example.com/job/1"
+        job.conclusion = "failure"
+        job.steps = [_step(9, "test")]
+
+        mock_run = MagicMock()
+        mock_run.jobs.return_value = [job]
+        mock_repo = MagicMock()
+        mock_repo.get_workflow_run.return_value = mock_run
+        mock_retry.side_effect = lambda op, **kwargs: op()
+        mock_gh = MagicMock()
+        mock_gh.get_repo.return_value = mock_repo
+
+        info = get_job_info(mock_gh, "owner/repo", 123)
+        assert info.url_for("test-ubuntu-jemalloc", "sentinel") == "https://example.com/job/1"
+
+    @patch("scripts.test_failure_detector.download.retry_github_call")
+    def test_matrix_alias_shares_step_urls(self, mock_retry) -> None:
+        """A normalized job alias resolves the same step URLs as its exact name."""
+        job = MagicMock()
+        job.name = "test-valgrind-test (unit)"
+        job.html_url = "https://example.com/job/2"
+        job.conclusion = "failure"
+        job.steps = [_step(7, "test", "failure")]
+
+        mock_run = MagicMock()
+        mock_run.jobs.return_value = [job]
+        mock_repo = MagicMock()
+        mock_repo.get_workflow_run.return_value = mock_run
+        mock_retry.side_effect = lambda op, **kwargs: op()
+        mock_gh = MagicMock()
+        mock_gh.get_repo.return_value = mock_repo
+
+        info = get_job_info(mock_gh, "owner/repo", 123)
+        assert info.url_for("test-valgrind-test-unit", "valkey") == "https://example.com/job/2#step:7:1"
