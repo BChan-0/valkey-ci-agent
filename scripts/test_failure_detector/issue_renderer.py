@@ -68,14 +68,8 @@ _CROSS_TOOL_TYPES = frozenset({FailureType.VALGRIND, FailureType.SANITIZER})
 def _cross_tool_identity(failure: UniqueFailure) -> tuple[str, str] | None:
     """A valgrind/sanitizer failure's (class, anchor) identity, or None.
 
-    None means the failure cannot be matched across tools with confidence and
-    must keep its per-tool identity. That is the safe direction: both tools
-    describing one bug produce two issues, which is what happens today, whereas
-    a wrong merge hides one bug inside another's issue.
-
-    Both components are required. The class alone is far too coarse (every leak
-    in the codebase shares one), and the anchor alone would merge a leak and a
-    use-after-free that happen to share an allocation site.
+    None keeps the failure on its per-tool identity, which costs two issues for
+    one bug; a wrong merge instead hides one bug inside another's issue.
     """
     if failure.failure_type not in _CROSS_TOOL_TYPES:
         return None
@@ -232,15 +226,16 @@ class _FailureRenderer:
             (trace_label_for(self._failure), self._failure.error),
             *self._failure.extra_traces,
         ]
-        budget = _MAX_TRACE_CHARS // len(traces)
         fresh: list[str] = []
         for label, trace in traces:
             if label in reported:
                 continue
             # The stored traces were truncated when published, so a fresh trace
             # must be compared in its truncated form too, or every recurrence of
-            # an oversized trace would register as new.
-            candidate = _truncate_trace(trace, budget)
+            # an oversized trace would register as new. The budget must be the
+            # one the body used, not a share of it: comparing a half-budget
+            # candidate against a full-budget stored trace never matches.
+            candidate = _truncate_trace(trace, _MAX_TRACE_CHARS)
             if not candidate.strip():
                 continue
             if _normalize_trace(candidate) in stored:
@@ -358,6 +353,23 @@ _LEAKS_TOTAL_RE = re.compile(
     r"(?P<phrase>\d[\d,]*\s+leaks?\s+for\s+\d[\d,]*\s+total\s+leaked\s+bytes)"
 )
 
+# The allocation site named by a macOS leaks report's ROOT LEAK line ("<malloc
+# in sdsnewlen 0x600001d1c100>"). A leaks blob has no stack frames, so this is
+# the only thing in it that says which code path leaked, and the identity keys
+# on it for the same reason.
+_LEAKS_ROOT_SITE_RE = re.compile(r"ROOT LEAK:\s*<[^>]*?\bin\s+(?P<func>\S+)")
+
+
+def _leaks_root_site(error: str) -> str:
+    """The function a macOS leaks report blames, or "".
+
+    Returns "" for an unsymbolicated report, whose root lines carry a bare
+    address and name no function.
+    """
+    match = _LEAKS_ROOT_SITE_RE.search(error)
+    return match.group("func") if match else ""
+
+
 def _leak_site(error: str) -> str:
     """Distinctive "func (file:line)" in the report's first stack, or "".
 
@@ -469,18 +481,17 @@ def _error_summary_line(error: str) -> str:
                            else "Can't start server")
 
     # A macOS leaks report's first line is the Tcl test name with a volatile
-    # PID ("Check for memory leaks (pid 9443) in ..."); the payload is the
-    # totals line.
-    leaks_total = _LEAKS_TOTAL_RE.search(error)
-    if leaks_total:
-        return _title_text(_COUNT_RE.sub(r"N\1", leaks_total.group("phrase")))
+    # PID ("Check for memory leaks (pid 9443) in ..."); the totals line is the
+    # payload. Its counts are left out for the same reason the other leak titles
+    # omit theirs, so the title does not change as the leak's magnitude does.
+    # The allocation site takes their place, since without it every leak on the
+    # macos jobs would carry one indistinguishable title.
+    if _LEAKS_TOTAL_RE.search(error):
+        return _with_site("Leaked memory", _leaks_root_site(error))
 
-    # Lead with the size, then the leaking code path, so two sanitizer leaks
-    # stay distinct in a title list.
     sanitizer_leak = _SANITIZER_LEAK_RE.search(error)
     if sanitizer_leak:
-        size = _COUNT_RE.sub(r"N\1", sanitizer_leak.group("size"))
-        return _with_site(f"Leaked {size}", _leak_site(error))
+        return _with_site("Leaked memory", _leak_site(error))
 
     clean = re.sub(r"\033\[[0-9;]*m", "", error)
     clean = re.sub(r"==\d+==\s*", "", clean)
@@ -509,12 +520,14 @@ def _error_summary_line(error: str) -> str:
         if any(kw in line for kw in _TITLE_KEYWORDS):
             leak = _LEAK_RECORD_RE.search(line)
             if leak:
-                # "Definitely lost: N bytes in debugCommand (debug.c:569)". The
-                # size is shown as N: it drifts run to run for one leak, and the
-                # publisher would rewrite the title on every recurrence.
-                size = _COUNT_RE.sub(r"N\1", leak.group("size"))
+                # "Definitely lost in debugCommand (debug.c:569)". The size is
+                # left out: one leak is reported at different sizes by different
+                # builds (the NO_MALLOC_USABLE_SIZE jobs account an allocation
+                # differently), and the publisher rewrites the title on every
+                # update, so a size in the title would flip between runs. The
+                # exact figures stay in the trace.
                 kind = leak.group("kind").capitalize()
-                return _with_site(f"{kind} lost: {size}", _leak_site(error))
+                return _with_site(f"{kind} lost", _leak_site(error))
             summary = _LOSS_RECORD_RE.sub("", line)
             summary = _COUNT_RE.sub(r"N\1", summary)
             summary = _ASAN_ADDR_NOISE_RE.sub("", summary)

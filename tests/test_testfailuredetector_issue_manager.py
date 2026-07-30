@@ -667,7 +667,7 @@ class TestTypeSpecificRendering:
         # valgrind report, so a first-line title gives all valgrind issues
         # the same name. A leak title leads with the leak kind, then the
         # size and the first non-plumbing source frame:
-        # "Definitely lost: N bytes in debugCommand (debug.c:569)".
+        # "Definitely lost in debugCommand (debug.c:569)".
         error = (
             " Valgrind error: ==6554== Memcheck, a memory error detector\n"
             "==6554== Copyright (C) 2002-2022, and GNU GPL'd, by Julian Seward et al.\n"
@@ -688,7 +688,7 @@ class TestTypeSpecificRendering:
         # fingerprint on the error, not the file), so it is not in the title.
         title = title_for(f)
         assert title == (
-            "[TEST-FAILURE] Definitely lost: N bytes in debugCommand (debug.c:569)"
+            "[TEST-FAILURE] Definitely lost in debugCommand (debug.c:569)"
         )
 
     def test_valgrind_leak_title_ignores_loss_record_and_pid_drift(self) -> None:
@@ -1006,7 +1006,7 @@ class TestValgrindBannerTitle:
         assert "Memcheck" not in title
         # No source frame in this trace (only the malloc interceptor), so the
         # title is kind + size without a site.
-        assert "Definitely lost: N bytes" in title
+        assert "Definitely lost" in title
 
     def test_title_names_leaking_code_path_not_the_allocator(self) -> None:
         """Valgrind resolves its malloc interceptor to a source file inside the
@@ -1143,7 +1143,7 @@ class TestValgrindBannerTitle:
         )
         title = title_for(f)
         assert "detected memory leaks" not in title
-        assert "Leaked N byte(s)" in title
+        assert "Leaked memory" in title
         # The site skips the allocator wrappers (zmalloc.c/sds.c) and names the
         # code path that leaked.
         assert "debugCommand (debug.c:569)" in title
@@ -1162,7 +1162,7 @@ class TestValgrindBannerTitle:
             failure_type=FailureType.SANITIZER, error=error,
             jobs=[JobReference(job="j", suite="s", url="u")],
         )
-        assert "Leaked N byte(s)" in title_for(f)
+        assert "Leaked memory" in title_for(f)
 
     def test_sanitizer_leak_site_skips_interceptor_frame(self) -> None:
         """GCC's ASan interceptor frame carries a real file:line into the
@@ -1472,10 +1472,12 @@ class TestMacosLeaksTitle:
             jobs=[JobReference(job="test-macos-latest", suite="valkey", url="u")],
         )
 
-    def test_title_uses_leaks_totals_line(self) -> None:
+    def test_title_names_the_leak_without_its_magnitude(self) -> None:
+        # The totals line is the blob's payload, but its counts drift between
+        # runs of one leak, so the title names the leak and leaves them to the
+        # trace. This blob's roots are bare addresses, so there is no site.
         f = self._failure(_macos_leaks_error(9443, 1, 48, "0x953074d20"))
-        title = title_for(f)
-        assert title == "[TEST-FAILURE] 1 leak for 48 total leaked bytes"
+        assert title_for(f) == "[TEST-FAILURE] Leaked memory"
 
     def test_title_omits_the_test_file(self) -> None:
         """A leak in shared code is reported after whichever test file exposed
@@ -1507,10 +1509,13 @@ class TestMacosLeaksTitle:
         assert "9443" not in t1
         assert "pid" not in t1.lower()
 
-    def test_titles_distinguish_leak_magnitudes(self) -> None:
-        t1 = title_for(self._failure(_macos_leaks_error(9443, 1, 48, "0x953074d20")))
-        t2 = title_for(self._failure(_macos_leaks_error(9443, 12, 4096, "0x953074d20")))
-        assert t1 != t2
+    def test_title_stable_across_leak_magnitudes(self) -> None:
+        # These two share a fingerprint (see the next test), so they are one
+        # issue. Carrying their magnitudes would retitle it on each recurrence.
+        f1 = self._failure(_macos_leaks_error(9443, 1, 48, "0x953074d20"))
+        f2 = self._failure(_macos_leaks_error(9443, 12, 4096, "0x953074d20"))
+        assert fingerprint_for(f1) == fingerprint_for(f2)
+        assert title_for(f1) == title_for(f2)
 
     def test_unsymbolicated_leaks_in_one_file_share_a_fingerprint(self) -> None:
         """Documents a known granularity limit: with bare-address ROOT LEAK
@@ -2321,3 +2326,65 @@ class TestBodyMatchesTheHandFiledFormat:
             marker="<!-- m -->", occurrences=1,
         )
         assert "- CI link(s):\n- `job-a`: [CI link](https://example.com/a)" in body
+
+
+class TestLeakTitlesCarryNoMagnitude:
+    """A leak title names the leaking code path, never the number of bytes.
+
+    One leak is reported at different sizes by different builds: on a real Daily
+    run the same sdsnewlen leak was 41 bytes on the standard valgrind and
+    sanitizer jobs and 49 on the NO_MALLOC_USABLE_SIZE ones, which account an
+    allocation differently. All of those jobs dedup to one issue, and the
+    publisher rewrites its title on every update, so a size in the title would
+    flip between runs. The exact figures stay in the trace.
+    """
+
+    def _valgrind_leak(self, size: str) -> UniqueFailure:
+        return _memory_failure(
+            FailureType.VALGRIND,
+            _vg(
+                f"==6554== {size} in 1 blocks are definitely lost\n"
+                "==6554==    at 0x4846828: malloc (vg_replace_malloc.c:381)\n"
+                "==6554==    by 0x1E8076: debugCommand (debug.c:569)\n"
+            ),
+            "test-valgrind",
+        )
+
+    def _sanitizer_leak(self, size: str) -> UniqueFailure:
+        return _memory_failure(
+            FailureType.SANITIZER,
+            "==1==ERROR: LeakSanitizer: detected memory leaks\n"
+            f"SUMMARY: AddressSanitizer: {size} leaked in 1 allocation(s).\n"
+            "    #0 0x55b in malloc\n"
+            "    #1 0x55c in debugCommand /src/debug.c:569:9\n",
+            "test-sanitizer-address",
+        )
+
+    def test_valgrind_leak_title_has_no_byte_count(self) -> None:
+        title = title_for(self._valgrind_leak("41 bytes"))
+        assert title == "[TEST-FAILURE] Definitely lost in debugCommand (debug.c:569)"
+        assert "41" not in title
+        assert " N " not in title
+
+    def test_valgrind_leak_title_is_stable_across_build_sizes(self) -> None:
+        """The 41-byte and 49-byte reports of one leak must title identically."""
+        assert title_for(self._valgrind_leak("41 bytes")) == title_for(
+            self._valgrind_leak("49 bytes")
+        )
+
+    def test_sanitizer_leak_title_has_no_byte_count(self) -> None:
+        title = title_for(self._sanitizer_leak("41 byte(s)"))
+        assert "Leaked memory" in title
+        assert "debugCommand (debug.c:569)" in title
+        assert "41" not in title
+
+    def test_no_leak_title_shows_a_placeholder_count(self) -> None:
+        """A scrubbed count read as a formatting fault, so the size is left out
+        rather than printed as N."""
+        for failure in (
+            self._valgrind_leak("41 bytes"),
+            self._sanitizer_leak("41 byte(s)"),
+        ):
+            title = title_for(failure)
+            assert "N bytes" not in title
+            assert "N byte(s)" not in title
