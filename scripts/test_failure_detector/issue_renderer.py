@@ -290,6 +290,10 @@ _TITLE_VOLATILE_SUBS: tuple[tuple[re.Pattern, str], ...] = (
     (re.compile(r"0x[0-9a-fA-F]+"), "0xN"),
     (re.compile(r"/tmp/[^\s:]+"), "/tmp/..."),
     (re.compile(r"\b(pid|port)([=\s]+)\d+", re.IGNORECASE), r"\1\2N"),
+    # A hung client's last-known runner state ("last state: (SPAWNING SERVER)
+    # pid:N fd 12"). It names what the runner was doing, not the failure, and
+    # every token in it drifts. The body keeps it; the title must not.
+    (re.compile(r"[,;]?\s*last state:.*$", re.IGNORECASE | re.DOTALL), ""),
     # The timestamps the identity drops, shared from there so the two cannot
     # drift apart: a datestamp the title keeps but the identity scrubs retitles
     # one issue on every recurrence.
@@ -557,13 +561,15 @@ def _error_summary_line(error: str) -> str:
     return _title_text(stripped) if stripped else "unknown error"
 
 
-# Nameless failure types whose fingerprint keys on test_file, so the file is
-# stable identity and belongs in the title. Only TIMEOUT qualifies: it keys on
-# the file directly (see fingerprint_for). Every other nameless type keys on the
-# normalized error, which discards the file, so putting the file in the title
-# would rewrite one issue's title whenever the same bug surfaced under a
-# different file. Memory leaks are the case that makes this concrete: one leak in
-# shared code is reported after whichever test file happened to expose it.
+# Nameless failure types whose fingerprint keys on test_file unconditionally, so
+# the file is stable identity and belongs in the title. Only TIMEOUT qualifies:
+# it keys on the file directly (see fingerprint_for). A type keying on the
+# normalized error must not show the file, or one issue would be retitled
+# whenever the same bug surfaced under a different file: a leak in shared code is
+# reported after whichever test file happened to expose it.
+#
+# MEMORY_LEAK is decided per report rather than listed here, since only some of
+# its reports key on the file. See _title_shows_file.
 _TITLE_SHOWS_FILE = frozenset({FailureType.TIMEOUT})
 
 
@@ -578,10 +584,17 @@ def _title_shows_file(failure: UniqueFailure) -> bool:
     """
     if failure.failure_type in _TITLE_SHOWS_FILE:
         return True
-    # An unsymbolicated macOS leaks report names no allocation site, so its
-    # identity comes from the boilerplate it shares with every leak in the file
-    # it surfaced under. The file is then the only thing telling two of them
-    # apart, and leaving it out gave them one title.
+    # An unsymbolicated macOS leaks report names no allocation site, only a bare
+    # address, so nothing in it survives normalization except the blob's opening
+    # line, which quotes the test file. The file is therefore already part of
+    # that report's identity, and showing it keeps the title matching the
+    # fingerprint. A symbolicated report keys on its allocation site instead, so
+    # it falls through and the file stays out.
+    #
+    # This makes the file identity for reports where it should not be: one leak
+    # in shared code becomes an issue per test file that exposes it. The fix is
+    # to symbolicate the reports, not to drop the file from the title, which
+    # would leave the split in place and merely hide it.
     return (
         failure.failure_type == FailureType.MEMORY_LEAK
         and not _leaks_root_site(failure.error)
