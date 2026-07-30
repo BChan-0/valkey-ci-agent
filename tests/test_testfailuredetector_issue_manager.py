@@ -1475,9 +1475,11 @@ class TestMacosLeaksTitle:
     def test_title_names_the_leak_without_its_magnitude(self) -> None:
         # The totals line is the blob's payload, but its counts drift between
         # runs of one leak, so the title names the leak and leaves them to the
-        # trace. This blob's roots are bare addresses, so there is no site.
+        # trace. This blob's roots are bare addresses, so it has no site to
+        # name and falls back to the test file, which is what its identity
+        # keys on and the only thing separating two such leaks.
         f = self._failure(_macos_leaks_error(9443, 1, 48, "0x953074d20"))
-        assert title_for(f) == "[TEST-FAILURE] Leaked memory"
+        assert title_for(f) == "[TEST-FAILURE] Leaked memory in tests/unit/multi.tcl"
 
     def test_title_omits_the_test_file(self) -> None:
         """A leak in shared code is reported after whichever test file exposed
@@ -2388,3 +2390,84 @@ class TestLeakTitlesCarryNoMagnitude:
             title = title_for(failure)
             assert "N bytes" not in title
             assert "N byte(s)" not in title
+
+
+def _leaks_blob(
+    sites: list[str],
+    test_file: str = "tests/unit/other.tcl",
+    leaked_bytes: int = 48,
+) -> str:
+    """A macOS leaks report blaming *sites*, or bare addresses when empty."""
+    roots = "".join(
+        f"    1 ({leaked_bytes} bytes) ROOT LEAK: "
+        f"<malloc in {site} 0x60000{index}> [{leaked_bytes}]\n"
+        for index, site in enumerate(sites)
+    ) or f"    1 ({leaked_bytes} bytes) ROOT LEAK: 0x600001d1c100 [{leaked_bytes}]\n"
+    return (
+        f"Check for memory leaks (pid 9443) in {test_file}\n"
+        f"Process 9443: {max(len(sites), 1)} leak for {leaked_bytes} "
+        f"total leaked bytes\n{roots}"
+    )
+
+
+class TestDistinctLeaksGetDistinctTitles:
+    """Two leaks that are separate issues must not share one title.
+
+    A macOS leaks report has no stack frames, so its title has less to work with
+    than the other types, which all carry a file:line. Identical titles are
+    unreadable in an issue list and feed the publisher's title fallback, which
+    adopts an issue by exact title.
+    """
+
+    def _failure(self, error: str, test_file: str) -> UniqueFailure:
+        return UniqueFailure(
+            test_name="", test_file=test_file,
+            failure_type=FailureType.MEMORY_LEAK, error=error,
+            jobs=[JobReference(job="test-macos-latest", suite="valkey", url="u")],
+        )
+
+    def _assert_distinct(self, first: UniqueFailure, second: UniqueFailure) -> None:
+        assert fingerprint_for(first) != fingerprint_for(second), (
+            "fixture error: these should be separate issues"
+        )
+        assert title_for(first) != title_for(second)
+
+    def test_reports_sharing_their_first_site_stay_distinct(self) -> None:
+        """Naming only the first site gave two multi-root reports one title."""
+        self._assert_distinct(
+            self._failure(
+                _leaks_blob(["sdsnewlen", "clusterInit"]), "tests/unit/other.tcl",
+            ),
+            self._failure(
+                _leaks_blob(["sdsnewlen", "dictExpand"]), "tests/unit/other.tcl",
+            ),
+        )
+
+    def test_unsymbolicated_reports_in_different_files_stay_distinct(self) -> None:
+        """With no site to name, the file is the only thing left."""
+        self._assert_distinct(
+            self._failure(_leaks_blob([], "tests/unit/dump.tcl"), "tests/unit/dump.tcl"),
+            self._failure(_leaks_blob([], "tests/unit/geo.tcl"), "tests/unit/geo.tcl"),
+        )
+
+    def test_the_title_is_stable_across_magnitude_and_report_order(self) -> None:
+        """Sites are sorted and counts left out, so one leak keeps one title."""
+        first = self._failure(
+            _leaks_blob(["sdsnewlen", "clusterInit"], leaked_bytes=48),
+            "tests/unit/other.tcl",
+        )
+        second = self._failure(
+            _leaks_blob(["clusterInit", "sdsnewlen"], leaked_bytes=144),
+            "tests/unit/other.tcl",
+        )
+        assert fingerprint_for(first) == fingerprint_for(second)
+        assert title_for(first) == title_for(second)
+
+    def test_a_report_blaming_many_sites_is_summarized(self) -> None:
+        """A title listing a dozen functions is unreadable, and the fingerprint
+        keys on the full set regardless."""
+        title = title_for(self._failure(
+            _leaks_blob(["a1", "b2", "c3", "d4", "e5"]), "tests/unit/other.tcl",
+        ))
+        assert "and 3 more" in title
+        assert len(title) <= 256

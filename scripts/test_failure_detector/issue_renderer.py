@@ -360,14 +360,29 @@ _LEAKS_TOTAL_RE = re.compile(
 _LEAKS_ROOT_SITE_RE = re.compile(r"ROOT LEAK:\s*<[^>]*?\bin\s+(?P<func>\S+)")
 
 
+# Root sites named in a title before it is cut short. A report with more sites
+# than this is summarized, since a title listing a dozen functions is unreadable
+# and the fingerprint keys on the full set anyway.
+_MAX_TITLE_ROOT_SITES = 2
+
+
 def _leaks_root_site(error: str) -> str:
-    """The function a macOS leaks report blames, or "".
+    """The functions a macOS leaks report blames, or "".
+
+    Every distinct site is named, sorted, matching what the identity keys on: a
+    report can blame several, and naming only the first gave two reports that
+    happened to share it one title while they remained separate issues.
 
     Returns "" for an unsymbolicated report, whose root lines carry a bare
     address and name no function.
     """
-    match = _LEAKS_ROOT_SITE_RE.search(error)
-    return match.group("func") if match else ""
+    sites = sorted({m.group("func") for m in _LEAKS_ROOT_SITE_RE.finditer(error)})
+    if not sites:
+        return ""
+    if len(sites) > _MAX_TITLE_ROOT_SITES:
+        shown = ", ".join(sites[:_MAX_TITLE_ROOT_SITES])
+        return f"{shown} and {len(sites) - _MAX_TITLE_ROOT_SITES} more"
+    return ", ".join(sites)
 
 
 def _leak_site(error: str) -> str:
@@ -557,12 +572,28 @@ _TITLE_SHOWS_FILE = frozenset({FailureType.TIMEOUT})
 _MAX_TITLE_CHARS = 256
 
 
+def _title_shows_file(failure: UniqueFailure) -> bool:
+    """Whether the test file is stable identity for *failure*, so it may appear
+    in the title without the publisher retitling the issue later.
+    """
+    if failure.failure_type in _TITLE_SHOWS_FILE:
+        return True
+    # An unsymbolicated macOS leaks report names no allocation site, so its
+    # identity comes from the boilerplate it shares with every leak in the file
+    # it surfaced under. The file is then the only thing telling two of them
+    # apart, and leaving it out gave them one title.
+    return (
+        failure.failure_type == FailureType.MEMORY_LEAK
+        and not _leaks_root_site(failure.error)
+    )
+
+
 def _build_title(failure: UniqueFailure) -> str:
     if failure.has_test_identity:
         title = f"{TITLE_PREFIX} {failure.test_name} in {failure.test_file}"
     else:
         summary = _error_summary_line(failure.error)
-        if failure.test_file and failure.failure_type in _TITLE_SHOWS_FILE:
+        if failure.test_file and _title_shows_file(failure):
             title = f"{TITLE_PREFIX} {summary} in {failure.test_file}"
         else:
             title = f"{TITLE_PREFIX} {summary}"
