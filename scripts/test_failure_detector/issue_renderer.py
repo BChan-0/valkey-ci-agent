@@ -659,8 +659,10 @@ def _summary_sentence_for(failure: UniqueFailure) -> str:
 def _build_body(failure: UniqueFailure, marker: str, *, occurrences: int) -> str:
     """Build the issue body for a test failure."""
     ns = marker_namespace_for(failure)
+    # Indented under the "CI link(s):" row they belong to, so a long list reads
+    # as that row's links rather than as more rows in the Failing test(s) list.
     ci_links = "\n".join(
-        f"- `{j.job}`: [CI link]({j.url})" for j in failure.jobs
+        f"    - `{j.job}`: [CI link]({j.url})" for j in failure.jobs
     )
     env_list = ", ".join(f"`{j.job}`" for j in failure.jobs)
 
@@ -789,26 +791,23 @@ def _build_absorbed_trace_comment(failure: UniqueFailure) -> str:
     goes here: it says things the first does not (each tool names details the
     other omits), and discarding it would lose the reason the two were merged.
 
-    Uses the same headings as a recurrence comment, so a reader meets one
-    format throughout: the trace, then the jobs it came from. A trace on its own
-    said nothing about which jobs reported it.
+    Rendered by :func:`_build_comment`, so it is the same comment a recurrence
+    posts, opening line and all. Duplicating the structure here let the two
+    drift: this one carried a bare trace under a heading of its own while the
+    recurrence comment named the date and the jobs.
 
     Returns "" for the ordinary single-tool failure, which posts no comment.
     """
     if not failure.extra_traces:
         return ""
-    lines: list[str] = []
     budget = _MAX_TRACE_CHARS // (len(failure.extra_traces) + 1)
-    for _label, trace in failure.extra_traces:
-        text = _defuse_markers(_truncate_trace(trace, budget)) or "N/A"
-        fence = _fence_for(text)
-        lines.append(f"**Error stack trace**\n\n{fence}\n{text}\n{fence}")
-    ci_links = "\n".join(
-        f"- `{j.job}`: [CI link]({j.url})" for j in failure.jobs
+    traces = [
+        _defuse_markers(_truncate_trace(trace, budget))
+        for _label, trace in failure.extra_traces
+    ]
+    return _build_comment(
+        failure, newly_failing=[], new_error="\n\n".join(traces) or None,
     )
-    if ci_links:
-        lines.append(f"**Failed in:**\n{ci_links}")
-    return "\n\n".join(lines)
 
 
 def _build_comment(
@@ -830,7 +829,8 @@ def _build_comment(
         new_error = _truncate_trace(new_error)
         fence = _fence_for(new_error)
         lines.append(f"\n**New error stack trace**\n\n{fence}\n{new_error}\n{fence}")
-    lines.append(f"\n**Failed in:**\n{ci_links}")
+    if ci_links:
+        lines.append(f"\n**Failed in:**\n{ci_links}")
     return "\n".join(lines)
 
 
@@ -935,6 +935,17 @@ _TRACE_NOISE_RES = (
     # The macOS leaks report's process footprint ("Physical footprint: 2801K").
     # It measures the live server when the report was taken, not the leak.
     re.compile(r"(Physical footprint(?:\s*\(peak\))?:\s*)\d+K"),
+    # gtest-parallel's progress counter and per-test duration ("[6/298] ... (2 ms)").
+    # Both move with how the run was sharded and scheduled.
+    re.compile(r"^\[\d+/\d+\]\s*", re.MULTILINE),
+    re.compile(r"\s*\(\d+(?:\.\d+)?\s*m?s\)"),
+    # A Tcl socket handle from the runner's clients-state report.
+    re.compile(r"\bsock[0-9a-f]{6,}\b"),
+    # The runner's workspace root, which differs per platform. A frame reaches
+    # the identity as a basename, so only the trace comparison needs this.
+    re.compile(r"/(?:home|Users)/runner/[^\s:]*|/__w/[^\s:]*"),
+    # A leaked file descriptor number.
+    re.compile(r"\b(fd)\s+\d+", re.IGNORECASE),
 )
 
 

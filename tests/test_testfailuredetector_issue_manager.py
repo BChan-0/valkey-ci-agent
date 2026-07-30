@@ -1824,7 +1824,7 @@ class TestMultiTraceBody:
         assert "heap-use-after-free" in content.body
         assert "Invalid read of size 4" not in content.body
         assert "Invalid read of size 4" in content.creation_comment
-        assert "**Error stack trace**" in content.creation_comment
+        assert "**New error stack trace**" in content.creation_comment
 
     def test_both_tools_appear_in_the_environments_line(self) -> None:
         vg = _memory_failure(FailureType.VALGRIND, _VG_USE_AFTER_FREE, "test-valgrind")
@@ -2055,8 +2055,8 @@ class TestBodyShapeMatchesLegacyAcrossTypes:
             ("job-a", "suite", "https://example.com/a"),
             ("job-b", "suite", "https://example.com/b"),
         ]))
-        assert "- CI link(s):\n- `job-a`: [CI link](https://example.com/a)" in body
-        assert "- `job-b`: [CI link](https://example.com/b)" in body
+        assert "- CI link(s):\n    - `job-a`: [CI link](https://example.com/a)" in body
+        assert "    - `job-b`: [CI link](https://example.com/b)" in body
 
 
 class TestMergedBodyFitsGitHubLimit:
@@ -2248,7 +2248,7 @@ class TestAbsorbedTraceOnCreation:
     def test_creation_comment_carries_the_absorbed_trace(self) -> None:
         content = renderer_for(self._merged()).render("<!-- m -->", 1)
         assert "Invalid read of size 4" in content.creation_comment
-        assert "**Error stack trace**" in content.creation_comment
+        assert "**New error stack trace**" in content.creation_comment
 
     def test_a_single_tool_failure_posts_no_creation_comment(self) -> None:
         content = renderer_for(
@@ -2326,7 +2326,7 @@ class TestBodyMatchesTheHandFiledFormat:
             _make_failure(jobs=[("job-a", "suite", "https://example.com/a")]),
             marker="<!-- m -->", occurrences=1,
         )
-        assert "- CI link(s):\n- `job-a`: [CI link](https://example.com/a)" in body
+        assert "- CI link(s):\n    - `job-a`: [CI link](https://example.com/a)" in body
 
 
 class TestLeakTitlesCarryNoMagnitude:
@@ -2503,7 +2503,7 @@ class TestCommentsUseOnlyTemplateWording:
 
     def test_the_creation_comment_uses_the_template_heading(self) -> None:
         content = renderer_for(self._merged()).render("<!-- m -->", 1)
-        assert "**Error stack trace**" in content.creation_comment
+        assert "**New error stack trace**" in content.creation_comment
         assert "Invalid read of size 4" in content.creation_comment
 
     def test_the_recurrence_comment_adds_no_prose(self) -> None:
@@ -2615,7 +2615,7 @@ class TestCreationCommentCarriesItsContext:
 
     def test_the_comment_still_carries_the_trace(self) -> None:
         comment = renderer_for(self._merged()).render("<!-- m -->", 1).creation_comment
-        assert "**Error stack trace**" in comment
+        assert "**New error stack trace**" in comment
         assert "Invalid read of size 4" in comment
 
     def test_the_headings_match_a_recurrence_comment(self) -> None:
@@ -2642,4 +2642,62 @@ class TestCreationCommentCarriesItsContext:
         merged.jobs.clear()
         comment = renderer_for(merged).render("<!-- m -->", 1).creation_comment
         assert "**Failed in:**" not in comment
-        assert "**Error stack trace**" in comment
+        assert "**New error stack trace**" in comment
+
+
+class TestBothCommentsShareOneStructure:
+    """Every comment the detector posts follows the recurrence model:
+    an opening line, then New error stack trace, then Failed in.
+
+    The comment carrying a second tool's report is rendered by the same function
+    as a recurrence, so the two cannot drift. Built separately, it lost the
+    opening line and the job list and used a heading of its own.
+    """
+
+    def _merged(self) -> UniqueFailure:
+        vg = _memory_failure(FailureType.VALGRIND, _VG_USE_AFTER_FREE, "test-valgrind")
+        asan = _memory_failure(
+            FailureType.SANITIZER, _ASAN_USE_AFTER_FREE, "test-sanitizer-address",
+        )
+        return _merge_same_fingerprint_failures([vg, asan])[0]
+
+    def _sections(self, comment: str) -> list[str]:
+        return [
+            line for line in comment.split("\n")
+            if line.startswith("**") or line.startswith("Test failed again on")
+        ]
+
+    def test_the_creation_comment_follows_the_model(self) -> None:
+        comment = renderer_for(self._merged()).render("<!-- m -->", 1).creation_comment
+        sections = self._sections(comment)
+        assert sections[0].startswith("Test failed again on")
+        assert "**New error stack trace**" in sections
+        assert "**Failed in:**" in sections
+
+    def test_a_recurrence_comment_follows_the_same_model(self) -> None:
+        merged = self._merged()
+        renderer = renderer_for(merged)
+        renderer.merge_environments(_build_body(
+            _memory_failure(FailureType.VALGRIND, _VG_USE_AFTER_FREE, "test-valgrind"),
+            marker="<!-- m -->", occurrences=1,
+        ))
+        sections = self._sections(renderer.render("<!-- m -->", 2).comment)
+        assert sections[0].startswith("Test failed again on")
+        assert "**New error stack trace**" in sections
+        assert "**Failed in:**" in sections
+
+    def test_neither_comment_invents_a_heading(self) -> None:
+        merged = self._merged()
+        content = renderer_for(merged).render("<!-- m -->", 1)
+        allowed = {
+            "**New error stack trace**",
+            "**Failed in:**",
+            "**Newly failing in:**",
+        }
+        for comment in (content.creation_comment, content.comment):
+            for section in self._sections(comment):
+                if section.startswith("Test failed again on"):
+                    continue
+                assert any(section.startswith(a.rstrip("*")) for a in allowed), (
+                    f"unexpected section: {section!r}"
+                )
