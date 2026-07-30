@@ -1824,7 +1824,7 @@ class TestMultiTraceBody:
         assert "heap-use-after-free" in content.body
         assert "Invalid read of size 4" not in content.body
         assert "Invalid read of size 4" in content.creation_comment
-        assert "**Valgrind trace**" in content.creation_comment
+        assert "**Error stack trace**" in content.creation_comment
 
     def test_both_tools_appear_in_the_environments_line(self) -> None:
         vg = _memory_failure(FailureType.VALGRIND, _VG_USE_AFTER_FREE, "test-valgrind")
@@ -2161,7 +2161,7 @@ class TestAbsorbedTraceReachesTheIssue:
         renderer.merge_environments(self._valgrind_only_body())
         comment = renderer.render("<!-- m -->", 2).comment
         assert "heap-use-after-free" in comment
-        assert "Sanitizer trace:" in comment
+        assert "**New error stack trace**" in comment
 
     def test_a_trace_the_issue_already_stores_is_not_repeated(self) -> None:
         renderer = renderer_for(self._merged())
@@ -2248,8 +2248,7 @@ class TestAbsorbedTraceOnCreation:
     def test_creation_comment_carries_the_absorbed_trace(self) -> None:
         content = renderer_for(self._merged()).render("<!-- m -->", 1)
         assert "Invalid read of size 4" in content.creation_comment
-        assert "**Valgrind trace**" in content.creation_comment
-        assert "Sanitizer report" in content.creation_comment
+        assert "**Error stack trace**" in content.creation_comment
 
     def test_a_single_tool_failure_posts_no_creation_comment(self) -> None:
         content = renderer_for(
@@ -2471,3 +2470,55 @@ class TestDistinctLeaksGetDistinctTitles:
         ))
         assert "and 3 more" in title
         assert len(title) <= 256
+
+
+class TestCommentsUseOnlyTemplateWording:
+    """Comments reuse the template's headings and add no prose of their own.
+
+    Detector issues sit beside ones filed by hand, so every section a reader or
+    a parser meets should be one the template defines. Explanatory sentences and
+    per-tool headings were invented here and are not part of it.
+    """
+
+    _INVENTED = (
+        "also reported by",
+        "The issue body holds",
+        "Valgrind trace",
+        "Sanitizer trace",
+        "Reported by",
+    )
+
+    def _merged(self) -> UniqueFailure:
+        vg = _memory_failure(FailureType.VALGRIND, _VG_USE_AFTER_FREE, "test-valgrind")
+        asan = _memory_failure(
+            FailureType.SANITIZER, _ASAN_USE_AFTER_FREE, "test-sanitizer-address",
+        )
+        return _merge_same_fingerprint_failures([vg, asan])[0]
+
+    def test_the_creation_comment_adds_no_prose(self) -> None:
+        content = renderer_for(self._merged()).render("<!-- m -->", 1)
+        assert content.creation_comment
+        for phrase in self._INVENTED:
+            assert phrase not in content.creation_comment
+
+    def test_the_creation_comment_uses_the_template_heading(self) -> None:
+        content = renderer_for(self._merged()).render("<!-- m -->", 1)
+        assert "**Error stack trace**" in content.creation_comment
+        assert "Invalid read of size 4" in content.creation_comment
+
+    def test_the_recurrence_comment_adds_no_prose(self) -> None:
+        body = _build_body(
+            _memory_failure(FailureType.VALGRIND, _VG_USE_AFTER_FREE, "test-valgrind"),
+            marker="<!-- m -->", occurrences=1,
+        )
+        renderer = renderer_for(self._merged())
+        renderer.merge_environments(body)
+        comment = renderer.render("<!-- m -->", 2).comment
+        assert "**New error stack trace**" in comment
+        for phrase in self._INVENTED:
+            assert phrase not in comment
+
+    def test_the_body_adds_no_prose(self) -> None:
+        body = _build_body(self._merged(), marker="<!-- m -->", occurrences=1)
+        for phrase in self._INVENTED:
+            assert phrase not in body

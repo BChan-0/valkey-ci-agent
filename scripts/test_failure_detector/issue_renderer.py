@@ -240,11 +240,11 @@ class _FailureRenderer:
                 continue
             if _normalize_trace(candidate) in stored:
                 continue
-            fresh.append(
-                candidate if len(traces) == 1 else f"{label} trace:\n{candidate}"
-            )
+            fresh.append(candidate)
         if not fresh:
             return None
+        # Joined as one trace: the comment renders it under the template's
+        # heading, which carries no per-tool label.
         return "\n\n".join(fresh)
 
 
@@ -768,24 +768,20 @@ def _build_absorbed_trace_comment(failure: UniqueFailure) -> str:
     goes here: it says things the first does not (each tool names details the
     other omits), and discarding it would lose the reason the two were merged.
 
+    Uses the template's own trace heading, with no wording of its own: a reader
+    or a parser sees the same section here as in a body.
+
     Returns "" for the ordinary single-tool failure, which posts no comment.
     """
     if not failure.extra_traces:
         return ""
-    own = trace_label_for(failure)
-    lines = [
-        f"The same bug was also reported by "
-        f"{', '.join(label for label, _ in failure.extra_traces)}. "
-        f"The issue body holds the {own} report.",
-    ]
+    lines: list[str] = []
     budget = _MAX_TRACE_CHARS // (len(failure.extra_traces) + 1)
-    for label, trace in failure.extra_traces:
-        text = _truncate_trace(trace, budget) or "N/A"
-        fence = _fence_for(_defuse_markers(text))
-        lines.append(
-            f"\n**{label} trace**\n\n{fence}\n{_defuse_markers(text)}\n{fence}"
-        )
-    return "\n".join(lines)
+    for _label, trace in failure.extra_traces:
+        text = _defuse_markers(_truncate_trace(trace, budget)) or "N/A"
+        fence = _fence_for(text)
+        lines.append(f"**Error stack trace**\n\n{fence}\n{text}\n{fence}")
+    return "\n\n".join(lines)
 
 
 def _build_comment(
@@ -841,12 +837,20 @@ def _record_reported_tools(body: str, labels: list[str]) -> str:
     return f"{body}\n{marker}"
 
 
+# The body's own Environments line, anchored to the start of a line. A trace is
+# embedded verbatim above it and can quote the same text, which an unanchored
+# pattern matches first: the environments would then be read from, and written
+# back into, the trace, leaving the real line frozen and every job reading as
+# newly failing on every run.
+_ENVIRONMENTS_LINE_RE = re.compile(r"(?m)^\*\*Environments:\*\*[ \t]*.*$")
+
+
 def _extract_environments_from_body(body: str) -> list[str]:
     """Extract existing environment names from an issue body."""
-    env_match = re.search(r"\*\*Environments:\*\*\s*(.+)", body)
+    env_match = _ENVIRONMENTS_LINE_RE.search(body)
     if not env_match:
         return []
-    return re.findall(r"`([^`]+)`", env_match.group(1))
+    return re.findall(r"`([^`]+)`", env_match.group(0))
 
 
 # The fence length varies (see _fence_for); the backreference requires the
@@ -923,12 +927,11 @@ def _normalize_trace(text: str) -> str:
 def _update_environments_in_body(body: str, all_envs: list[str]) -> str:
     """Replace the issue body's Environments line with an updated list.
 
-    Only the first occurrence: a trace that quotes the line would otherwise be
-    rewritten too. The replacement is escaped because a job name is data, and a
-    backslash in one is a group reference to ``re.sub``.
+    The replacement is escaped because a job name is data, and a backslash in
+    one would read as a group reference to ``re.sub``.
     """
     new_env_line = f"**Environments:** {', '.join(f'`{e}`' for e in all_envs)}"
-    return re.sub(
-        r"\*\*Environments:\*\*\s*.+", new_env_line.replace("\\", r"\\"), body,
+    return _ENVIRONMENTS_LINE_RE.sub(
+        new_env_line.replace("\\", r"\\"), body,
         count=1,
     )
