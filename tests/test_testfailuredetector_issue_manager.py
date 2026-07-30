@@ -2590,3 +2590,56 @@ class TestSymbolicatedMacosLeaksReport:
             self._failure("tests/unit/other.tcl").error
         )
         assert identity.count("_sdsnewlen") == 1
+
+
+class TestCreationCommentCarriesItsContext:
+    """The comment naming a second tool's report lists the jobs it came from.
+
+    It uses the same headings as a recurrence comment. A bare trace read as
+    truncated output: nothing in it said which jobs reported the bug or linked
+    to their runs.
+    """
+
+    def _merged(self) -> UniqueFailure:
+        vg = _memory_failure(FailureType.VALGRIND, _VG_USE_AFTER_FREE, "test-valgrind")
+        asan = _memory_failure(
+            FailureType.SANITIZER, _ASAN_USE_AFTER_FREE, "test-sanitizer-address",
+        )
+        return _merge_same_fingerprint_failures([vg, asan])[0]
+
+    def test_the_comment_lists_the_failing_jobs(self) -> None:
+        comment = renderer_for(self._merged()).render("<!-- m -->", 1).creation_comment
+        assert "**Failed in:**" in comment
+        assert "`test-valgrind`" in comment
+        assert "`test-sanitizer-address`" in comment
+
+    def test_the_comment_still_carries_the_trace(self) -> None:
+        comment = renderer_for(self._merged()).render("<!-- m -->", 1).creation_comment
+        assert "**Error stack trace**" in comment
+        assert "Invalid read of size 4" in comment
+
+    def test_the_headings_match_a_recurrence_comment(self) -> None:
+        """Both comments use the same sections, so a reader meets one format."""
+        merged = self._merged()
+        creation = renderer_for(merged).render("<!-- m -->", 1).creation_comment
+        renderer = renderer_for(merged)
+        renderer.merge_environments(_build_body(
+            _memory_failure(FailureType.VALGRIND, _VG_USE_AFTER_FREE, "test-valgrind"),
+            marker="<!-- m -->", occurrences=1,
+        ))
+        recurrence = renderer.render("<!-- m -->", 2).comment
+        assert "**Failed in:**" in creation
+        assert "**Failed in:**" in recurrence
+
+    def test_a_failure_with_no_jobs_omits_the_section(self) -> None:
+        """A merged failure always has jobs, but an empty list must not leave a
+        heading with nothing under it."""
+        vg = _memory_failure(FailureType.VALGRIND, _VG_USE_AFTER_FREE, "test-valgrind")
+        asan = _memory_failure(
+            FailureType.SANITIZER, _ASAN_USE_AFTER_FREE, "test-sanitizer-address",
+        )
+        merged = _merge_same_fingerprint_failures([vg, asan])[0]
+        merged.jobs.clear()
+        comment = renderer_for(merged).render("<!-- m -->", 1).creation_comment
+        assert "**Failed in:**" not in comment
+        assert "**Error stack trace**" in comment

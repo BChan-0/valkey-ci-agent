@@ -789,8 +789,9 @@ def _build_absorbed_trace_comment(failure: UniqueFailure) -> str:
     goes here: it says things the first does not (each tool names details the
     other omits), and discarding it would lose the reason the two were merged.
 
-    Uses the template's own trace heading, with no wording of its own: a reader
-    or a parser sees the same section here as in a body.
+    Uses the same headings as a recurrence comment, so a reader meets one
+    format throughout: the trace, then the jobs it came from. A trace on its own
+    said nothing about which jobs reported it.
 
     Returns "" for the ordinary single-tool failure, which posts no comment.
     """
@@ -802,6 +803,11 @@ def _build_absorbed_trace_comment(failure: UniqueFailure) -> str:
         text = _defuse_markers(_truncate_trace(trace, budget)) or "N/A"
         fence = _fence_for(text)
         lines.append(f"**Error stack trace**\n\n{fence}\n{text}\n{fence}")
+    ci_links = "\n".join(
+        f"- `{j.job}`: [CI link]({j.url})" for j in failure.jobs
+    )
+    if ci_links:
+        lines.append(f"**Failed in:**\n{ci_links}")
     return "\n\n".join(lines)
 
 
