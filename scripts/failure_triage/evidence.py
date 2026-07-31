@@ -334,11 +334,11 @@ def _budgeted_span(
     # When the whole window fits under the cap, keep it whole: the proportional
     # split below is only for trimming, and applying it to a window that already
     # fits would drop context for no reason and flag a spurious truncation. The
-    # check renders the full window's header so it is exact rather than relying
-    # on a fixed header reserve.
+    # check renders exactly what the caller renders, so it neither over- nor
+    # under-counts the separators.
     full_header = _excerpt_header(window_start, window_end, len(lines), False)
-    window_cost = sum(len(lines[i]) + 1 for i in range(window_start, window_end))
-    if window_cost + len("\n".join(full_header)) + 1 <= _MAX_EXCERPT_CHARS:
+    full_text = "\n".join(full_header + lines[window_start:window_end])
+    if len(full_text) <= _MAX_EXCERPT_CHARS:
         return window_start, window_end
 
     # The window is too large. Spend a proportional share forward, reserving the
