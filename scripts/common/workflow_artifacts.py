@@ -103,7 +103,23 @@ class ArtifactClient:
             f"/repos/{repo_full_name}/actions/runs/{run_id}/logs"
         ))
 
-    def _download(self, path: str) -> bytes:
+    def download_job_log(self, repo_full_name: str, job_id: int) -> bytes:
+        """Download one job's console log, or ``b""`` when it has expired.
+
+        A run's log zip holds every job and runs to tens of megabytes; a caller
+        that already knows which job failed fetches only that job's log here.
+        Unlike the run-log endpoint this returns plain text, not a zip. Shares
+        the token-redirect and retry discipline of the other downloads. The read
+        is capped: this path does not go through ``_extract_zip``, which is where
+        the other downloads enforce their size limit, so a pathological log
+        cannot pull an unbounded body into memory.
+        """
+        return self._download(
+            f"/repos/{repo_full_name}/actions/jobs/{job_id}/logs",
+            max_bytes=_MAX_JOB_LOG_BYTES,
+        )
+
+    def _download(self, path: str, *, max_bytes: int | None = None) -> bytes:
         url = f"https://api.github.com{path}"
         req = Request(url, headers={
             "Accept": "application/vnd.github+json",
@@ -121,10 +137,20 @@ class ArtifactClient:
         for attempt in range(self._retries + 1):
             try:
                 with urlopen(req, timeout=120) as resp:
-                    return resp.read()
+                    # Read one byte past the cap so an oversized body is detected
+                    # rather than silently returned truncated to exactly the cap.
+                    if max_bytes is None:
+                        return resp.read()
+                    data = resp.read(max_bytes + 1)
+                    if len(data) > max_bytes:
+                        logger.warning(
+                            "Response at %s exceeds %d bytes; truncating", path, max_bytes,
+                        )
+                        return data[:max_bytes]
+                    return data
             except HTTPError as exc:
                 if exc.code == 404:
-                    logger.warning("Artifact not found at %s (likely expired)", path)
+                    logger.warning("Log or artifact not found at %s (likely expired)", path)
                     return b""
                 if exc.code in RETRYABLE_HTTP_STATUS and attempt < self._retries:
                     time.sleep(transient_backoff_delay(attempt))
@@ -141,6 +167,11 @@ class ArtifactClient:
 # Defends against a runaway log/artifact dump that would exhaust the runner.
 # Real fuzzer artifacts and CI run logs are typically well under this.
 _MAX_UNCOMPRESSED_BYTES = 500 * 1024 * 1024
+
+# Cap for a single job's console log, which the excerpt carver reads whole into
+# memory. A real Valkey job log is around a megabyte; this leaves generous room
+# while bounding a pathological one.
+_MAX_JOB_LOG_BYTES = 50 * 1024 * 1024
 
 
 def _extract_zip(blob: bytes) -> dict[str, bytes]:

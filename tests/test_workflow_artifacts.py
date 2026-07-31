@@ -100,6 +100,45 @@ def test_download_run_logs_empty_on_expired(monkeypatch):
     assert client.download_run_logs("r", 1) == {}
 
 
+def test_download_job_log_returns_raw_text(monkeypatch):
+    """A single job's log comes back as plain text, not a zip."""
+    client = ArtifactClient(MagicMock(), token="t")
+    captured = {}
+
+    def fake_download(path, *, max_bytes=None):
+        captured["path"] = path
+        captured["max_bytes"] = max_bytes
+        return b"[err]: boom in tests/x.tcl"
+
+    monkeypatch.setattr(client, "_download", fake_download)
+    assert client.download_job_log("valkey-io/valkey", 12345) == b"[err]: boom in tests/x.tcl"
+    assert captured["path"].endswith("/actions/jobs/12345/logs")
+    # The job-log read is capped, unlike the zip downloads.
+    assert captured["max_bytes"] is not None
+
+
+def test_download_job_log_empty_on_expired(monkeypatch):
+    """An expired job log (404) yields empty bytes, not an exception."""
+    client = ArtifactClient(MagicMock(), token="t")
+    monkeypatch.setattr(client, "_download", lambda path, *, max_bytes=None: b"")
+    assert client.download_job_log("r", 1) == b""
+
+
+def test_download_caps_oversized_body(monkeypatch):
+    """A body over the cap is truncated to it rather than read whole."""
+    from scripts.common import workflow_artifacts as artifacts_mod
+
+    class _Resp:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self, size=-1): return b"x" * size if size and size > 0 else b"x" * 100
+
+    monkeypatch.setattr(artifacts_mod, "urlopen", lambda req, timeout=0: _Resp())
+    client = ArtifactClient(MagicMock(), token="t")
+    data = client._download("/some/path", max_bytes=10)
+    assert len(data) == 10
+
+
 def test_list_run_artifacts():
     mock_repo = MagicMock()
     mock_repo._requester.requestJsonAndCheck.return_value = (

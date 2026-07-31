@@ -159,6 +159,7 @@ Operational workflows require these values in the `valkey-ci-agent` repository:
 | Secret | `VALKEYRIE_BOT_APP_ID` | Valkeyrie GitHub App ID |
 | Secret | `VALKEYRIE_BOT_PRIVATE_KEY` | Valkeyrie GitHub App private key |
 | Variable | `AWS_REGION` | AWS region, for example `us-east-1` |
+| Variable | `ENABLE_AI_FAILURE_TRIAGE` | Set to `true` to enable the AI Failure Triage workflow; anything else leaves it off |
 
 Claude Code defaults to Fable 5 through the `us.anthropic.claude-fable-5`
 Bedrock inference profile. The AWS account must have access to that profile and
@@ -216,6 +217,34 @@ local `scripts.backport.mark_done` command with `--dry-run` shown above.
 gh workflow run backport-mark-done-poll.yml \
   --repo valkey-io/valkey-ci-agent \
   --field repo=valkey-io/valkey
+```
+
+### AI Failure Triage
+
+`.github/workflows/failure-triage.yml` runs when the Test Failure Detector
+completes and posts an AI analysis on the issues that run filed. It is gated by
+the `ENABLE_AI_FAILURE_TRIAGE` repository variable and stays off until that
+variable is `true`.
+
+Dispatch it manually with `dry_run` to inspect the analysis without commenting.
+Pass `issues` to backfill specific older issues, ignoring the age filter:
+
+```bash
+gh workflow run failure-triage.yml \
+  --repo valkey-io/valkey-ci-agent \
+  --field repo=valkey-io/valkey \
+  --field issues=4289,4290 \
+  --field dry_run=true
+```
+
+To run it locally against real issues without commenting:
+
+```bash
+TARGET_TOKEN="$GITHUB_TOKEN" python -m scripts.failure_triage.main \
+  --repo valkey-io/valkey \
+  --issues 4289 \
+  --dry-run \
+  --verbose
 ```
 
 ## Registry Changes

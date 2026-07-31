@@ -308,6 +308,32 @@ main.py (daily cron or manual dispatch)
 - `scripts/test_failure_detector/manage_issues.py` - orchestration over the shared dedup publisher to create/update issues
 - `scripts/test_failure_detector/issue_renderer.py` - test-failure-specific title/body/comment rendering and label assignment
 
+## AI Failure Triage Flow
+
+```text
+main.py (Test Failure Detector completion, or manual dispatch)
+  -> discover.select_targets() reads run id, job id, test, and error off issue bodies
+  for each target:
+    -> evidence.collect() downloads the failing job log, carves the failure
+       excerpt, clones valkey at the run's commit
+    -> analyze.triage() runs a read-only agent, returns a structured verdict
+    -> comment.post() renders and posts the analysis on the issue
+```
+
+Triage reads the published issues rather than the detector's in-memory
+failures, so analyzing a fresh issue and an older one is one code path with a
+different filter. It is kept out of the detector so an AI or Bedrock outage
+cannot turn the detector's tracking signal red.
+
+### Entry Points
+
+- `scripts/failure_triage/main.py` - CLI entry point and per-issue orchestration
+- `scripts/failure_triage/discover.py` - issue selection and body parsing
+- `scripts/failure_triage/evidence.py` - job-log download, excerpt carving, source clone
+- `scripts/failure_triage/analyze.py` - prompt, read-only agent call, verdict parsing
+- `scripts/failure_triage/comment.py` - comment rendering and idempotent posting
+- `scripts/failure_triage/models.py` - the shapes passed between the stages
+
 ## Release Notes Flow
 
 ```text

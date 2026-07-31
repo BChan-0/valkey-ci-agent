@@ -29,6 +29,7 @@ New workflows are added as sibling directories to `backport/`. Each workflow pic
 | Fuzzer Monitor | Active | Analyzes scheduled fuzzer runs and files issues for anomalous failures |
 | CI Fix | Active | On-demand `@valkeyrie-bot fix <ci-link>` - diagnoses and fixes a failing test on a backport PR |
 | Test Failure Detector | Active | Detects test failures from Daily CI, files/updates GitHub issues |
+| AI Failure Triage | Active | Reads the issues the detector filed, posts an AI root-cause analysis and, when recognizable, a fix suggestion |
 | Release Notes | Active | Cuts a release: AI-generates notes from `release-notes` PRs plus AI-triaged candidates without that label, promotes them onto a release line branch, bumps `src/version.h`, opens a PR (held as a draft when the cut flags issues) |
 | PR Reviewer | Planned | Two-stage code review with skeptic pass |
 | Additional Daily CI Analysis | Planned | Detects flaky tests, generates fix PRs |
@@ -161,6 +162,75 @@ gh workflow run test-failure-detector-sweep.yml \
 - `repo` - target repository to scan (default: `valkey-io/valkey`)
 - `run_id` - specific workflow run ID to analyze (empty = latest Daily run)
 - `dry_run` - parse and report only, don't create/update issues
+
+## AI Failure Triage
+
+Reads the issues the Test Failure Detector filed and posts an AI-generated
+analysis as a comment: a summary of the failure, a hypothesized root cause and,
+when the pattern is recognizable, a suggested fix in prose. It is read-only. It
+never opens a branch or PR, which stays the CI Fix workflow's job.
+
+### How it works
+
+The triage pipeline (`scripts/failure_triage/`) reuses the shared AI layer
+(`run_agent` and its read-only profiles), `ArtifactClient`, and
+`shallow_clone_at_sha`. It discovers its work from the published issues rather
+than the detector's in-memory failures, so a fresh detector run and an older
+issue take one code path.
+
+1. **Trigger** - runs when the Test Failure Detector workflow completes, or on
+   manual dispatch. It is gated by the `ENABLE_AI_FAILURE_TRIAGE` repository
+   variable and does nothing unless that variable is set to `true`.
+2. **Select issues** - lists open `test-failure` issues and reads the run id,
+   job id, test name, and error trace off each body. On the automatic trigger it
+   analyzes the recently filed issues that do not yet carry a triage comment,
+   which right after a detector run are the ones it just filed; an age filter
+   keeps it inside the window where run logs still exist, and a per-run limit
+   bounds the work. A manual dispatch can scope to one detector run or to
+   specific issue numbers.
+3. **Gather evidence** - downloads the failing job's console log and carves the
+   block around the failure, so the agent reads a focused excerpt rather than a
+   megabyte of log. Because Daily CI runs its suites with `--dump-logs`, the
+   server logs of the failing test sit in that excerpt. The Valkey source is
+   cloned at the exact commit the run was built from.
+4. **Analyze** - a read-only agent (`Read`, `Grep`, `Glob` only) reads the
+   excerpt and the source and returns a structured verdict: summary, root cause,
+   a failure class (product bug, test bug, flaky, infrastructure, or
+   undetermined), a confidence, and an optional fix suggestion.
+5. **Comment** - renders the verdict into a comment and posts it once per issue,
+   marked so a later run does not repeat it. Every comment carries a caveat that
+   it is AI-generated and may be wrong. When no analysis can be produced (an
+   expired log, a stalled model), an honest note is posted instead.
+
+A GitHub Actions job summary reports how many issues were selected, commented,
+skipped for lack of evidence, or errored.
+
+#### Prerequisites
+
+The workflow uses the same GitHub App secrets as the detector for `issues:write`
+and `actions:read` on `valkey-io/valkey`, and the same `AWS_ROLE_ARN` OIDC role
+as the fuzzer monitor for Bedrock access. It runs only when the
+`ENABLE_AI_FAILURE_TRIAGE` repository variable is `true`, so it can be turned on
+or off from the repository settings without a code change.
+
+### Usage
+
+#### Manual dispatch
+
+```bash
+gh workflow run failure-triage.yml \
+  --repo valkey-io/valkey-ci-agent \
+  --field repo=valkey-io/valkey \
+  --field issues=4289,4290 \
+  --field dry_run=true
+```
+
+- `repo` - target repository whose issues to triage (default: `valkey-io/valkey`)
+- `detector_run_id` - only triage issues recorded by this detector run (empty = any open issue within the age filter)
+- `issues` - comma-separated issue numbers to triage, ignoring the age filter
+- `limit` - most issues to triage in one run (default: 10)
+- `force` - triage issues that already carry a triage comment
+- `dry_run` - analyze and report only, don't post comments
 
 ## CI Fix Workflow
 

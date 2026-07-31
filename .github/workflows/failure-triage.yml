@@ -1,0 +1,169 @@
+name: AI Failure Triage
+
+# Runs after the Test Failure Detector and analyzes the issues that run
+# recorded. Kept separate from the detector so an AI or Bedrock outage cannot
+# turn the detector's tracking signal red.
+on:
+  workflow_run:
+    workflows: ["Test Failure Detector"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: "Repository whose issues to triage (default: valkey-io/valkey)"
+        required: false
+        type: string
+        default: "valkey-io/valkey"
+      detector_run_id:
+        description: "Only triage issues stamped with this Daily CI run id (empty = any open issue within the age filter)"
+        required: false
+        type: string
+        default: ""
+      issues:
+        description: "Comma-separated issue numbers to triage, ignoring the age filter"
+        required: false
+        type: string
+        default: ""
+      limit:
+        description: "Most issues to triage in one run"
+        required: false
+        type: string
+        default: "10"
+      force:
+        description: "Triage issues that already carry a triage comment"
+        required: false
+        default: false
+        type: boolean
+      dry_run:
+        description: "Analyze and report without commenting"
+        required: false
+        default: false
+        type: boolean
+
+permissions: {}
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  triage:
+    name: "Triage detected failures"
+    # Off unless ENABLE_AI_FAILURE_TRIAGE is set to true, so the comparison is
+    # written against 'true' rather than testing for absence: an unset or
+    # misspelled variable leaves the workflow disabled. On the automatic trigger
+    # it also runs only when the detector run succeeded, so a crashed detector
+    # run does not launch a full analysis job.
+    if: >
+      vars.ENABLE_AI_FAILURE_TRIAGE == 'true' &&
+      (github.event_name == 'workflow_dispatch' ||
+      (github.repository == 'valkey-io/valkey-ci-agent' &&
+      github.event.workflow_run.conclusion == 'success'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      id-token: write
+    # A fixed group serializes triage runs so an automatic run and a manual
+    # dispatch cannot select the same issues and double-comment.
+    concurrency:
+      group: ai-failure-triage-${{ inputs.repo || 'valkey-io/valkey' }}
+      cancel-in-progress: false
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      CLAUDE_CODE_USE_BEDROCK: "1"
+      CI_AGENT_EVIDENCE_DIR: agent-evidence
+    steps:
+      - name: Check out agent repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up agent dependencies
+        uses: ./.github/actions/setup-agent
+        with:
+          install-claude: "true"
+
+      - name: Generate GitHub App token
+        id: generate-token
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
+        with:
+          app-id: ${{ secrets.VALKEYRIE_BOT_APP_ID }}
+          private-key: ${{ secrets.VALKEYRIE_BOT_PRIVATE_KEY }}
+          owner: valkey-io
+          repositories: valkey
+          permission-actions: read
+          permission-contents: read
+          permission-issues: write
+          permission-metadata: read
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: valkey-failure-triage-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Triage the detected failures
+        shell: bash
+        env:
+          TARGET_TOKEN: ${{ steps.generate-token.outputs.token }}
+          TARGET_REPO: ${{ inputs.repo || 'valkey-io/valkey' }}
+          # The Daily CI run id the detector stamped on its issues. The
+          # workflow_run event does not carry it (only the detector's own run
+          # id), so on the automatic trigger this is empty and every recently
+          # filed, not-yet-triaged issue is a candidate. It is set only on
+          # manual dispatch, to scope triage to one CI run.
+          DETECTOR_RUN_ID: ${{ inputs.detector_run_id || '' }}
+          ISSUES: ${{ inputs.issues || '' }}
+          LIMIT: ${{ inputs.limit || '10' }}
+          FORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.force == true && 'true' || 'false' }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run == true && 'true' || 'false' }}
+          TRIAGE_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          args=(
+            -m scripts.failure_triage.main
+            --token "${TARGET_TOKEN}"
+            --repo "${TARGET_REPO}"
+            --limit "${LIMIT}"
+            --triage-run-url "${TRIAGE_RUN_URL}"
+            --output failure-triage-result.json
+            --verbose
+          )
+
+          if [[ -n "${DETECTOR_RUN_ID}" ]]; then
+            args+=(--run-id "${DETECTOR_RUN_ID}")
+          fi
+
+          if [[ -n "${ISSUES}" ]]; then
+            args+=(--issues "${ISSUES}")
+          fi
+
+          if [[ "${FORCE}" == "true" ]]; then
+            args+=(--force)
+          fi
+
+          if [[ "${DRY_RUN}" == "true" ]]; then
+            args+=(--dry-run)
+          fi
+
+          python "${args[@]}"
+
+      - name: Upload triage result
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: failure-triage-result-${{ github.run_id }}
+          path: failure-triage-result.json
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload agent evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: failure-triage-agent-evidence-${{ github.run_id }}
+          path: agent-evidence
+          if-no-files-found: ignore
+          retention-days: 30

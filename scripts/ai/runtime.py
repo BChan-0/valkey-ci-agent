@@ -22,6 +22,7 @@ AgentProfileName = Literal[
     "validation_repair_edit_only",
     "fuzzer_analysis_readonly",
     "ci_fix_diagnose_readonly",
+    "failure_triage_readonly",
 ]
 
 
@@ -105,6 +106,24 @@ AGENT_PROFILES: dict[AgentProfileName, AgentProfile] = {
         max_turns=200,
         writes_allowed=False,
         output_schema="text",
+    ),
+    # The log search this profile would otherwise spend its turns on has already
+    # been done: the excerpt handed to it is carved down to the failure. So the
+    # turn budget is a fraction of the diagnosis profile's, which starts from a
+    # whole run's logs.
+    "failure_triage_readonly": AgentProfile(
+        name="failure_triage_readonly",
+        allowed_tools="Read,Grep,Glob",
+        timeout=1800,
+        effort="high",
+        max_turns=80,
+        writes_allowed=False,
+        output_schema="text",
+        # The write tools are already absent from allowed_tools; naming them here
+        # too adds an explicit hard-deny, since a default of "" leaves the
+        # --disallowedTools flag unset. The output is posted to a public issue,
+        # so the extra layer is worth it.
+        disallowed_tools="Bash,Write,Edit,MultiEdit",
     ),
 }
 
