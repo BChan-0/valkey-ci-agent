@@ -120,6 +120,18 @@ def test_carve_excerpt_truncates_within_budget(monkeypatch):
     assert len(excerpt.text) <= 2000
 
 
+def test_carve_excerpt_truncates_giant_anchor_line(monkeypatch):
+    # A single-line sanitizer dump longer than the whole budget: the failure line
+    # must be kept but truncated, never returned over the cap.
+    monkeypatch.setattr(evidence_mod, "_MAX_EXCERPT_CHARS", 500)
+    target = _target(test_name="t", test_file="tests/x.tcl", failure_type="sanitizer")
+    lines = ["[err]: t in tests/x.tcl " + "A" * 5000]
+    excerpt = carve_excerpt(lines, target)
+    assert excerpt is not None
+    assert excerpt.truncated
+    assert len(excerpt.text) <= 500
+
+
 def test_carve_excerpt_log_lines_excludes_header():
     target = _target(test_name="t", test_file="tests/x.tcl")
     marker = "[err]: t in tests/x.tcl"

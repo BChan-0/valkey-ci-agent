@@ -128,15 +128,34 @@ def test_render_clamps_oversized_comment(monkeypatch):
 
 
 def test_clamp_closes_open_fence_before_notice(monkeypatch):
-    monkeypatch.setattr(comment_mod, "_MAX_COMMENT_CHARS", 120)
+    monkeypatch.setattr(comment_mod, "_MAX_COMMENT_CHARS", 200)
     # A body cut inside a fenced block must have the fence closed so the
     # re-appended caveat renders as text, not swallowed into the code block.
     body = "line\n```\n" + "code\n" * 200
     clamped = comment_mod._clamp(body)
-    assert len(clamped) <= 120
-    fence_lines = [ln for ln in clamped.splitlines() if ln.startswith("```")]
-    assert len(fence_lines) % 2 == 0
+    assert len(clamped) <= 200
+    # Parsed as a fence-state machine, nothing is left open.
+    assert comment_mod._open_fence(clamped) == ""
     assert "truncated" in clamped
+
+
+def test_open_fence_ignores_closed_longer_fence():
+    # A closed 4-backtick block (as _fenced emits around backtick content) must
+    # not be misread as open.
+    assert comment_mod._open_fence(comment_mod._fenced("```\ncode")) == ""
+
+
+def test_open_fence_returns_matching_length_closer():
+    # An open 11-backtick fence needs an 11-backtick closer, not a 3-backtick one.
+    kept = "`" * 11 + " info\n" + "q\n" * 5
+    assert comment_mod._open_fence(kept) == "`" * 11
+
+
+def test_open_fence_shorter_run_does_not_close_longer_fence():
+    # While a long fence is open, a shorter backtick run inside is content, not a
+    # closer, so the block is still open.
+    kept = "`" * 6 + "\n```\nstill inside\n"
+    assert comment_mod._open_fence(kept) == "`" * 6
 
 
 def test_post_creates_comment_and_returns_url():

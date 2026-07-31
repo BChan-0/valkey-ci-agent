@@ -276,14 +276,24 @@ def carve_excerpt(lines: list[str], target: TriageTarget) -> Excerpt | None:
     # split reserves room for the header, but rather than trust that reserve to
     # be exactly right, leading lines are dropped until the whole thing fits, so
     # the returned text is never over the cap regardless of the header's length.
-    while True:
+    while kept_start < anchor:
         kept = lines[kept_start:kept_end]
         header = _excerpt_header(kept_start, kept_end, len(lines), truncated)
         text = "\n".join(header + kept)
-        if len(text) <= _MAX_EXCERPT_CHARS or kept_start >= anchor:
+        if len(text) <= _MAX_EXCERPT_CHARS:
             return Excerpt(text=text, log_lines=len(kept), truncated=truncated)
         kept_start += 1
         truncated = True
+
+    # Only the anchor line and what follows it are left, yet the text is still
+    # over the cap: the anchor line itself is too long (a single-line sanitizer
+    # or valgrind dump). Keep just the anchor and truncate it, so the failure is
+    # never dropped for being large.
+    header = _excerpt_header(anchor, anchor + 1, len(lines), True)
+    overhead = len("\n".join(header + [""]))
+    truncated_line = lines[anchor][: max(0, _MAX_EXCERPT_CHARS - overhead)]
+    text = "\n".join(header + [truncated_line])
+    return Excerpt(text=text, log_lines=1, truncated=True)
 
 
 def _excerpt_header(
