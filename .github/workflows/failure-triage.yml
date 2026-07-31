@@ -122,9 +122,11 @@ jobs:
           TRIAGE_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
+          # The token is read from TARGET_TOKEN in the environment rather than
+          # passed on the command line, so it does not appear in the process's
+          # argv on the runner.
           args=(
             -m scripts.failure_triage.main
-            --token "${TARGET_TOKEN}"
             --repo "${TARGET_REPO}"
             --limit "${LIMIT}"
             --triage-run-url "${TRIAGE_RUN_URL}"
