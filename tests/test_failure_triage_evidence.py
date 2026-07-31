@@ -120,6 +120,45 @@ def test_carve_excerpt_truncates_within_budget(monkeypatch):
     assert len(excerpt.text) <= 2000
 
 
+def test_carve_excerpt_keeps_forward_context_when_anchor_is_first_line():
+    # The failure can be the first line of the log (nothing precedes it). The
+    # following server-log lines must still be kept, not collapsed to the anchor.
+    target = _target(test_name="my test", test_file="tests/x.tcl")
+    marker = "[err]: my test in tests/x.tcl"
+    lines = [marker] + [f"after {i}: dumped server log" for i in range(150)]
+    excerpt = carve_excerpt(lines, target)
+    assert excerpt is not None
+    assert not excerpt.truncated
+    assert excerpt.log_lines == 151
+    assert "dumped server log" in excerpt.text
+
+
+def test_carve_excerpt_keeps_whole_window_when_it_fits(monkeypatch):
+    # A window that fits under the cap must be kept whole and not flagged
+    # truncated, even when trailing lines are large: the proportional forward
+    # split is for trimming an oversized window, not a fitting one.
+    monkeypatch.setattr(evidence_mod, "_MAX_EXCERPT_CHARS", 4000)
+    target = _target(test_name="t", test_file="tests/x.tcl")
+    marker = "[err]: t in tests/x.tcl"
+    lines = ["before"] * 5 + [marker] + ["x" * 300] * 5
+    excerpt = carve_excerpt(lines, target)
+    assert excerpt is not None
+    assert not excerpt.truncated
+    assert excerpt.log_lines == len(lines)
+
+
+def test_carve_excerpt_truncates_giant_anchor_line(monkeypatch):
+    # A single-line sanitizer dump longer than the whole budget: the failure line
+    # must be kept but truncated, never returned over the cap.
+    monkeypatch.setattr(evidence_mod, "_MAX_EXCERPT_CHARS", 500)
+    target = _target(test_name="t", test_file="tests/x.tcl", failure_type="sanitizer")
+    lines = ["[err]: t in tests/x.tcl " + "A" * 5000]
+    excerpt = carve_excerpt(lines, target)
+    assert excerpt is not None
+    assert excerpt.truncated
+    assert len(excerpt.text) <= 500
+
+
 def test_carve_excerpt_log_lines_excludes_header():
     target = _target(test_name="t", test_file="tests/x.tcl")
     marker = "[err]: t in tests/x.tcl"

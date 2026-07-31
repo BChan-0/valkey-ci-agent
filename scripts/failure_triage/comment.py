@@ -248,23 +248,49 @@ def _clamp(body: str) -> str:
         "_This analysis was truncated because it exceeded the comment size "
         "limit. AI-generated and may be incorrect._"
     )
-    cut = _MAX_COMMENT_CHARS - len(notice) - len("\n\n\n```\n")
+    # Room the appended parts need: two blank lines before the notice, the notice
+    # itself, and a fence-closing line the truncation might add (sized to the
+    # longest fence this module emits). Clamped at zero so a cap smaller than the
+    # reserve cannot slice from the end of the body.
+    reserve = len(notice) + len("\n\n") + len("\n") + _MAX_FENCE_CHARS
+    cut = max(0, _MAX_COMMENT_CHARS - reserve)
     kept = body[:cut]
     # Prefer a line boundary so the cut does not land mid-token (including inside
     # a defused marker), falling back to the raw cut if there is no newline.
     newline = kept.rfind("\n")
     if newline > 0:
         kept = kept[:newline]
-    if _open_fence(kept):
-        kept += "\n```"
-    return f"{kept}\n\n{notice}"
+    open_fence = _open_fence(kept)
+    if open_fence:
+        kept += f"\n{open_fence}"
+    # A hard final cap: with the real 60k limit the reserve leaves ample room, but
+    # a limit smaller than the notice itself could still overflow, so the whole
+    # result is bounded as a backstop.
+    return f"{kept}\n\n{notice}"[:_MAX_COMMENT_CHARS]
 
 
-def _open_fence(text: str) -> bool:
-    """Whether *text* ends inside an unclosed ``` code fence.
+# A line that is entirely a code fence: 3+ backticks or tildes, indented 0-3
+# spaces, optionally followed by an info string (backtick fences take no
+# backticks in the info string, per CommonMark).
+_FENCE_LINE_RE = re.compile(r" {0,3}(?P<fence>`{3,}|~{3,})[^`]*$")
 
-    Only backtick fences are counted, which is all this module emits. An odd
-    number of fence lines means the last one was never closed.
+
+def _open_fence(text: str) -> str:
+    """The closing delimiter for a fence *text* leaves open, or "" if none.
+
+    Tracks fence state line by line as a Markdown parser does: a fence opens on
+    a fence line and closes only on a later line whose delimiter is the same
+    character and at least as long. The returned delimiter closes the open fence
+    exactly, which a fixed three-backtick closer would not do for a longer one.
     """
-    fences = sum(1 for line in text.splitlines() if line.lstrip().startswith("```"))
-    return fences % 2 == 1
+    open_delim = ""
+    for line in text.splitlines():
+        match = _FENCE_LINE_RE.match(line)
+        if not match:
+            continue
+        delim = match.group("fence")
+        if not open_delim:
+            open_delim = delim
+        elif delim[0] == open_delim[0] and len(delim) >= len(open_delim):
+            open_delim = ""
+    return open_delim

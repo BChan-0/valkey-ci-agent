@@ -280,10 +280,23 @@ def carve_excerpt(lines: list[str], target: TriageTarget) -> Excerpt | None:
         kept = lines[kept_start:kept_end]
         header = _excerpt_header(kept_start, kept_end, len(lines), truncated)
         text = "\n".join(header + kept)
-        if len(text) <= _MAX_EXCERPT_CHARS or kept_start >= anchor:
+        if len(text) <= _MAX_EXCERPT_CHARS:
             return Excerpt(text=text, log_lines=len(kept), truncated=truncated)
+        if kept_start >= anchor:
+            break
         kept_start += 1
         truncated = True
+
+    # Only the anchor line and what follows it are left, yet the text is still
+    # over the cap: the anchor line itself is too long (a single-line sanitizer
+    # or valgrind dump). Keep just the anchor and truncate it, so the failure is
+    # never dropped for being large. The final slice is an absolute backstop for
+    # a cap so small the header alone would not fit, which the real cap is not.
+    header = _excerpt_header(anchor, anchor + 1, len(lines), True)
+    overhead = len("\n".join(header + [""]))
+    truncated_line = lines[anchor][: max(0, _MAX_EXCERPT_CHARS - overhead)]
+    text = "\n".join(header + [truncated_line])[:_MAX_EXCERPT_CHARS]
+    return Excerpt(text=text, log_lines=1, truncated=True)
 
 
 def _excerpt_header(
@@ -318,9 +331,23 @@ def _budgeted_span(
     A trailing header of a few lines is written by the caller; ``_HEADER_RESERVE``
     holds room for it so the rendered excerpt stays within ``_MAX_EXCERPT_CHARS``.
     """
+    # When the whole window fits under the cap, keep it whole: the proportional
+    # split below is only for trimming, and applying it to a window that already
+    # fits would drop context for no reason and flag a spurious truncation. The
+    # check renders exactly what the caller renders, so it neither over- nor
+    # under-counts the separators.
+    full_header = _excerpt_header(window_start, window_end, len(lines), False)
+    full_text = "\n".join(full_header + lines[window_start:window_end])
+    if len(full_text) <= _MAX_EXCERPT_CHARS:
+        return window_start, window_end
+
+    # The window is too large. Spend a proportional share forward, reserving the
+    # rest for the backward pass, so a run of fat trailing lines cannot starve
+    # the preceding server logs. Any forward budget left unused is then available
+    # to the backward pass, which runs second. The header reserve keeps room for
+    # the truncation header the caller will render.
     budget = _MAX_EXCERPT_CHARS - _HEADER_RESERVE
     forward_budget = budget * _LINES_AFTER // (_LINES_BEFORE + _LINES_AFTER)
-
     used = len(lines[anchor]) + 1
     kept_end = anchor + 1
     for index in range(anchor + 1, window_end):
