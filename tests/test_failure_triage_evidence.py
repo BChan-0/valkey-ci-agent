@@ -120,6 +120,19 @@ def test_carve_excerpt_truncates_within_budget(monkeypatch):
     assert len(excerpt.text) <= 2000
 
 
+def test_carve_excerpt_keeps_forward_context_when_anchor_is_first_line():
+    # The failure can be the first line of the log (nothing precedes it). The
+    # following server-log lines must still be kept, not collapsed to the anchor.
+    target = _target(test_name="my test", test_file="tests/x.tcl")
+    marker = "[err]: my test in tests/x.tcl"
+    lines = [marker] + [f"after {i}: dumped server log" for i in range(150)]
+    excerpt = carve_excerpt(lines, target)
+    assert excerpt is not None
+    assert not excerpt.truncated
+    assert excerpt.log_lines == 151
+    assert "dumped server log" in excerpt.text
+
+
 def test_carve_excerpt_truncates_giant_anchor_line(monkeypatch):
     # A single-line sanitizer dump longer than the whole budget: the failure line
     # must be kept but truncated, never returned over the cap.
